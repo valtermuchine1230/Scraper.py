@@ -1,41 +1,12 @@
-name: download-and-process📧
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
+name: Minerador de Alta Performance
+on: [workflow_dispatch]
 
 jobs:
-  download-and-process:
-    runs-on: ubuntu-22.04
+  mineracao:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout do Código
-        uses: actions/checkout@v4
-
-      - name: Instalar Libtorrent no Sistema
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-libtorrent
-
-      - name: Configurar Python e Linkar Libtorrent
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          system-architecture: 'x64'
-
-      - name: Instalar Dependências Restantes
-        run: |
-          pip install requests
-          python -c "import sys; sys.path.append('/usr/lib/python3/dist-packages')"
-
-      - name: Executar Mineração Industrial Local
-        run: |
-          export PYTHONPATH="${PYTHONPATH}:/usr/lib/python3/dist-packages"
-          python minerador.py
-
-      - name: Upload dos E-mails Extraídos (Artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: lista-emails-novos
-          path: emails_minerados_finais.txt
-          retention-days: 7
+      - uses: actions/checkout@v3
+      - name: Instalar Dependências
+        run: pip install psycopg[binary] libtorrent
+      - name: Executar Minerador
+        run: python minerador.py
