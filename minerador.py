@@ -19,12 +19,12 @@ ARQUIVOS_ALVO = [
     "Collection #4_BTC combos.tar.gz"
 ]
 
-# 1. Regex de alta performance operando diretamente em bytes (case-insensitive)
+# Regex de alta performance operando diretamente em bytes (case-insensitive)
 EMAIL_REGEX_BYTES = re.compile(rb'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.IGNORECASE)
 
-TAMANHO_LOTE_UPLOAD = 10000     # Lote otimizado para evitar timeouts de requisição
+TAMANHO_LOTE_UPLOAD = 10000     
 TAMANHO_SINC_DOWNLOAD = 50000  
-CHUNK_SIZE = 8 * 1024 * 1024    # 2. Tamanho do bloco de leitura (8 MB)
+CHUNK_SIZE = 8 * 1024 * 1024    # Tamanho do bloco de leitura (8 MB)
 
 http_session = requests.Session()
 http_session.headers.update({
@@ -139,7 +139,6 @@ def processar_arquivos_tar(emails_cache):
             alvo_tar = os.path.join(root, file)
             print(f"\n📦 [Streaming Ativo] Abrindo tarfile em modo sequencial (r|gz): {alvo_tar}", flush=True)
             
-            # E. Usando modo "r|gz" para evitar estouro de memória e indexação desnecessária
             with tarfile.open(alvo_tar, "r|gz", errorlevel=0) as tar:
                 for member in tar:
                     if not member.isfile() or not (member.name.endswith(".txt") or member.name.endswith(".csv")):
@@ -157,14 +156,21 @@ def processar_arquivos_tar(emails_cache):
                     print(f"\n⛏️ [Mineração Iniciada] {member.name}", flush=True)
                     bytes_lidos = 0
                     
+                    # CORREÇÃO CRÍTICA: Avança consumindo os blocos em stream (Sem usar seek())
                     if checkpoint_bytes > 0:
-                        print(f"⏩ Pulando {checkpoint_bytes / 1024 / 1024:.2f} MB até o checkpoint...", flush=True)
-                        f.seek(checkpoint_bytes)
-                        bytes_lidos = checkpoint_bytes
+                        print(f"⏩ Descartando {checkpoint_bytes / 1024 / 1024:.2f} MB iniciais para atingir o Checkpoint...", flush=True)
+                        bytes_saltados = 0
+                        while bytes_saltados < checkpoint_bytes:
+                            tamanho_proximo_bloco = min(CHUNK_SIZE, checkpoint_bytes - bytes_saltados)
+                            descarte = f.read(tamanho_proximo_bloco)
+                            if not descarte:
+                                break
+                            bytes_saltados += len(descarte)
+                        bytes_lidos = bytes_saltados
+                        print(f"🎯 Ponto de checkpoint reestabelecido nos {bytes_lidos / 1024 / 1024:.2f} MB.", flush=True)
                     
                     buffer_restante = b''
                     
-                    # 2. Loop de leitura baseado em Chunks puros de memória
                     while True:
                         bloco = f.read(CHUNK_SIZE)
                         if not bloco:
@@ -173,17 +179,13 @@ def processar_arquivos_tar(emails_cache):
                         bytes_lidos += len(bloco)
                         dados = buffer_restante + bloco
                         
-                        # 1. Executa busca massiva em C nativo diretamente nos bytes
                         encontrados = EMAIL_REGEX_BYTES.findall(dados)
                         total_encontrados_global += len(encontrados)
                         
-                        # 3. Preserva fragmentos entre os blocos (Salva os últimos 1024 bytes)
                         buffer_restante = dados[-1024:]
                         
-                        # 4. Força o log na tela a cada iteração de bloco para não congelar
                         mb = bytes_lidos / 1024 / 1024
                         print(f"📂 {mb:.2f} MB processados | E-mails encontrados: {total_encontrados_global}", flush=True)
-                        sys.stdout.flush()
                         
                         for email_b in encontrados:
                             try:
@@ -198,7 +200,6 @@ def processar_arquivos_tar(emails_cache):
                                     "origem_p": f"{file}/{member.name}"
                                 })
                                 
-                                # 5. Despacha os lotes assim que o tamanho limite é atingido
                                 if len(buffer_supabase) >= TAMANHO_LOTE_UPLOAD:
                                     enviar_lote_final_supabase(buffer_supabase)
                                     salvar_checkpoint_supabase(member.name, bytes_processed=bytes_lidos)
