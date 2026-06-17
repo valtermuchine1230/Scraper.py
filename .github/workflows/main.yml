@@ -1,12 +1,15 @@
-name: Minerador de Alta Performance
+name: Minerador Neon
 on: [workflow_dispatch]
-
 jobs:
-  mineracao:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Instalar Dependências
-        run: pip install psycopg[binary] libtorrent
-      - name: Executar Minerador
+      - name: Baixar Dados (Força Bruta)
+        run: |
+          sudo apt-get install aria2
+          aria2c -x 16 -s 16 -k 1M "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2fannounce"
+      - name: Instalar Deps
+        run: pip install psycopg[binary]
+      - name: Rodar Minerador
         run: python minerador.py
