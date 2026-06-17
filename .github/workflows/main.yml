@@ -1,0 +1,27 @@
+name: download-and-process
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *' # Executa automaticamente a cada 6 horas se necessário
+
+jobs:
+  download-and-process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Instalar Dependências de Sistema e Torrent
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-libtorrent
+          pip install requests
+
+      - name: Executar Mineração Industrial
+        run: python minerador.py
