@@ -1,14 +1,20 @@
-name: Minerador Neon
-on: [workflow_dispatch]
+name: Minerador-Neon-Escalavel
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
 jobs:
-  run:
-    runs-on: ubuntu-latest
+  mineracao:
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
       - name: Instalar Dependências
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libtorrent-rasterbar-dev
-          pip install psycopg[binary]
+        run: pip install libtorrent psycopg[binary] requests
       - name: Rodar Minerador
         run: python minerador.py
