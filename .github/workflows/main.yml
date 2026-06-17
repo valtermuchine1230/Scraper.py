@@ -1,5 +1,4 @@
-name: Minerador-Neon-Escalavel
-
+name: Minerador-Neon-Producao
 on:
   workflow_dispatch:
   schedule:
@@ -15,6 +14,9 @@ jobs:
         with:
           python-version: '3.10'
       - name: Instalar Dependências
-        run: pip install libtorrent psycopg[binary] requests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-libtorrent
+          pip install libtorrent psycopg[binary]
       - name: Rodar Minerador
         run: python minerador.py
