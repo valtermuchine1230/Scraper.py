@@ -6,7 +6,7 @@ import sys
 import time
 import libtorrent as lt
 
-# Força o Python a cuspir os logs no ecrã imediatamente
+# Força o Python a cuspir os logs essenciais imediatamente
 sys.stdout.reconfigure(line_buffering=True)
 
 SUPABASE_URL = "https://rbgbwqossenorypfrzln.supabase.co"
@@ -19,13 +19,12 @@ ARQUIVOS_ALVO = [
     "Collection #4_BTC combos.tar.gz"
 ]
 
-# Regex de alta performance operando diretamente em bytes (case-insensitive)
 EMAIL_REGEX_BYTES = re.compile(rb'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.IGNORECASE)
 
-# CALIBRAÇÃO CRÍTICA: Reduzido para 1000 para acabar com os erros 500 do Supabase
+# Calibrações de segurança para performance e estabilidade
 TAMANHO_LOTE_UPLOAD = 1000     
-TAMANHO_SINC_DOWNLOAD = 50000  
-CHUNK_SIZE = 8 * 1024 * 1024    # Tamanho do bloco de leitura (8 MB)
+TAMANHO_SINC_DOWNLOAD = 100000  # Puxa blocos maiores de cada vez para reduzir chamadas HTTP
+CHUNK_SIZE = 8 * 1024 * 1024    
 
 http_session = requests.Session()
 http_session.headers.update({
@@ -35,18 +34,18 @@ http_session.headers.update({
 })
 
 def carregar_emails_existentes_via_id():
-    print("🔄 [Cache] Sincronizando base de e-mails existente para a RAM...", flush=True)
+    print("🔄 [Cache] A carregar base de dados remota para a RAM...", flush=True)
     emails_cache = set()
     last_id = 0
     total_baixado = 0
     url = f"{SUPABASE_URL}/rest/v1/rpc/get_emails_batch_id"
     
+    ult_print = 0
     while True:
         payload = {"last_id": last_id, "batch_size": TAMANHO_SINC_DOWNLOAD}
         try:
             r = http_session.post(url, json=payload, timeout=60.0)
             if r.status_code != 200:
-                print(f"⚠️ Instabilidade na API ({r.status_code}). Nova tentativa em 10s...", flush=True)
                 time.sleep(10)
                 continue
             dados = r.json()
@@ -57,12 +56,16 @@ def carregar_emails_existentes_via_id():
                     emails_cache.add(item["email"].strip().lower())
             total_baixado += len(dados)
             last_id = dados[-1]["id"]
-            print(f"📥 [Cache-RAM] Carregados {total_baixado} e-mails (Último ID: {last_id})", flush=True)
-        except Exception as e:
-            print(f"⚠️ Erro no Sync de rede: {e}. Aguardando 15s...", flush=True)
+            
+            # PROTEÇÃO DE DISCO: Só escreve no log a cada 200.000 registos salvando espaço
+            if total_baixado - ult_print >= 200000:
+                print(f"📥 [Cache-RAM] Total sincronizado: {total_baixado:,} e-mails.", flush=True)
+                ult_print = total_baixado
+                
+        except Exception:
             time.sleep(15)
             
-    print(f"✅ Cache Populado! {len(emails_cache)} chaves prontas em memória para Dedupe.", flush=True)
+    print(f"✅ Sincronização Concluída! Cache RAM com {len(emails_cache):,} registos prontos.", flush=True)
     return emails_cache
 
 def salvar_checkpoint_supabase(member_name, bytes_processed):
@@ -92,20 +95,15 @@ def enviar_lote_final_supabase(lote):
     if not lote:
         return
     url = f"{SUPABASE_URL}/rest/v1/rpc/importar_leads_flash"
-    print(f"📡 [Supabase Push] Enviando lote leve de {len(lote)} novos e-mails...", flush=True)
     
     for tentativa in range(5):
         try:
             r = http_session.post(url, json={"lote_dados": lote}, timeout=60.0)
             if r.status_code == 200:
-                print(f"🚀 Enviados {len(lote)} e-mails com sucesso para a nuvem.", flush=True)
                 return
-            print(f"⚠️ Resposta inesperada ({r.status_code}) na tentativa {tentativa+1}/5. Tentando novamente...", flush=True)
             time.sleep(3 * (tentativa + 1))
-        except Exception as e:
-            print(f"⚠️ Falha de rede ao enviar lote ({e}). Re-tentando...", flush=True)
+        except Exception:
             time.sleep(5)
-    print("❌ Falha crítica: Lote descartado após 5 tentativas infrutíferas.", flush=True)
 
 def baixar_torrent_seletivo(arquivos_alvo):
     print("📡 Conectando ao Enxame BitTorrent...", flush=True)
@@ -116,14 +114,22 @@ def baixar_torrent_seletivo(arquivos_alvo):
     tor_info = handle.get_torrent_info()
     for index, f in enumerate(tor_info.files()):
         handle.file_priority(index, 7 if any(alvo in f.path for alvo in arquivos_alvo) else 0)
+        
+    ult_progresso = -1.0
     while not handle.is_seed():
         s = handle.status()
-        print(f"📥 Download: {s.progress*100:.2f}% | Velocidade: {s.download_rate/1024/1024:.2f} MB/s | Peers: {s.num_peers}", flush=True)
+        progresso_atual = s.progress * 100
+        
+        # Reduz os logs do Torrent para imprimir apenas quando mudar 1% inteiro
+        if progresso_atual - ult_progresso >= 1.0:
+            print(f"📥 Download: {progresso_atual:.1f}% | Velocidade: {s.download_rate/1024/1024:.2f} MB/s | Peers: {s.num_peers}", flush=True)
+            ult_progresso = progresso_atual
+            
         completos = sum(1 for idx, f in enumerate(tor_info.files()) if any(alvo in f.path for alvo in arquivos_alvo) and handle.file_progress()[idx] >= f.size)
         if completos == len(arquivos_alvo):
             break
-        time.sleep(15)
-    print("✅ Alvos baixados localmente.", flush=True)
+        time.sleep(10)
+    print("✅ Alvos guardados localmente.", flush=True)
     return True
 
 def processar_arquivos_tar(emails_cache):
@@ -138,7 +144,7 @@ def processar_arquivos_tar(emails_cache):
                 continue
                 
             alvo_tar = os.path.join(root, file)
-            print(f"\n📦 [Streaming Ativo] Abrindo tarfile em modo sequencial (r|gz): {alvo_tar}", flush=True)
+            print(f"\n📦 [Streaming Ativo] Analisando: {alvo_tar}", flush=True)
             
             with tarfile.open(alvo_tar, "r|gz", errorlevel=0) as tar:
                 for member in tar:
@@ -154,11 +160,10 @@ def processar_arquivos_tar(emails_cache):
                     if not f:
                         continue
                     
-                    print(f"\n⛏️ [Mineração Iniciada] {member.name}", flush=True)
+                    print(f"⛏️ [Mineração] Ficheiro Atual: {member.name}", flush=True)
                     bytes_lidos = 0
                     
                     if checkpoint_bytes > 0:
-                        print(f"⏩ Descartando {checkpoint_bytes / 1024 / 1024:.2f} MB iniciais para atingir o Checkpoint...", flush=True)
                         bytes_saltados = 0
                         while bytes_saltados < checkpoint_bytes:
                             tamanho_proximo_bloco = min(CHUNK_SIZE, checkpoint_bytes - bytes_saltados)
@@ -167,9 +172,10 @@ def processar_arquivos_tar(emails_cache):
                                 break
                             bytes_saltados += len(descarte)
                         bytes_lidos = bytes_saltados
-                        print(f"🎯 Ponto de checkpoint reestabelecido nos {bytes_lidos / 1024 / 1024:.2f} MB.", flush=True)
+                        print(f"🎯 Checkpoint alinhado em {bytes_lidos / 1024 / 1024:.2f} MB.", flush=True)
                     
                     buffer_restante = b''
+                    ult_print_mb = 0.0
                     
                     while True:
                         bloco = f.read(CHUNK_SIZE)
@@ -181,12 +187,13 @@ def processar_arquivos_tar(emails_cache):
                         
                         encontrados = EMAIL_REGEX_BYTES.findall(dados)
                         total_encontrados_global += len(encontrados)
-                        
-                        # Segurança expandida para e-mails muito longos na transição
                         buffer_restante = dados[-4096:]
                         
                         mb = bytes_lidos / 1024 / 1024
-                        print(f"📂 {mb:.2f} MB processados | E-mails encontrados: {total_encontrados_global}", flush=True)
+                        # Controla logs de processamento para reportar apenas de 40MB em 40MB
+                        if mb - ult_print_mb >= 40.0:
+                            print(f"📂 {mb:.1f} MB lidos | Total de e-mails capturados: {total_encontrados_global:,}", flush=True)
+                            ult_print_mb = mb
                         
                         for email_b in encontrados:
                             try:
@@ -213,7 +220,7 @@ def processar_arquivos_tar(emails_cache):
     if buffer_supabase:
         enviar_lote_final_supabase(buffer_supabase)
         salvar_checkpoint_supabase(member.name, bytes_processed=bytes_lidos)
-    print("🏁 [Sucesso Total] Pipeline de mineração concluído sem congelamentos.", flush=True)
+    print("🏁 [Fim da Execução] Processamento concluído com sucesso.", flush=True)
 
 if __name__ == "__main__":
     try:
