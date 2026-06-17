@@ -1,27 +1,37 @@
-name: download-and-process
+name: download-and-process📧
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *' # Executa automaticamente a cada 6 horas se necessário
+    - cron: '0 */6 * * *'
 
 jobs:
   download-and-process:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04 # Fixado numa versão estável com suporte nativo ao python3-libtorrent
     steps:
       - name: Checkout do Código
         uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Instalar Dependências de Sistema e Torrent
+      - name: Instalar Libtorrent no Sistema
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-libtorrent
+
+      - name: Configurar Python e Linkar Libtorrent
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          # Permite que o ambiente do Python aceda às bibliotecas nativas instaladas pelo apt-get
+          system-architecture: 'x64'
+
+      - name: Instalar Dependências Restantes
+        run: |
           pip install requests
+          # Cria um link direto do pacote de sistema para dentro do ambiente do Python se necessário
+          python -c "import sys; sys.path.append('/usr/lib/python3/dist-packages')"
 
       - name: Executar Mineração Industrial
-        run: python minerador.py
+        run: |
+          # Injeta os pacotes do sistema na variável de ambiente do pipeline para o comando rodar sem falhas
+          export PYTHONPATH="${PYTHONPATH}:/usr/lib/python3/dist-packages"
+          python minerador.py
