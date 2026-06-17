@@ -22,7 +22,8 @@ ARQUIVOS_ALVO = [
 # Regex de alta performance operando diretamente em bytes (case-insensitive)
 EMAIL_REGEX_BYTES = re.compile(rb'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.IGNORECASE)
 
-TAMANHO_LOTE_UPLOAD = 10000     
+# CALIBRAÇÃO CRÍTICA: Reduzido para 1000 para acabar com os erros 500 do Supabase
+TAMANHO_LOTE_UPLOAD = 1000     
 TAMANHO_SINC_DOWNLOAD = 50000  
 CHUNK_SIZE = 8 * 1024 * 1024    # Tamanho do bloco de leitura (8 MB)
 
@@ -91,19 +92,19 @@ def enviar_lote_final_supabase(lote):
     if not lote:
         return
     url = f"{SUPABASE_URL}/rest/v1/rpc/importar_leads_flash"
-    print(f"📡 [Supabase Push] Enviando lote de {len(lote)} novos e-mails...", flush=True)
+    print(f"📡 [Supabase Push] Enviando lote leve de {len(lote)} novos e-mails...", flush=True)
     
     for tentativa in range(5):
         try:
-            r = http_session.post(url, json={"lote_dados": lote}, timeout=90.0)
+            r = http_session.post(url, json={"lote_dados": lote}, timeout=60.0)
             if r.status_code == 200:
                 print(f"🚀 Enviados {len(lote)} e-mails com sucesso para a nuvem.", flush=True)
                 return
             print(f"⚠️ Resposta inesperada ({r.status_code}) na tentativa {tentativa+1}/5. Tentando novamente...", flush=True)
-            time.sleep(5 * (tentativa + 1))
+            time.sleep(3 * (tentativa + 1))
         except Exception as e:
             print(f"⚠️ Falha de rede ao enviar lote ({e}). Re-tentando...", flush=True)
-            time.sleep(10)
+            time.sleep(5)
     print("❌ Falha crítica: Lote descartado após 5 tentativas infrutíferas.", flush=True)
 
 def baixar_torrent_seletivo(arquivos_alvo):
@@ -156,7 +157,6 @@ def processar_arquivos_tar(emails_cache):
                     print(f"\n⛏️ [Mineração Iniciada] {member.name}", flush=True)
                     bytes_lidos = 0
                     
-                    # CORREÇÃO CRÍTICA: Avança consumindo os blocos em stream (Sem usar seek())
                     if checkpoint_bytes > 0:
                         print(f"⏩ Descartando {checkpoint_bytes / 1024 / 1024:.2f} MB iniciais para atingir o Checkpoint...", flush=True)
                         bytes_saltados = 0
@@ -182,7 +182,8 @@ def processar_arquivos_tar(emails_cache):
                         encontrados = EMAIL_REGEX_BYTES.findall(dados)
                         total_encontrados_global += len(encontrados)
                         
-                        buffer_restante = dados[-1024:]
+                        # Segurança expandida para e-mails muito longos na transição
+                        buffer_restante = dados[-4096:]
                         
                         mb = bytes_lidos / 1024 / 1024
                         print(f"📂 {mb:.2f} MB processados | E-mails encontrados: {total_encontrados_global}", flush=True)
