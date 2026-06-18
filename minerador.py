@@ -3,7 +3,6 @@
 Minerador robusto: baixa arquivos selecionados de um magnet/torrent via libtorrent,
 faz streaming dos .tar.gz, extrai e-mails por regex e injeta no Neon (Postgres)
 usando COPY -> INSERT ... ON CONFLICT DO NOTHING. Checkpoints por member e estatísticas.
-Configure DB_URL e MAGNET_LINK via environment variables (secrets no Actions).
 """
 import os
 import re
@@ -14,30 +13,26 @@ import signal
 import sys
 import libtorrent as lt
 import psycopg
-from psycopg.rows import class_row
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import traceback
 
 # Configurações
-DB_URL = "postgresql://neondb_owner:npg_cumTqS9n5ABR@ep-delicate-heart-ad6by8cm-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"  # Ex.: postgresql://user:pass@host:port/db
-MAGNET_LINK ="magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce"
-# Ajuste a lista de arquivos alvo conforme necessário (strings parciais ou nomes base)
+DB_URL = "postgresql://neondb_owner:npg_cumTqS9n5ABR@ep-delicate-heart-ad6by8cm-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+MAGNET_LINK = "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce"
 ARQUIVOS_ALVO = [
     "Collection #2_New combo cloud_Trading Collection.tar.gz",
     "Collection #4_BTC combos.tar.gz",
 ]
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "8"))  # segundos entre logs/checagens
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "2000"))     # não usado como lista, mas parâmetro de referência
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "8"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "2000"))
 SAVE_PATH = os.getenv("SAVE_PATH", ".")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Regex de e-mail (bytes) - trabalha com linhas em bytes
 EMAIL_REGEX = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
 
-# Global control
 _stop_requested = False
 
-# Logging configurado bonito
 logger = logging.getLogger("minerador")
 handler = logging.StreamHandler(sys.stdout)
 fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -47,7 +42,6 @@ logger.setLevel(LOG_LEVEL)
 
 
 def add_sslmode_if_needed(dsn: str) -> str:
-    """Se DB_URL não tem sslmode, adiciona sslmode=require (muito comum para Neon)."""
     if not dsn:
         return dsn
     try:
@@ -59,12 +53,12 @@ def add_sslmode_if_needed(dsn: str) -> str:
             new = parsed._replace(query=new_query)
             return urlunparse(new)
     except Exception:
-        logger.debug("Não consegui parsear DSN para adicionar sslmode; usando original.")
+        logger.debug("Não consegui parsear DSN; usando original.")
     return dsn
 
 
 def setup_db(conn):
-    """Cria tabelas necessárias se não existirem."""
+    """Cria as tabelas se possível. Se o usuário não tiver permissão, lance a exceção para o chamador tratar."""
     with conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS leads (
@@ -110,28 +104,55 @@ def setup_db(conn):
 
 
 def mark_checkpoint(conn, torrent, tar_name, member_name, status, error=None):
-    with conn.cursor() as cur:
-        cur.execute("""
-        INSERT INTO processing_checkpoints(torrent, tar_name, member_name, status, last_updated, error)
-        VALUES (%s,%s,%s,%s,now(),%s)
-        ON CONFLICT (torrent, tar_name, member_name) DO UPDATE
-           SET status = EXCLUDED.status, last_updated = now(), error = EXCLUDED.error
-        """, (torrent, tar_name, member_name, status, error))
-        conn.commit()
+    """Marca checkpoint; usa sua própria transação/commit."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO processing_checkpoints(torrent, tar_name, member_name, status, last_updated, error)
+            VALUES (%s,%s,%s,%s,now(),%s)
+            ON CONFLICT (torrent, tar_name, member_name) DO UPDATE
+               SET status = EXCLUDED.status, last_updated = now(), error = EXCLUDED.error
+            """, (torrent, tar_name, member_name, status, error))
+            conn.commit()
+    except Exception:
+        # Se houve um estado de transação abortada no conn, tenta rollback e repetir
+        try:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("""
+                INSERT INTO processing_checkpoints(torrent, tar_name, member_name, status, last_updated, error)
+                VALUES (%s,%s,%s,%s,now(),%s)
+                ON CONFLICT (torrent, tar_name, member_name) DO UPDATE
+                   SET status = EXCLUDED.status, last_updated = now(), error = EXCLUDED.error
+                """, (torrent, tar_name, member_name, status, error))
+                conn.commit()
+        except Exception as e:
+            logger.exception("Falha ao marcar checkpoint mesmo após rollback: %s", e)
 
 
 def record_stats(conn, tar_name, member_name, extracted, inserted, inicio, fim):
-    with conn.cursor() as cur:
-        cur.execute("""
-        INSERT INTO processing_stats(tar_name, member_name, emails_extraidos, emails_inseridos, inicio, fim)
-        VALUES (%s,%s,%s,%s,%s,%s)
-        """, (tar_name, member_name, extracted, inserted, inicio, fim))
-        conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO processing_stats(tar_name, member_name, emails_extraidos, emails_inseridos, inicio, fim)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            """, (tar_name, member_name, extracted, inserted, inicio, fim))
+            conn.commit()
+    except Exception:
+        logger.exception("Falha ao gravar stats; tentando rollback e regravar.")
+        try:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("""
+                INSERT INTO processing_stats(tar_name, member_name, emails_extraidos, emails_inseridos, inicio, fim)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                """, (tar_name, member_name, extracted, inserted, inicio, fim))
+                conn.commit()
+        except Exception as e:
+            logger.exception("Ainda falhou ao gravar stats: %s", e)
 
 
 def find_local_target_files(root="."):
-    """Procura por arquivos em disco que correspondem a ARQUIVOS_ALVO.
-    Matching é case-insensitive e tenta substring no path e equality na basename."""
     matches = []
     lower_targets = [t.lower() for t in ARQUIVOS_ALVO]
     for dirpath, _, filenames in os.walk(root):
@@ -148,13 +169,11 @@ def find_local_target_files(root="."):
 
 def graceful_shutdown(signum, frame):
     global _stop_requested
-    logger.warning("Sinal de parada recebido (%s). Irei encerrar após a iteração corrente.", signum)
+    logger.warning("Sinal de parada recebido (%s). Encerrando após a iteração corrente.", signum)
     _stop_requested = True
 
 
 def download_and_wait(magnet: str, save_path: str):
-    """Adiciona torrent e espera até que os arquivos alvo comecem a existir no disco.
-    Faz logs frequentes de progresso para indicar que está 'vivo'."""
     ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
     params = lt.parse_magnet_uri(magnet)
     params.save_path = save_path
@@ -169,12 +188,11 @@ def download_and_wait(magnet: str, save_path: str):
         time.sleep(POLL_INTERVAL)
     logger.info("📦 Metadata obtido.")
     info = handle.get_torrent_info()
-    # Priorizar arquivos alvo
     n_files = info.num_files()
     logger.info("Torrent contém %d arquivos. Aplicando prioridades conforme ARQUIVOS_ALVO...", n_files)
     prioritized_count = 0
     for i in range(n_files):
-        path = info.files().at(i).path  # path dentro do torrent
+        path = info.files().at(i).path
         path_lower = path.lower()
         setprio = 0
         for t in ARQUIVOS_ALVO:
@@ -183,74 +201,83 @@ def download_and_wait(magnet: str, save_path: str):
                 prioritized_count += 1
                 break
         handle.file_priority(i, setprio)
-    logger.info("Priorizei %d arquivos (se houverem correspondências no torrent).", prioritized_count)
+    logger.info("Priorizei %d arquivos (se houver correspondências no torrent).", prioritized_count)
 
-    # Espera até os arquivos aparecerem no disco ou até completarem (de forma segura)
-    start = time.time()
+    # Espera os arquivos alvo aparecerem em disco
     logger.info("⌛ Aguardando os arquivos alvo aparecerem em disco (pode requerer alguns minutos)...")
     last_log = 0
     while True:
         if _stop_requested:
             raise KeyboardInterrupt()
         found = find_local_target_files(save_path)
-        # Logging de progresso do torrent
         s = handle.status()
-        now = time.time()
-        if now - last_log > 10:
+        now_ts = time.time()
+        if now_ts - last_log > 10:
             logger.info("↓ Download: %.2f%%, peers: %d, download_rate: %d B/s, arquivos_localizados: %d",
                         s.progress * 100, s.num_peers, s.download_rate, len(found))
-            last_log = now
+            last_log = now_ts
         if found:
             logger.info("✅ Encontrados %d arquivo(s) alvo em disco: %s", len(found), ", ".join(found))
             return handle, found
-        # se o torrent terminou por completo, tenta novamente um listing
         if s.progress >= 1.0:
-            logger.info("Torrent completo (progress 100%%). Verificando arquivos alvo no disco...")
+            logger.info("Torrent completo (100%%). Verificando arquivos alvo no disco...")
             found = find_local_target_files(save_path)
             if found:
                 return handle, found
             else:
-                logger.warning("Torrent completo mas nenhum dos ARQUIVOS_ALVO foi encontrado no path. Verifique nomes em ARQUIVOS_ALVO.")
+                logger.warning("Torrent completo mas nenhum dos ARQUIVOS_ALVO foi encontrado no path.")
                 return handle, []
-        # evita loop apertado
         time.sleep(POLL_INTERVAL)
 
 
-def process_tarfile_member(conn, tar_path, member, torrent_id):
-    """Processa um member do tar em streaming, faz COPY para staging e move para leads final."""
+def process_tarfile_member(conn, tar_path, member, torrent_id, tar_obj):
     tar_name = os.path.basename(tar_path)
     member_name = member.name
     logger.info("📂 Iniciando processamento do member: %s (dentro de %s)", member_name, tar_name)
 
     # Verifica checkpoint
-    with conn.cursor() as cur:
-        cur.execute("""
-        SELECT status FROM processing_checkpoints
-        WHERE torrent=%s AND tar_name=%s AND member_name=%s
-        """, (torrent_id, tar_name, member_name))
-        row = cur.fetchone()
-        if row and row[0] == 'done':
-            logger.info("⏭️  Já processado (checkpoint done): %s", member_name)
-            return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT status FROM processing_checkpoints
+            WHERE torrent=%s AND tar_name=%s AND member_name=%s
+            """, (torrent_id, tar_name, member_name))
+            row = cur.fetchone()
+            if row and row[0] == 'done':
+                logger.info("⏭️  Já processado (checkpoint done): %s", member_name)
+                return
+    except Exception:
+        # Se houver problema (ex: transação anterior abortada), tenta rollback e re-tentar a verificação
+        logger.debug("Erro ao verificar checkpoint — tentando rollback e re-tentar.")
+        try:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("""
+                SELECT status FROM processing_checkpoints
+                WHERE torrent=%s AND tar_name=%s AND member_name=%s
+                """, (torrent_id, tar_name, member_name))
+                row = cur.fetchone()
+                if row and row[0] == 'done':
+                    logger.info("⏭️  Já processado (checkpoint done): %s", member_name)
+                    return
+        except Exception:
+            logger.exception("Não consegui verificar checkpoint após rollback; prosseguindo e tentando processar.")
 
     mark_checkpoint(conn, torrent_id, tar_name, member_name, 'processing')
 
-    inicio = datetime.utcnow()
+    inicio = datetime.now(timezone.utc)
     extracted_count = 0
     inserted_count = 0
     try:
         with conn.cursor() as cur:
-            # COPY streaming para leads_staging (persistente)
             copy_sql = "COPY leads_staging(email,nome,dominio,origem) FROM STDIN"
             with cur.copy(copy_sql) as copy:
-                # extrai o member em streaming
-                f = tar.extractfile(member)
+                f = tar_obj.extractfile(member)
                 if f is None:
-                    raise RuntimeError("Não consegui extrair member %s" % member_name)
+                    raise RuntimeError(f"Não consegui extrair member {member_name}")
                 for raw_line in f:
                     if _stop_requested:
                         raise KeyboardInterrupt()
-                    # raw_line é bytes; usa regex em bytes
                     for email_b in EMAIL_REGEX.findall(raw_line):
                         try:
                             email = email_b.decode('utf8', 'ignore').strip().lower()
@@ -261,60 +288,76 @@ def process_tarfile_member(conn, tar_path, member, torrent_id):
                         dominio = email.split('@', 1)[1] if '@' in email else 'n/a'
                         copy.write_row((email, "Trader Lead", dominio, member_name))
                         extracted_count += 1
-                # copy context fecha aqui
-            # Mover para final com deduplicação
+            # Após fechar o COPY, mover para leads
             insert_sql = """
             INSERT INTO leads(email,nome,dominio,origem)
             SELECT email,nome,dominio,origem FROM leads_staging
             ON CONFLICT (email) DO NOTHING
-            RETURNING email
             """
             cur.execute(insert_sql)
-            # rowcount deve indicar quantos foram inseridos
-            inserted_count = cur.rowcount if cur.rowcount is not None else 0
-            # estatística de quantos extraímos total (antes do TRUNCATE)
+            # número aproximado inserido:
+            try:
+                inserted_count = cur.rowcount if cur.rowcount is not None else 0
+            except Exception:
+                inserted_count = 0
+            # Conta staging antes do TRUNCATE
             cur.execute("SELECT count(*) FROM leads_staging")
             total_staged = cur.fetchone()[0]
-            # limpa staging
             cur.execute("TRUNCATE leads_staging")
             conn.commit()
-            fim = datetime.utcnow()
+            fim = datetime.now(timezone.utc)
             record_stats(conn, tar_name, member_name, total_staged, inserted_count, inicio, fim)
             mark_checkpoint(conn, torrent_id, tar_name, member_name, 'done')
             logger.info("✅ Finalizado member %s - extraídos=%d, inseridos=%d", member_name, total_staged, inserted_count)
     except KeyboardInterrupt:
-        logger.warning("⛔ Interrompido pelo usuário durante member %s. Marcando como failed temporariamente.", member_name)
+        logger.warning("⛔ Interrompido pelo usuário durante member %s. Marcando como failed.", member_name)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         mark_checkpoint(conn, torrent_id, tar_name, member_name, 'failed', error='interrupted')
         raise
     except Exception as e:
         logger.exception("❌ Erro ao processar member %s: %s", member_name, e)
+        # Se a transação foi abortada, precisa dar rollback antes de executar outros comandos
+        try:
+            conn.rollback()
+        except Exception:
+            logger.debug("Rollback também falhou ou não necessário.")
         mark_checkpoint(conn, torrent_id, tar_name, member_name, 'failed', error=str(e))
+        # registra stats com 0 inseridos/extrados se for apropriado
+        fim = datetime.now(timezone.utc)
+        try:
+            record_stats(conn, tar_name, member_name, extracted_count, 0, inicio, fim)
+        except Exception:
+            logger.debug("Falha ao gravar stats de erro.")
+        # não relançamos — permitimos que o loop continue com o próximo member
+        return
 
 
 def process_files(conn, files_list, torrent_id):
-    """Para cada arquivo .tar.gz localizado, itera pelos members e processa os .txt/.csv."""
     for tar_path in files_list:
         logger.info("🗂️  Abrindo tar.gz: %s", tar_path)
         if not os.path.exists(tar_path):
             logger.warning("Arquivo esperado não existe (pulando): %s", tar_path)
             continue
         try:
-            # modo streaming - r|gz
             with tarfile.open(tar_path, "r|gz") as t:
                 for member in t:
                     if _stop_requested:
                         raise KeyboardInterrupt()
                     if not member.isfile():
                         continue
-                    # filtra por extensões relevantes
                     if not (member.name.endswith(".txt") or member.name.endswith(".csv")):
                         continue
                     logger.info("  ➤ Arquivo interno: %s", member.name)
-                    process_tarfile_member(conn, tar_path, member, torrent_id)
-        except tarfile.ReadError as e:
-            logger.exception("Erro lendo tar %s: %s", tar_path, e)
-        except Exception:
-            logger.exception("Erro geral ao processar %s", tar_path)
+                    process_tarfile_member(conn, tar_path, member, torrent_id, t)
+        except KeyboardInterrupt:
+            logger.warning("Interrompido pelo usuário durante processamento de %s", tar_path)
+            raise
+        except Exception as e:
+            logger.exception("Erro geral ao processar %s: %s", tar_path, e)
+            # continuar com próximos arquivos
 
 
 def main():
@@ -331,7 +374,6 @@ def main():
 
     DB_URL = add_sslmode_if_needed(DB_URL)
     logger.info("Conectando ao banco de dados (Neon)...")
-    # psycopg.connect aceita DSN com sslmode
     try:
         conn = psycopg.connect(DB_URL, autocommit=False)
     except Exception as e:
@@ -340,11 +382,20 @@ def main():
 
     try:
         setup_db(conn)
+    except Exception as e:
+        logger.exception("setup_db falhou (ver permissões). Trace:\n%s", traceback.format_exc())
+        # Se preferir, sem permissões, podemos continuar assumindo que as tabelas já existem:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("Continuando sem criar esquema - assuma que tabelas já existem.")
+
+    try:
         handle, found_files = download_and_wait(MAGNET_LINK, SAVE_PATH)
         if not found_files:
             logger.warning("Nenhum arquivo alvo encontrado; saindo.")
             return
-        # Usa o magnet link como id de torrent simples (pode usar info.hash se preferir)
         torrent_id = MAGNET_LINK
         process_files(conn, found_files, torrent_id)
     except KeyboardInterrupt:
