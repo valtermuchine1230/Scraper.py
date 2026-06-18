@@ -44,7 +44,7 @@ from rich.table import Table
 # -------- CONFIG --------
 # Se quiser que o token venha do env, set HF_TOKEN no Actions; caso contrário o script usa HF_TOKEN_DEFAULT.
 HF_TOKEN_DEFAULT = "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"  # token que você forneceu
-HF_TOKEN = os.getenv("HF_TOKEN", HF_TOKEN_DEFAULT)
+HF_TOKEN = "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"
 
 # Dataset name (no Hub será: <username>/<HF_DATASET_NAME>)
 HF_DATASET_NAME = os.getenv("HF_DATASET_NAME", "email_miner_dataset")
