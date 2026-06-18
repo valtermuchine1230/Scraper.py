@@ -2,56 +2,60 @@ name: Process Emails from Torrent
 
 on:
   workflow_dispatch:
-    inputs:
-      magnet_link:
-        description: 'Magnet link do torrent'
-        required: true
-      target_files:
-        description: 'Arquivos alvo (separados por vírgula)'
-        required: true
-        default: 'arquivo.tar.gz'
+  schedule:
+    - cron: '0 */6 * * *' # Executa a cada 6 horas automaticamente
 
 jobs:
   process:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 1440  # 24 horas
     
+    env:
+      # Definição fixa das variáveis globais para o script Python
+      MAGNET_LINK: "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce"
+      TARGET_FILES: "Trading Collection.tar.gz,Collection #4_BTC combos.tar.gz"
+      DB_URL: ${{ secrets.DB_URL }}
+
     steps:
       - uses: actions/checkout@v4
       
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
       
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libtorrent-rasterbar-dev
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          sudo apt-get install -y python3-libtorrent
       
-      - name: Set environment
+      - name: Install Python dependencies
         run: |
-          echo "MAGNET_LINK=${{ github.event.inputs.magnet_link }}" >> $GITHUB_ENV
-          echo "TARGET_FILES=${{ github.event.inputs.target_files }}" >> $GITHUB_ENV
+          pip install libtorrent psycopg[binary]
+      
+      - name: Create logs directory
+        run: mkdir -p logs
       
       - name: Run email processor
-        env:
-          DB_URL: ${{ secrets.DB_URL }}
         run: |
-          python -c "
-          import os
-          magnet = os.getenv('MAGNET_LINK')
-          files = [f.strip() for f in os.getenv('TARGET_FILES').split(',')]
-          print(f'Magnet: {magnet}')
-          print(f'Files: {files}')
-          " && python process_emails.py
+          python minerador.py 2>&1 | tee logs/execution.log
       
-      - name: Upload logs
+      - name: Upload execution logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: execution-logs
+          name: execution-logs-${{ github.run_id }}
           path: logs/
-          retention-days: 30
+          retention-days: 7
+          if-no-files-found: ignore
+      
+      - name: Job Summary
+        if: success()
+        run: |
+          echo "✅ Processamento concluído com sucesso!" >> $GITHUB_STEP_SUMMARY
+          echo "📊 Logs arquivados nos artifacts." >> $GITHUB_STEP_SUMMARY
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ O processo falhou. Verifique os logs detalhados nos artifacts." >> $GITHUB_STEP_SUMMARY
