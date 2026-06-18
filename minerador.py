@@ -15,8 +15,8 @@ MAGNET_LINK = "magnet:?xt=urn:btih:..."
 ARQUIVOS_ALVO = ["seu_arquivo.tar.gz"]
 
 # ============ OTIMIZAÇÕES PARA VELOCIDADE ============
-CHUNK_SIZE = 16 * 1024 * 1024  # 16MB (aumentado)
-TAMANHO_LOTE = 10000  # Aumentado para menos commits
+CHUNK_SIZE = 16 * 1024 * 1024  # 16MB
+TAMANHO_LOTE = 10000
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 5
 
@@ -56,39 +56,37 @@ def validar_email(email: str) -> bool:
     )
 
 def baixar_torrent_otimizado() -> bool:
-    """Download do torrent com máxima velocidade"""
+    """Download do torrent com máxima velocidade - VERSÃO CORRIGIDA"""
     logger.info("📡 INICIANDO DOWNLOAD COM VELOCIDADE MÁXIMA...")
     
     try:
-        # Configuração agressiva para máxima velocidade
+        # Configuração otimizada (apenas parâmetros suportados)
         settings = {
             'listen_interfaces': '0.0.0.0:6881,0.0.0.0:6889',
-            'connections_limit': 1000,  # Máximo de conexões
-            'connection_speed': 100,  # Conexões por segundo
+            'connections_limit': 1000,
+            'connection_speed': 100,
             'request_timeout': 3,
             'peer_connect_timeout': 3,
-            'download_rate_limit': 0,  # Sem limite de velocidade
-            'upload_rate_limit': 50000000,  # 50MB/s para upload
+            'download_rate_limit': 0,
+            'upload_rate_limit': 0,
             'active_downloads': 100,
             'active_seeds': 100,
             'active_dht_limit': 600,
-            'max_metadata_size': 16777216,
-            'max_piece_size': 16777216,
-            'max_out_request_queue': 500,
-            'whole_pieces_threshold': 2097152,  # 2MB
         }
         
         ses = lt.session(settings)
         
-        # Permitir conexões IPv4 e IPv6
-        ses.add_dht_router("router.utorrent.com", 6881)
-        ses.add_dht_router("dht.transmissionbt.com", 6881)
-        ses.add_dht_router("router.bittorrent.com", 6881)
+        # Adicionar DHT routers
+        try:
+            ses.add_dht_router("router.utorrent.com", 6881)
+            ses.add_dht_router("dht.transmissionbt.com", 6881)
+            ses.add_dht_router("router.bittorrent.com", 6881)
+        except Exception as e:
+            logger.warning(f"⚠️ Aviso ao adicionar DHT: {e}")
         
         # Parse magnet
         params = lt.parse_magnet_uri(MAGNET_LINK)
         params.save_path = '.'
-        params.flags |= lt.torrent_flags.sequential_download  # Download sequencial
         
         handle = ses.add_torrent(params)
         
@@ -107,9 +105,6 @@ def baixar_torrent_otimizado() -> bool:
         
         logger.info("✅ Metadados recebidos!")
         
-        # Desabilitar upload enquanto baixa
-        ses.set_settings({'upload_rate_limit': 0})
-        
         # Download com feedback contínuo
         inicio = time.time()
         ultimo_reporte = 0
@@ -124,7 +119,7 @@ def baixar_torrent_otimizado() -> bool:
                 velocidade_pico = vel_mb
             
             tempo_atual = time.time() - inicio
-            if tempo_atual - ultimo_reporte >= 5:  # Reporte a cada 5 segundos
+            if tempo_atual - ultimo_reporte >= 5:
                 logger.info(
                     f"📥 {progress:6.2f}% | "
                     f"Vel: {vel_mb:7.2f}MB/s | "
@@ -147,6 +142,8 @@ def baixar_torrent_otimizado() -> bool:
         
     except Exception as e:
         logger.error(f"❌ Erro no download: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def conectar_db(tentativa=0):
@@ -201,7 +198,7 @@ def inserir_lote_otimizado(conn, buffer_lote: List[Tuple]) -> bool:
                 )
             
             conn.commit()
-            logger.info(f"🚀 {len(buffer_lote)} leads inseridos | Cache atual")
+            logger.info(f"🚀 {len(buffer_lote)} leads inseridos")
             return True
             
         except Exception as e:
@@ -301,6 +298,8 @@ def processar_arquivo_otimizado(conn, filepath: str, cache_local: Set[str]) -> T
         
     except Exception as e:
         logger.error(f"❌ Erro processando {filepath}: {e}")
+        import traceback
+        traceback.print_exc()
         return 0, 0
 
 def processar():
@@ -350,6 +349,8 @@ def processar():
         
     except Exception as e:
         logger.error(f"❌ Erro geral: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     finally:
         conn.close()
