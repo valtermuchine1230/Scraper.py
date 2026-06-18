@@ -1,32 +1,37 @@
-name: Minerador
+name: Minerador -> Hugging Face
 on:
   workflow_dispatch:
 
 jobs:
   mineracao:
     runs-on: ubuntu-latest
-    # Ajuste timeout-minutes se souber que precisa de mais tempo; GitHub tem limites.
-    # timeout-minutes: 360
+    timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Preparar dependências do sistema
+      - name: System packages (libtorrent)
         run: |
           sudo apt-get update -y
-          # instala bindings do libtorrent; nome do pacote pode variar conforme runner
-          sudo apt-get install -y python3-libtorrent libtorrent-rasterbar-dev
-        # Se o runner não tiver python3-libtorrent disponível, considere usar runner self-hosted
-      - name: Instalar dependências Python
+          sudo apt-get install -y build-essential libssl-dev libffi-dev python3-dev \
+            libtorrent-rasterbar-dev libcurl4-openssl-dev
+        # Note: python binding availability depends on runner. If the runner lacks python-libtorrent package,
+        # you may need a self-hosted runner or to compile bindings. This installs system deps.
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "psycopg[binary]" || pip install psycopg-binary
-      - name: Executar minerador
+          pip install huggingface_hub datasets pyarrow pandas rich libtorrent colorlog
+
+      - name: Run minerador
         env:
-          DB_URL: ${{ secrets.DB_URL }}
-          MAGNET_LINK: ${{ secrets.MAGNET_LINK }}
-          # Opcional: ajustar parâmetro BATCH_SIZE/POLL_INTERVAL via environment variables
-          BATCH_SIZE: "2000"
-          POLL_INTERVAL: "8"
-          SAVE_PATH: "."
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SAVE_PATH: ${{ github.workspace }}/data
         run: |
+          mkdir -p $SAVE_PATH
           python minerador.py
