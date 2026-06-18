@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Minerador -> Hugging Face (versão com diagnóstico robusto de arquivos)
+Minerador -> Hugging Face (corrigido)
 
-Atualizações importantes:
-- Logs do metadata (lista de arquivos no torrent) e do disco quando found=0.
-- Matching mais tolerante (basename, substring, normalização, close-match).
-- Sugestões impressas quando nada é encontrado.
-- Mantém restante do pipeline (SQLite/HF) como antes.
-
-Rode: python minerador.py
+- Diagnóstico robusto quando arquivos alvo não são encontrados.
+- Matching tolerante (basename, substring, normalized, close-match).
+- Checkpoint local (checkpoint.json).
+- Deduplicação persistente via SQLite (emails.db).
+- Export incremental para Parquet e upload para Hugging Face Dataset privado.
+- Logs com rich.
 """
 import os
 import re
@@ -19,36 +18,44 @@ import tarfile
 import signal
 import logging
 import sqlite3
-import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import difflib
 import unicodedata
 
+# bittorrent
 import libtorrent as lt
+
+# Hugging Face
 from huggingface_hub import HfApi
+
+# data export
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+# rich logging
 from rich.logging import RichHandler
 from rich.console import Console
 from rich.table import Table
 
 # -------- CONFIG --------
-HF_TOKEN_DEFAULT = "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"
+# HF token: env HF_TOKEN overrides HF_TOKEN_DEFAULT.
+HF_TOKEN_DEFAULT = "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"  # if you insist to embed token
 HF_TOKEN = os.getenv("HF_TOKEN", HF_TOKEN_DEFAULT)
+
 HF_DATASET_NAME = os.getenv("HF_DATASET_NAME", "email_miner_dataset")
 SAVE_PATH = Path(os.getenv("SAVE_PATH", "."))
 CHECKPOINT_PATH = SAVE_PATH / "checkpoint.json"
 SQLITE_DB = SAVE_PATH / "emails.db"
 EXPORT_DIR = SAVE_PATH / "exports"
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "8"))
-WAIT_RETRIES = int(os.getenv("WAIT_RETRIES", "20"))  # aumentado para tolerância
+WAIT_RETRIES = int(os.getenv("WAIT_RETRIES", "20"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-BATCH_REF = int(os.getenv("BATCH_REF", "2000"))
+BATCH_REF = int(os.getenv("BATCH_REF", "200000"))  # how many rows to export in a batch
 
-# user-configured magnets/targets
+# magnets and targets (edit if needed)
 MAGNETS = [
     {
         "name": "Collection #2-#5",
@@ -60,7 +67,7 @@ MAGNETS = [
     },
     {
         "name": "Collection #1",
-        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2fannounce",
+        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2fannounce",
         "targets": [
             "Collection #1_BTC combos.tar.gz",
             "Collection #1_OLD CLOUD_Trading combos.tar.gz",
@@ -74,35 +81,36 @@ console = Console()
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(message)s",
-    handlers=[RichHandler(console=console, rich_tracebacks=True)]
+    handlers=[RichHandler(console=console, rich_tracebacks=True)],
 )
 logger = logging.getLogger("minerador")
 logger.setLevel(LOG_LEVEL)
 
-# email regex (bytes)
 EMAIL_REGEX = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
 
 # ---------- Helpers ----------
 def normalize_for_match(s: str) -> str:
-    """Normaliza uma string: remove acentos, non-alnum, lowercase."""
     if not isinstance(s, str):
         s = str(s)
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    # replace non-alnum with single space
     s = re.sub(r'[^0-9a-zA-Z]+', ' ', s)
-    s = s.strip().lower()
-    return s
+    return s.strip().lower()
 
-def list_disk_files(root: Path, max_files=1000):
-    """Lista recursivamente arquivos no disco (usa para diagnóstico)."""
+def sanitize_filename(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "._- " else "_" for c in s)[:200].replace(" ", "_")
+
+def safe_mkdir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def list_disk_files(root: Path, max_files=2000):
     out = []
     for dirpath, _, filenames in os.walk(root):
         for fn in filenames:
-            full = os.path.join(dirpath, fn)
+            full = Path(dirpath) / fn
             try:
-                size = os.path.getsize(full)
-            except OSError:
+                size = full.stat().st_size
+            except Exception:
                 size = 0
             out.append((full, size))
             if len(out) >= max_files:
@@ -110,7 +118,6 @@ def list_disk_files(root: Path, max_files=1000):
     return out
 
 def print_metadata_file_list(info):
-    """Imprime a lista de arquivos do torrent metadata (name + size)."""
     n = info.num_files()
     table = Table(title="Torrent metadata files", show_header=True, header_style="bold magenta")
     table.add_column("idx", style="dim", width=6)
@@ -120,40 +127,6 @@ def print_metadata_file_list(info):
         f = info.files().at(i)
         table.add_row(str(i), f.path, f"{f.size:,}")
     console.print(table)
-
-def find_local_target_files(root: Path, targets):
-    """Melhorado: tenta vários tipos de matching e devolve lista de Paths."""
-    matches = set()
-    # gather disk files once
-    disk_files = []
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            disk_files.append(Path(dirpath) / fn)
-    disk_basenames = {p: p.name for p in disk_files}
-
-    # precompute normalized forms
-    disk_norm_map = {p: normalize_for_match(str(p.name)): p for p in disk_files}
-    disk_full_norm_map = {p: normalize_for_match(str(p)): p for p in disk_files}
-
-    for target in targets:
-        t_base = os.path.basename(target)
-        t_norm = normalize_for_match(t_base)
-        # 1) exact basename match (case-insensitive)
-        for p in disk_files:
-            if p.name.lower() == t_base.lower():
-                matches.add(p)
-        # 2) substring match in full path (case-insensitive)
-        for p in disk_files:
-            if t_base.lower() in str(p).lower():
-                matches.add(p)
-        # 3) normalized exact
-        if t_norm in disk_norm_map:
-            matches.add(disk_norm_map[t_norm])
-        # 4) close matches using difflib on normalized names
-        close = difflib.get_close_matches(t_norm, list(disk_norm_map.keys()), n=3, cutoff=0.6)
-        for c in close:
-            matches.add(disk_norm_map[c])
-    return sorted(matches)
 
 def build_torrent_file_size_map(torrent_info):
     mapping = {}
@@ -178,37 +151,9 @@ def expected_size_for_local_path(local_path: Path, file_size_map: dict):
     base = os.path.basename(local_path).lower()
     return file_size_map.get(base)
 
-# ---------- HF helpers (kept minimal) ----------
-def hf_api_login_and_prepare_repo(token: str, dataset_name: str):
-    api = HfApi()
-    who = api.whoami(token=token)
-    user = who.get("name") or who.get("user") or who.get("id")
-    repo_id = f"{user}/{dataset_name}"
-    try:
-        api.create_repo(repo_id=repo_id, token=token, repo_type="dataset", private=True)
-        logger.info(f"✅ Created dataset: {repo_id}")
-    except Exception as e:
-        if "already exists" in str(e).lower():
-            logger.info(f"Dataset already exists: {repo_id}")
-        else:
-            logger.info(f"Dataset check/create: {repo_id} (maybe exists). Msg: {e}")
-    return api, repo_id, user
-
-def hf_upload_file(api, token, repo_id, local_path: Path, repo_path: str):
-    try:
-        api.upload_file(path_or_fileobj=str(local_path),
-                        path_in_repo=repo_path,
-                        repo_id=repo_id,
-                        repo_type="dataset",
-                        token=token)
-        return True
-    except Exception:
-        logger.exception("Upload failed for %s", local_path)
-        return False
-
-# ---------- SQLite (simple dedupe) ----------
+# ---------- SQLite persistence ----------
 def init_sqlite(db_path: Path):
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_mkdir(db_path.parent)
     conn = sqlite3.connect(str(db_path), timeout=30)
     cur = conn.cursor()
     cur.execute("""
@@ -220,6 +165,7 @@ def init_sqlite(db_path: Path):
         uploaded INTEGER DEFAULT 0
     );
     """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_uploaded ON emails(uploaded);")
     conn.commit()
     return conn
 
@@ -246,7 +192,7 @@ def mark_uploaded_for_rows(conn, emails_list):
         conn.rollback()
         logger.exception("Failed to mark uploaded rows")
 
-# ---------- Checkpoint helpers ----------
+# ---------- Checkpoint ----------
 def load_checkpoint():
     if CHECKPOINT_PATH.exists():
         try:
@@ -257,7 +203,7 @@ def load_checkpoint():
     return {}
 
 def save_checkpoint(data):
-    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    safe_mkdir(CHECKPOINT_PATH.parent)
     with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -270,14 +216,82 @@ def guess_name(email: str) -> str:
         return ""
     return " ".join([p.capitalize() for p in spaced.split()])
 
-# ---------- Core: improved download/wait + diag ----------
+# ---------- Hugging Face helpers ----------
+def hf_api_login_and_prepare_repo(token: str, dataset_name: str):
+    api = HfApi()
+    try:
+        who = api.whoami(token=token)
+        user = who.get("name") or who.get("user") or who.get("id")
+    except Exception as e:
+        logger.exception("HF whoami failed: %s", e)
+        raise
+    repo_id = f"{user}/{dataset_name}"
+    try:
+        api.create_repo(repo_id=repo_id, token=token, repo_type="dataset", private=True)
+        logger.info(f"✅ Created dataset: {repo_id}")
+    except Exception as e:
+        if "already exists" in str(e).lower():
+            logger.info(f"Dataset already exists: {repo_id}")
+        else:
+            logger.info(f"Dataset check/create: {repo_id} (maybe exists). Msg: {e}")
+    return api, repo_id, user
+
+def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_path: str):
+    try:
+        api.upload_file(path_or_fileobj=str(local_path),
+                        path_in_repo=repo_path,
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        token=token)
+        logger.info(f"Uploaded {repo_path}")
+        return True
+    except Exception:
+        logger.exception("Upload failed for %s", local_path)
+        return False
+
+# ---------- Matching helpers ----------
+def find_local_target_files(root: Path, targets):
+    """
+    Matching strategy:
+    - exact basename
+    - substring of full path (case-insensitive)
+    - normalized basename match
+    - close matches using difflib on normalized basenames
+    """
+    disk_files = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            disk_files.append(Path(dirpath) / fn)
+    disk_norm_map = {normalize_for_match(p.name): p for p in disk_files}
+    disk_full_norm_map = {normalize_for_match(str(p)): p for p in disk_files}
+    matches = set()
+    for target in targets:
+        t_base = os.path.basename(target)
+        t_norm = normalize_for_match(t_base)
+        # exact basename
+        for p in disk_files:
+            if p.name.lower() == t_base.lower():
+                matches.add(p)
+        # substring in full path
+        for p in disk_files:
+            if t_base.lower() in str(p).lower():
+                matches.add(p)
+        # normalized exact
+        if t_norm in disk_norm_map:
+            matches.add(disk_norm_map[t_norm])
+        # close matches
+        close = difflib.get_close_matches(t_norm, list(disk_norm_map.keys()), n=3, cutoff=0.6)
+        for c in close:
+            matches.add(disk_norm_map[c])
+    return sorted(matches)
+
+# ---------- Diagnostics + download wait ----------
 def download_and_wait_with_diagnostics(magnet: str, save_path: Path, targets):
     ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
     params = lt.parse_magnet_uri(magnet)
     params.save_path = str(save_path)
     handle = ses.add_torrent(params)
     logger.info("🔗 Magnet added. Waiting metadata...")
-    # wait metadata
     while not handle.has_metadata():
         s = handle.status()
         logger.info(f"⏳ waiting metadata: peers={s.num_peers} state={s.state}")
@@ -286,7 +300,6 @@ def download_and_wait_with_diagnostics(magnet: str, save_path: Path, targets):
     info = handle.get_torrent_info()
     print_metadata_file_list(info)
     file_size_map = build_torrent_file_size_map(info)
-
     # prioritize
     n_files = info.num_files()
     prioritized_count = 0
@@ -298,8 +311,7 @@ def download_and_wait_with_diagnostics(magnet: str, save_path: Path, targets):
                 prioritized_count += 1
                 break
     logger.info(f"Prioritized {prioritized_count} files (if matched).")
-
-    # wait for files to appear and be complete
+    # wait loop
     retries = 0
     while True:
         s = handle.status()
@@ -308,24 +320,20 @@ def download_and_wait_with_diagnostics(magnet: str, save_path: Path, targets):
         if found:
             logger.info(f"[green]Found {len(found)} matching file(s):[/green] {', '.join(str(p) for p in found)}")
             return handle, found, file_size_map
-        # not found -> diagnostics when torrent is 100% or after several retries
         if s.progress >= 1.0 or retries >= WAIT_RETRIES:
             logger.warning("Torrent appears complete or retries exceeded but no target files found. Running diagnostics...")
-            # 1) print all metadata entries (already printed above)
-            # 2) list disk files
-            disk_files = list_disk_files(save_path, max_files=2000)
+            # list disk files (first 500)
+            disk_files = list_disk_files(save_path, max_files=500)
             if not disk_files:
-                logger.warning(f"No files found on disk under {save_path} — maybe save_path is wrong or torrent saved to different location.")
+                logger.warning(f"No files found on disk under {save_path} — maybe save_path is wrong.")
             else:
-                # print table of some disk files
                 table = Table(title=f"Disk files under {save_path} (first 200)", show_header=True)
                 table.add_column("path", overflow="fold")
                 table.add_column("size", justify="right")
                 for p, sz in disk_files[:200]:
                     table.add_row(str(p), f"{sz:,}")
                 console.print(table)
-            # 3) Suggest close matches between metadata names and disk names
-            # build lists
+            # suggest close matches between metadata and disk
             meta_names = [info.files().at(i).path for i in range(info.num_files())]
             disk_names = [os.path.basename(p) for p, _ in disk_files]
             disk_norms = {normalize_for_match(n): n for n in disk_names}
@@ -345,7 +353,7 @@ def download_and_wait_with_diagnostics(magnet: str, save_path: Path, targets):
                 console.print(table2)
             else:
                 logger.info("No close matches found between metadata filenames and disk filenames.")
-            # 4) Print normalized target vs disk normalized similarities
+            # targets -> best matches
             target_norms = {t: normalize_for_match(os.path.basename(t)) for t in targets}
             best_matches = {}
             for t, tnorm in target_norms.items():
@@ -357,47 +365,71 @@ def download_and_wait_with_diagnostics(magnet: str, save_path: Path, targets):
             for t, bm in best_matches.items():
                 table3.add_row(t, ", ".join(bm) if bm else "(none)")
             console.print(table3)
-            # stop waiting and return empty list so caller can decide
             return handle, [], file_size_map
         retries += 1
         time.sleep(POLL_INTERVAL)
 
-# ---------- Main flow (simplified) ----------
+# ---------- Main flow ----------
+_stop_requested = False
+def handle_sig(signum, frame):
+    global _stop_requested
+    logger.warning(f"Signal {signum} received; will stop after current item.")
+    _stop_requested = True
+
+signal.signal(signal.SIGINT, handle_sig)
+signal.signal(signal.SIGTERM, handle_sig)
+
 def main():
+    global HF_TOKEN
+    HF_TOKEN = os.getenv("HF_TOKEN", HF_TOKEN)
     if not HF_TOKEN:
-        logger.error("HF_TOKEN not set. Set env HF_TOKEN or HF_TOKEN_DEFAULT in code.")
+        logger.error("HF_TOKEN not set. Set env HF_TOKEN or embed in code.")
         sys.exit(1)
     api, repo_id, hf_user = hf_api_login_and_prepare_repo(HF_TOKEN, HF_DATASET_NAME)
     conn_sqlite = init_sqlite(SQLITE_DB)
     checkpoint = load_checkpoint()
+    overall_report = {}
 
     for magnet_item in MAGNETS:
-        name = magnet_item.get("name")
-        magnet = magnet_item.get("magnet")
+        if _stop_requested:
+            break
+        torrent_name = magnet_item.get("name")
+        magnet_link = magnet_item.get("magnet")
         targets = magnet_item.get("targets", [])
-        logger.info(f"[blue]Starting torrent {name}[/blue]")
-        handle, found_files, file_size_map = download_and_wait_with_diagnostics(magnet, SAVE_PATH, targets)
+        logger.info(f"[blue]Iniciando torrent:[/blue] {torrent_name}")
+        handle, found_files, file_size_map = download_and_wait_with_diagnostics(magnet_link, SAVE_PATH, targets)
         if not found_files:
-            logger.warning(f"No target files found for torrent {name}. See diagnostics above.")
+            logger.warning(f"No target files found for torrent {torrent_name}. See diagnostics above.")
             continue
-        # process found_files as earlier: open tar, iterate members, extract emails, insert sqlite, export/upload
+        report_for_torrent = {"files_processed": 0, "members_processed": 0, "emails_found_per_file": {}, "emails_saved_per_file": {}}
         for tar_path in found_files:
-            logger.info(f"Processing tar: {tar_path}")
+            if _stop_requested:
+                break
+            tar_name = tar_path.name
+            logger.info(f"[blue]Abrindo tar:[/blue] {tar_path}")
+            if not tar_path.exists():
+                logger.warning(f"Arquivo não existe (pular): {tar_path}")
+                continue
+            expected = expected_size_for_local_path(tar_path, file_size_map)
+            if expected and tar_path.stat().st_size < expected:
+                logger.warning(f"Arquivo {tar_path} ainda incompleto (pular).")
+                continue
             try:
                 with tarfile.open(tar_path, "r:*") as t:
                     for member in t:
+                        if _stop_requested:
+                            break
                         if not member.isfile():
                             continue
                         if not (member.name.endswith(".txt") or member.name.endswith(".csv")):
                             continue
-                        key = f"{name}||{os.path.basename(tar_path)}||{member.name}"
+                        key = f"{torrent_name}||{tar_name}||{member.name}"
                         if checkpoint.get(key) == "done":
                             logger.info(f"Skipping already done member {member.name}")
                             continue
                         logger.info(f"Processing member {member.name}")
                         checkpoint[key] = "processing"
                         save_checkpoint(checkpoint)
-                        # process member: read stream and insert into sqlite
                         extracted = 0
                         inserted = 0
                         f = t.extractfile(member)
@@ -410,7 +442,7 @@ def main():
                             for email_b in EMAIL_REGEX.findall(raw_line):
                                 try:
                                     email = email_b.decode("utf8", "ignore").strip().lower()
-                                except:
+                                except Exception:
                                     email = email_b.decode("latin1", "ignore").strip().lower()
                                 if not email:
                                     continue
@@ -420,33 +452,44 @@ def main():
                                 extracted += 1
                                 if inserted_flag:
                                     inserted += 1
-                        # after processing member, try exporting & uploading this batch
-                        exported = 0
-                        uploaded = 0
-                        # export up to BATCH_REF rows from sqlite (uploaded=0)
+                        # export batch up to BATCH_REF
                         cur = conn_sqlite.cursor()
                         cur.execute("SELECT email,nome,origem,data FROM emails WHERE uploaded=0 LIMIT ?", (BATCH_REF,))
                         rows = cur.fetchall()
+                        exported = 0
+                        uploaded = 0
                         if rows:
                             df = pd.DataFrame(rows, columns=["email","nome","origem","data"])
-                            safe_dir = EXPORT_DIR / sanitize_filename(name) / sanitize_filename(os.path.basename(tar_path))
-                            safe_dir.mkdir(parents=True, exist_ok=True)
+                            safe_mkdir(EXPORT_DIR)
+                            out_dir = EXPORT_DIR / sanitize_filename(torrent_name) / sanitize_filename(tar_name)
+                            safe_mkdir(out_dir)
                             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                             fname = f"{sanitize_filename(member.name)}_{ts}.parquet"
-                            out_path = safe_dir / fname
+                            out_path = out_dir / fname
                             table = pa.Table.from_pandas(df)
                             pq.write_table(table, str(out_path), compression="snappy")
                             exported = len(df)
-                            repo_path = f"{sanitize_filename(name)}/{sanitize_filename(os.path.basename(tar_path))}/{fname}"
+                            repo_path = f"{sanitize_filename(torrent_name)}/{sanitize_filename(tar_name)}/{fname}"
                             if hf_upload_file(api, HF_TOKEN, repo_id, out_path, repo_path):
                                 uploaded = exported
                                 mark_uploaded_for_rows(conn_sqlite, df["email"].tolist())
                         checkpoint[key] = "done"
                         save_checkpoint(checkpoint)
-                        logger.info(f"Member done: {member.name} extracted={extracted} inserted_new={inserted} exported={exported} uploaded={uploaded}")
+                        report_for_torrent["members_processed"] += 1
+                        report_for_torrent["files_processed"] = report_for_torrent.get("files_processed", 0) + 0
+                        report_for_torrent["emails_found_per_file"].setdefault(tar_name, 0)
+                        report_for_torrent["emails_saved_per_file"].setdefault(tar_name, 0)
+                        report_for_torrent["emails_found_per_file"][tar_name] += extracted
+                        report_for_torrent["emails_saved_per_file"][tar_name] += uploaded
+                        logger.info(f"[green]Member finalizado:[/green] {member.name} extraídos={extracted} inseridos_new={inserted} exported={exported} uploaded={uploaded}")
+            except tarfile.ReadError as e:
+                logger.exception("ReadError on tar %s: %s", tar_path, e)
+                continue
             except Exception as e:
                 logger.exception("Error processing tar %s: %s", tar_path, e)
                 continue
+            report_for_torrent["files_processed"] += 1
+        overall_report[torrent_name] = report_for_torrent
 
     # final summary
     cur = conn_sqlite.cursor()
@@ -455,13 +498,23 @@ def main():
     cur.execute("SELECT COUNT(*) FROM emails WHERE uploaded=1")
     total_up = cur.fetchone()[0]
     console.rule("[bold green]FINAL REPORT[/bold green]")
-    console.print(f"Total unique emails (sqlite): {total:,}")
-    console.print(f"Total uploaded to HF: {total_up:,}")
-    console.rule("[bold green]END[/bold green]")
-    conn_sqlite.close()
-
-def sanitize_filename(s: str):
-    return "".join(c if c.isalnum() or c in "._- " else "_" for c in s)[:200].replace(" ", "_")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Torrent")
+    table.add_column("Files Processed", justify="right")
+    table.add_column("Members Processed", justify="right")
+    table.add_column("Emails Found", justify="right")
+    table.add_column("Emails Uploaded", justify="right")
+    for tname, rep in overall_report.items():
+        files = rep.get("files_processed", 0)
+        members = rep.get("members_processed", 0)
+        emails_found = sum(rep.get("emails_found_per_file", {}).values())
+        emails_uploaded = sum(rep.get("emails_saved_per_file", {}).values())
+        table.add_row(tname, str(files), str(members), f"{emails_found:,}", f"{emails_uploaded:,}")
+    console.print(table)
+    console.print(f"TOTAL UNIQUE EMAILS (SQLite): {total:,}")
+    console.print(f"TOTAL UPLOADED TO HF: {total_up:,}")
+    console.print(f"Export files location: {EXPORT_DIR}")
+    console.rule("[bold green]FIM[/bold green]")
 
 if __name__ == "__main__":
     main()
