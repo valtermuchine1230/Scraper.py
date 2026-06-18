@@ -1,23 +1,24 @@
-name: Process Emails
+name: Minerador Industrial
+
 on: [workflow_dispatch]
 
 jobs:
-  process:
+  minerador:
     runs-on: ubuntu-latest
+    timeout-minutes: 1440
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install system dependencies
+      - name: Instalar dependências de sistema
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libtorrent-rasterbar-dev python3-libtorrent
-      
-      - name: Install Python dependencies
+          sudo apt update
+          sudo apt install -y libtorrent-rasterbar-dev python3-libtorrent
+          
+      - name: Instalar dependências Python
         run: |
-          pip install --upgrade pip
           pip install psycopg[binary]
-      
-      - name: Run Minerador
+          
+      - name: Executar Processamento
         env:
           DB_URL: ${{ secrets.DB_URL }}
         run: python minerador.py
