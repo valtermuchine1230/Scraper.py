@@ -1,22 +1,57 @@
-name: Minerador-Neon-Producao
+name: Process Emails from Torrent
+
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
+    inputs:
+      magnet_link:
+        description: 'Magnet link do torrent'
+        required: true
+      target_files:
+        description: 'Arquivos alvo (separados por vírgula)'
+        required: true
+        default: 'arquivo.tar.gz'
 
 jobs:
-  mineracao:
-    runs-on: ubuntu-22.04
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440  # 24 horas
+    
     steps:
       - uses: actions/checkout@v4
+      
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-      - name: Instalar Dependências
+          python-version: '3.11'
+      
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-libtorrent
-          pip install libtorrent psycopg[binary]
-      - name: Rodar Minerador
-        run: python minerador.py
+          sudo apt-get install -y libtorrent-rasterbar-dev
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Set environment
+        run: |
+          echo "MAGNET_LINK=${{ github.event.inputs.magnet_link }}" >> $GITHUB_ENV
+          echo "TARGET_FILES=${{ github.event.inputs.target_files }}" >> $GITHUB_ENV
+      
+      - name: Run email processor
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+        run: |
+          python -c "
+          import os
+          magnet = os.getenv('MAGNET_LINK')
+          files = [f.strip() for f in os.getenv('TARGET_FILES').split(',')]
+          print(f'Magnet: {magnet}')
+          print(f'Files: {files}')
+          " && python process_emails.py
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: execution-logs
+          path: logs/
+          retention-days: 30
