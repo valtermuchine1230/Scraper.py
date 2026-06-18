@@ -1,11 +1,23 @@
-- name: Install system dependencies
+name: Process Emails
+on: [workflow_dispatch]
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          # Este pacote instala a biblioteca C++ e os bindings Python automaticamente
           sudo apt-get install -y libtorrent-rasterbar-dev python3-libtorrent
       
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          # Remova o python-libtorrent daqui!
           pip install psycopg[binary]
+      
+      - name: Run Minerador
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+        run: python minerador.py
