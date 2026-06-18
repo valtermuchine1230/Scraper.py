@@ -11,7 +11,10 @@ import psycopg
 # ============ CONFIGURAÇÃO ============
 DB_URL = "postgresql://authenticator:npg_kIH5FMhy9EcR@ep-delicate-heart-ad6by8cm-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 MAGNET_LINK = "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce"
-ARQUIVOS_ALVO = ["Trading Collection.tar.gz", "Collection #4_BTC combos.tar.gz"]
+ARQUIVOS_ALVO = [
+    "Collection #2_New combo cloud_Trading Collection.tar.gz",
+    "Collection #4_BTC combos.tar.gz"
+]
 
 CHUNK_SIZE = 16 * 1024 * 1024
 TAMANHO_LOTE = 10000
@@ -32,14 +35,7 @@ EMAIL_REGEX = re.compile(
 # ============ FUNÇÕES ============
 
 def validar_magnet(magnet: str) -> bool:
-    if not magnet.startswith("magnet:?"):
-        logger.error("❌ Magnet link inválido")
-        return False
-    if "xt=urn:btih:" not in magnet:
-        logger.error("❌ Sem xt=urn:btih:")
-        return False
-    logger.info(f"✅ Magnet válido")
-    return True
+    return magnet.startswith("magnet:?") and "xt=urn:btih:" in magnet
 
 def deduzir_nome(email_bytes: bytes) -> str:
     try:
@@ -51,11 +47,10 @@ def deduzir_nome(email_bytes: bytes) -> str:
         return "Trader Lead"
 
 def validar_email(email: str) -> bool:
-    return (len(email) <= 254 and '@' in email and email.count('@') == 1 and '.' in email.split('@')[1])
+    return len(email) <= 254 and '@' in email and email.count('@') == 1 and '.' in email.split('@')[1]
 
-def baixar_torrent_compativel() -> bool:
-    logger.info("📡 DOWNLOAD DO TORRENT...")
-    if not validar_magnet(MAGNET_LINK): return False
+def baixar_torrent_seletivo_v2() -> bool:
+    logger.info("📡 DOWNLOAD SELETIVO DO TORRENT...")
     
     try:
         settings = {'listen_interfaces': '0.0.0.0:6881,0.0.0.0:6889', 'connections_limit': 1000}
@@ -67,25 +62,27 @@ def baixar_torrent_compativel() -> bool:
         logger.info("⏳ Aguardando metadados...")
         while not handle.status().has_metadata: time.sleep(1)
         
-        logger.info("✅ Metadados recebidos! Iniciando download...")
+        # Identificar arquivos e priorizar
+        info = handle.get_torrent_info()
+        logger.info("📋 Configurando prioridades de download...")
+        for i in range(info.num_files()):
+            fname = info.files().at(i).path
+            if any(alvo in fname for alvo in ARQUIVOS_ALVO):
+                handle.file_priority(i, 7)
+                logger.info(f"  ✅ Selecionado: {fname}")
+            else:
+                handle.file_priority(i, 0)
+        
         while not handle.status().is_seeding:
             status = handle.status()
             logger.info(f"📥 {status.progress*100:6.2f}% | Vel: {status.download_rate/1024/1024:7.2f}MB/s | Peers: {status.num_peers}")
-            time.sleep(10)
+            time.sleep(5)
             
         logger.info("✅ DOWNLOAD CONCLUÍDO!")
         return True
     except Exception as e:
-        logger.error(f"❌ Erro: {e}")
+        logger.error(f"❌ Erro no download: {e}")
         return False
-
-def conectar_db():
-    try:
-        conn = psycopg.connect(DB_URL, timeout=10)
-        logger.info("✅ Conectado ao banco de dados")
-        return conn
-    except:
-        return None
 
 def inserir_lote_otimizado(conn, buffer_lote: List[Tuple]):
     try:
@@ -104,8 +101,7 @@ def processar_arquivo_otimizado(conn, filepath: str, cache_local: Set[str]) -> T
                 if not member.isfile() or not member.name.endswith(('.txt', '.csv')): continue
                 f = tar.extractfile(member)
                 for line in f:
-                    emails = EMAIL_REGEX.findall(line)
-                    for email_bytes in emails:
+                    for email_bytes in EMAIL_REGEX.findall(line):
                         email = email_bytes.decode('utf-8', 'ignore').lower().strip()
                         if validar_email(email) and email not in cache_local:
                             cache_local.add(email)
@@ -121,10 +117,8 @@ def processar_arquivo_otimizado(conn, filepath: str, cache_local: Set[str]) -> T
         return 0, 0
 
 def processar():
-    if not baixar_torrent_compativel(): sys.exit(1)
-    conn = conectar_db()
-    if not conn: sys.exit(1)
-    
+    if not baixar_torrent_seletivo_v2(): sys.exit(1)
+    conn = psycopg.connect(DB_URL)
     cache = set()
     for arquivo in ARQUIVOS_ALVO:
         if os.path.exists(arquivo):
