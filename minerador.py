@@ -38,6 +38,7 @@ def validar_magnet(magnet: str) -> bool:
     if "xt=urn:btih:" not in magnet:
         logger.error("❌ Sem xt=urn:btih:")
         return False
+    logger.info(f"✅ Magnet válido")
     return True
 
 def deduzir_nome(email_bytes: bytes) -> str:
@@ -52,11 +53,13 @@ def deduzir_nome(email_bytes: bytes) -> str:
 def validar_email(email: str) -> bool:
     return (len(email) <= 254 and '@' in email and email.count('@') == 1 and '.' in email.split('@')[1])
 
-def baixar_torrent_seletivo() -> bool:
-    logger.info("📡 DOWNLOAD SELETIVO (APENAS ARQUIVOS ALVO)...")
+def baixar_torrent_compativel() -> bool:
+    logger.info("📡 DOWNLOAD DO TORRENT...")
     if not validar_magnet(MAGNET_LINK): return False
+    
     try:
-        ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+        settings = {'listen_interfaces': '0.0.0.0:6881,0.0.0.0:6889', 'connections_limit': 1000}
+        ses = lt.session(settings)
         params = lt.parse_magnet_uri(MAGNET_LINK)
         params.save_path = '.'
         handle = ses.add_torrent(params)
@@ -64,23 +67,13 @@ def baixar_torrent_seletivo() -> bool:
         logger.info("⏳ Aguardando metadados...")
         while not handle.status().has_metadata: time.sleep(1)
         
-        info = handle.get_torrent_info()
-        tamanho_total = 0
-        
-        for i in range(info.num_files()):
-            arquivo = info.file_path(i)
-            if any(alvo in arquivo for alvo in ARQUIVOS_ALVO):
-                handle.file_priority(i, 7)
-                tamanho_total += info.file_size(i)
-                logger.info(f"  ✅ {arquivo} - MARCADO PARA DOWNLOAD")
-            else:
-                handle.file_priority(i, 0)
-        
-        logger.info(f"📊 TAMANHO A BAIXAR: {tamanho_total/1024/1024:.2f}MB")
+        logger.info("✅ Metadados recebidos! Iniciando download...")
         while not handle.status().is_seeding:
             status = handle.status()
-            print(f"📥 {status.progress*100:.1f}% | Vel: {status.download_rate/1024/1024:.2f}MB/s", end="\r")
-            time.sleep(5)
+            logger.info(f"📥 {status.progress*100:6.2f}% | Vel: {status.download_rate/1024/1024:7.2f}MB/s | Peers: {status.num_peers}")
+            time.sleep(10)
+            
+        logger.info("✅ DOWNLOAD CONCLUÍDO!")
         return True
     except Exception as e:
         logger.error(f"❌ Erro: {e}")
@@ -88,7 +81,9 @@ def baixar_torrent_seletivo() -> bool:
 
 def conectar_db():
     try:
-        return psycopg.connect(DB_URL, timeout=10)
+        conn = psycopg.connect(DB_URL, timeout=10)
+        logger.info("✅ Conectado ao banco de dados")
+        return conn
     except:
         return None
 
@@ -121,13 +116,15 @@ def processar_arquivo_otimizado(conn, filepath: str, cache_local: Set[str]) -> T
                                 buffer_lote = []
         if buffer_lote: inserir_lote_otimizado(conn, buffer_lote)
         return emails_novos, emails_duplicados
-    except:
+    except Exception as e:
+        logger.error(f"❌ Erro ao processar {filepath}: {e}")
         return 0, 0
 
 def processar():
-    if not baixar_torrent_seletivo(): sys.exit(1)
+    if not baixar_torrent_compativel(): sys.exit(1)
     conn = conectar_db()
     if not conn: sys.exit(1)
+    
     cache = set()
     for arquivo in ARQUIVOS_ALVO:
         if os.path.exists(arquivo):
