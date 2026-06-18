@@ -18,112 +18,69 @@ ARQUIVOS_ALVO = [
 
 CHUNK_SIZE = 16 * 1024 * 1024
 TAMANHO_LOTE = 10000
-RETRY_ATTEMPTS = 3
-RETRY_DELAY = 5
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-EMAIL_REGEX = re.compile(
-    rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b',
-    re.IGNORECASE
-)
+EMAIL_REGEX = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
 
-# ============ FUNÇÕES ============
-
-def validar_magnet(magnet: str) -> bool:
-    return magnet.startswith("magnet:?") and "xt=urn:btih:" in magnet
-
-def deduzir_nome(email_bytes: bytes) -> str:
-    try:
-        username = email_bytes.split(b"@")[0].decode('utf-8', 'ignore')
-        username = re.sub(r'\d+', '', username)
-        username = re.sub(r'[_.-]+', ' ', username).strip()
-        return username.title() or "Trader Lead"
-    except:
-        return "Trader Lead"
-
-def validar_email(email: str) -> bool:
-    return len(email) <= 254 and '@' in email and email.count('@') == 1 and '.' in email.split('@')[1]
-
-def baixar_torrent_seletivo_v2() -> bool:
-    logger.info("📡 DOWNLOAD SELETIVO DO TORRENT...")
+def baixar_torrent_otimizado() -> bool:
+    logger.info("📡 INICIANDO DOWNLOAD OTIMIZADO...")
+    ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+    params = lt.parse_magnet_uri(MAGNET_LINK)
+    params.save_path = '.'
+    handle = ses.add_torrent(params)
     
-    try:
-        settings = {'listen_interfaces': '0.0.0.0:6881,0.0.0.0:6889', 'connections_limit': 1000}
-        ses = lt.session(settings)
-        params = lt.parse_magnet_uri(MAGNET_LINK)
-        params.save_path = '.'
-        handle = ses.add_torrent(params)
-        
-        logger.info("⏳ Aguardando metadados...")
-        while not handle.status().has_metadata: time.sleep(1)
-        
-        # Identificar arquivos e priorizar
-        info = handle.get_torrent_info()
-        logger.info("📋 Configurando prioridades de download...")
-        for i in range(info.num_files()):
-            fname = info.files().at(i).path
-            if any(alvo in fname for alvo in ARQUIVOS_ALVO):
-                handle.file_priority(i, 7)
-                logger.info(f"  ✅ Selecionado: {fname}")
-            else:
-                handle.file_priority(i, 0)
-        
-        while not handle.status().is_seeding:
-            status = handle.status()
-            logger.info(f"📥 {status.progress*100:6.2f}% | Vel: {status.download_rate/1024/1024:7.2f}MB/s | Peers: {status.num_peers}")
-            time.sleep(5)
-            
-        logger.info("✅ DOWNLOAD CONCLUÍDO!")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Erro no download: {e}")
-        return False
+    logger.info("⏳ Aguardando metadados...")
+    while not handle.status().has_metadata: time.sleep(1)
+    
+    # Priorizar apenas arquivos alvo
+    info = handle.get_torrent_info()
+    for i in range(info.num_files()):
+        handle.file_priority(i, 7 if any(a in info.files().at(i).path for a in ARQUIVOS_ALVO) else 0)
+    
+    # Download agressivo
+    while not handle.status().is_seeding:
+        status = handle.status()
+        if status.progress >= 1.0: break
+        logger.info(f"📥 {status.progress*100:.2f}% | Vel: {status.download_rate/1024/1024:.2f}MB/s")
+        time.sleep(5)
+    
+    handle.pause()
+    logger.info("✅ DOWNLOAD CONCLUÍDO E PAUSADO.")
+    return True
 
-def inserir_lote_otimizado(conn, buffer_lote: List[Tuple]):
-    try:
-        with conn.cursor() as cur:
-            cur.executemany("INSERT INTO leads (email, nome, dominio, origem) VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING", buffer_lote)
-        conn.commit()
-    except:
-        conn.rollback()
-
-def processar_arquivo_otimizado(conn, filepath: str, cache_local: Set[str]) -> Tuple[int, int]:
-    emails_novos, emails_duplicados = 0, 0
-    buffer_lote = []
-    try:
-        with tarfile.open(filepath, "r|gz") as tar:
-            for member in tar:
-                if not member.isfile() or not member.name.endswith(('.txt', '.csv')): continue
+def processar_arquivo(conn, filepath: str, cache: Set[str]):
+    logger.info(f"⛏️ Processando: {filepath}")
+    buffer = []
+    with tarfile.open(filepath, "r|gz") as tar:
+        for member in tar:
+            if member.isfile() and member.name.endswith(('.txt', '.csv')):
                 f = tar.extractfile(member)
                 for line in f:
-                    for email_bytes in EMAIL_REGEX.findall(line):
-                        email = email_bytes.decode('utf-8', 'ignore').lower().strip()
-                        if validar_email(email) and email not in cache_local:
-                            cache_local.add(email)
-                            buffer_lote.append((email, deduzir_nome(email_bytes), email.split('@')[1], member.name))
-                            emails_novos += 1
-                            if len(buffer_lote) >= TAMANHO_LOTE:
-                                inserir_lote_otimizado(conn, buffer_lote)
-                                buffer_lote = []
-        if buffer_lote: inserir_lote_otimizado(conn, buffer_lote)
-        return emails_novos, emails_duplicados
-    except Exception as e:
-        logger.error(f"❌ Erro ao processar {filepath}: {e}")
-        return 0, 0
+                    for email in EMAIL_REGEX.findall(line):
+                        email_str = email.decode('utf-8', 'ignore').lower().strip()
+                        if email_str not in cache:
+                            cache.add(email_str)
+                            buffer.append((email_str, "Trader", email_str.split('@')[1], member.name))
+                            if len(buffer) >= TAMANHO_LOTE:
+                                with conn.cursor() as cur:
+                                    cur.executemany("INSERT INTO leads (email, nome, dominio, origem) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", buffer)
+                                conn.commit()
+                                buffer = []
+    if buffer:
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO leads (email, nome, dominio, origem) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", buffer)
+            conn.commit()
 
-def processar():
-    if not baixar_torrent_seletivo_v2(): sys.exit(1)
+def run():
+    if not baixar_torrent_otimizado(): return
     conn = psycopg.connect(DB_URL)
     cache = set()
-    for arquivo in ARQUIVOS_ALVO:
-        if os.path.exists(arquivo):
-            processar_arquivo_otimizado(conn, arquivo, cache)
+    for arq in ARQUIVOS_ALVO:
+        if os.path.exists(arq): processar_arquivo(conn, arq, cache)
     conn.close()
+    logger.info("🚀 TAREFA FINALIZADA.")
 
 if __name__ == "__main__":
-    processar()
+    run()
