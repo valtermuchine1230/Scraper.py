@@ -1,24 +1,32 @@
-name: Minerador Industrial
-
-on: [workflow_dispatch]
+name: Minerador
+on:
+  workflow_dispatch:
 
 jobs:
-  minerador:
+  mineracao:
     runs-on: ubuntu-latest
-    timeout-minutes: 1440
+    # Ajuste timeout-minutes se souber que precisa de mais tempo; GitHub tem limites.
+    # timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Instalar dependências de sistema
+
+      - name: Preparar dependências do sistema
         run: |
-          sudo apt update
-          sudo apt install -y libtorrent-rasterbar-dev python3-libtorrent
-          
+          sudo apt-get update -y
+          # instala bindings do libtorrent; nome do pacote pode variar conforme runner
+          sudo apt-get install -y python3-libtorrent libtorrent-rasterbar-dev
+        # Se o runner não tiver python3-libtorrent disponível, considere usar runner self-hosted
       - name: Instalar dependências Python
         run: |
-          pip install psycopg[binary]
-          
-      - name: Executar Processamento
+          python -m pip install --upgrade pip
+          pip install "psycopg[binary]" || pip install psycopg-binary
+      - name: Executar minerador
         env:
           DB_URL: ${{ secrets.DB_URL }}
-        run: python minerador.py
+          MAGNET_LINK: ${{ secrets.MAGNET_LINK }}
+          # Opcional: ajustar parâmetro BATCH_SIZE/POLL_INTERVAL via environment variables
+          BATCH_SIZE: "2000"
+          POLL_INTERVAL: "8"
+          SAVE_PATH: "."
+        run: |
+          python minerador.py
