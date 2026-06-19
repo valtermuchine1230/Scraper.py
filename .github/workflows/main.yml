@@ -16,6 +16,7 @@ jobs:
         run: |
           echo "=== df -h BEFORE CLEANUP ==="
           df -h
+
           if [ -d /mnt ]; then
             sudo mkdir -p /mnt/downloads || true
             sudo chmod 777 /mnt/downloads || true
@@ -24,50 +25,65 @@ jobs:
             mkdir -p $GITHUB_WORKSPACE/data
             echo "SAVE_PATH=$GITHUB_WORKSPACE/data" >> $GITHUB_ENV
           fi
-          echo "SAVE_PATH is $SAVE_PATH"
+
           df -h
 
       - name: Safe cleanup to free disk (non-destructive)
         run: |
-          echo "🧹 Removing apt lists, user caches and /tmp to reclaim space"
+          echo "🧹 Cleaning caches"
           sudo rm -rf /var/lib/apt/lists/* || true
           rm -rf $HOME/.cache || true
           rm -rf $HOME/.npm || true
           rm -rf /tmp/* || true
-          echo "Disk after safe cleanup:"
-          df -h
-          echo "::notice::If you want to remove /opt/hostedtoolcache to reclaim more space, set FORCE_CLEAN_HOSTEDTOOLCACHE=true in the workflow env (use with caution)."
 
-      - name: Optionally remove hosted toolcache (dangerous — use only if you know what you're doing)
+          echo "Disk after cleanup:"
+          df -h
+
+      - name: Optionally remove hosted toolcache
         if: env.FORCE_CLEAN_HOSTEDTOOLCACHE == 'true'
         run: |
-          echo "⚠️ Removing /opt/hostedtoolcache (may break other steps)"
+          echo "⚠️ Removing /opt/hostedtoolcache"
           sudo rm -rf /opt/hostedtoolcache || true
           df -h
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install system packages
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y build-essential python3-dev libssl-dev libffi-dev \
-            libtorrent-rasterbar-dev libcurl4-openssl-dev pkg-config
+
+          sudo apt-get install -y \
+            build-essential \
+            python3-dev \
+            libssl-dev \
+            libffi-dev \
+            libcurl4-openssl-dev \
+            pkg-config \
+            libtorrent-rasterbar-dev \
+            python3-libtorrent
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade pip
-          pip install python-libtorrent duckdb pyarrow pandas requests huggingface_hub rich psutil
+
+          pip install \
+            duckdb \
+            pyarrow \
+            pandas \
+            requests \
+            huggingface_hub \
+            rich \
+            psutil
 
       - name: Run minerador
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_DATASET: Trader_Emails
           SAVE_PATH: ${{ env.SAVE_PATH }}
-          POLL_INTERVAL: "60"                      # reduce progress logging frequency
+          POLL_INTERVAL: "60"
           PROGRESS_LOG_INTERVAL: "60"
           PROGRESS_LOG_PERCENT_DELTA: "1.0"
           WORKERS: "4"
@@ -76,15 +92,21 @@ jobs:
           FORCE_CLEAN_HOSTEDTOOLCACHE: ${{ env.FORCE_CLEAN_HOSTEDTOOLCACHE }}
         run: |
           mkdir -p "$SAVE_PATH"
-          echo "df before run"; df -h
+
+          echo "df before run"
+          df -h
+
           python minerador.py
-          echo "df after run"; df -h
+
+          echo "df after run"
+          df -h
 
       - name: Post-run diagnostics
         if: always()
         run: |
           echo "=== df -h AFTER ==="
           df -h
+
           echo "=== SAVE_PATH usage ==="
           du -sh "$SAVE_PATH" || true
 
