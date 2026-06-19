@@ -1,4 +1,4 @@
-name: Minerador -> Hugging Face🗿📧🙂
+name: Minerador -> Hugging Face (high-performance)
 
 on:
   workflow_dispatch:
@@ -12,123 +12,85 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Diagnóstico do disco
+      - name: Diagnose disk and environment
         run: |
-          echo "===== DF ====="
+          echo "=== df -h ==="
           df -h
-
-          echo "===== LSBLK ====="
+          echo "=== lsblk ==="
           lsblk
+          echo "=== mount ==="
+          mount | sed -n '1,200p' || true
 
-          echo "===== MOUNT ====="
-          mount
-
-          echo "===== /mnt ====="
-          ls -lah /mnt || true
-
-          echo "===== Espaço em /mnt ====="
-          df -h /mnt || true
-
-      - name: Criar diretórios e definir SAVE_PATH
+      - name: Configure SAVE_PATH
         run: |
           if [ -d /mnt ]; then
-            echo "📦 /mnt encontrado"
-
-            sudo mkdir -p /mnt/downloads
-            sudo chmod 777 /mnt/downloads
-
+            sudo mkdir -p /mnt/downloads || true
+            sudo chmod 777 /mnt/downloads || true
             echo "SAVE_PATH=/mnt/downloads" >> $GITHUB_ENV
           else
-            echo "📦 Usando workspace"
-
-            mkdir -p "$GITHUB_WORKSPACE/data"
-
+            mkdir -p $GITHUB_WORKSPACE/data
             echo "SAVE_PATH=$GITHUB_WORKSPACE/data" >> $GITHUB_ENV
           fi
+          echo "Using SAVE_PATH=$SAVE_PATH"
 
-      - name: Limpeza segura para recuperar espaço
+      - name: Safe cleanup to recover space
         run: |
-          echo "🧹 Antes da limpeza"
-          df -h
-
           sudo rm -rf /var/lib/apt/lists/* || true
           rm -rf $HOME/.cache || true
           rm -rf /tmp/* || true
-
-          echo "🧹 Depois da limpeza"
           df -h
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Python and system deps
+        uses: actions/setup-python@v4
         with:
           python-version: "3.12"
 
-      - name: Instalar dependências do sistema
+      - name: Install system packages (libtorrent + build deps)
         run: |
           sudo apt-get update -y
-
-          sudo apt-get install -y \
-            build-essential \
-            libssl-dev \
-            libffi-dev \
-            python3-dev \
-            libtorrent-rasterbar-dev \
-            libcurl4-openssl-dev \
-            pkg-config
-
+          sudo apt-get install -y build-essential libssl-dev libffi-dev python3-dev \
+            libtorrent-rasterbar-dev libcurl4-openssl-dev pkg-config
           python -m pip install --upgrade pip
 
-      - name: Instalar dependências Python
+      - name: Install Python dependencies
         run: |
+          pip install --upgrade pip
           pip install \
-            huggingface_hub \
-            datasets \
+            duckdb \
             pyarrow \
             pandas \
+            requests \
+            huggingface_hub \
             rich \
-            libtorrent \
+            python-libtorrent \
             colorlog
 
-      - name: Verificar espaço antes do minerador
-        run: |
-          echo "===== DF ====="
-          df -h
-
-          echo "===== SAVE_PATH ====="
-          echo $SAVE_PATH
-
-          du -sh "$SAVE_PATH" || true
-
-      - name: Executar minerador
+      - name: Run minerador
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_DATASET_NAME: email_miner_dataset
-          POLL_INTERVAL: "60"
-          BATCH_INSERT: "5000"
-          BATCH_EXPORT_ROWS: "200000"
-
+          HF_DATASET: Trader_Emails
+          SAVE_PATH: ${{ env.SAVE_PATH }}
+          MAX_SIMULTANEOUS_TORRENTS: "5"
+          WORKERS: ${{ matrix.workers || 4 }}
         run: |
           mkdir -p "$SAVE_PATH"
           python minerador.py
 
-      - name: Diagnóstico final
+      - name: Post-run diagnostics
         if: always()
         run: |
-          echo "===== DF FINAL ====="
+          echo "=== df -h ==="
           df -h
-
-          echo "===== Uso do SAVE_PATH ====="
+          echo "=== Save path usage ==="
           du -sh "$SAVE_PATH" || true
 
-          echo "===== /tmp ====="
-          du -sh /tmp || true
-
-      - name: Upload de diagnósticos
+      - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: minerador-diagnostics
           path: |
-            ${{ github.workspace }}/data/checkpoint.json
-            ${{ github.workspace }}/data/exports
-            ${{ github.workspace }}/data/emails.db
+            ${{ env.SAVE_PATH }}/checkpoints/checkpoint.json
+            ${{ env.SAVE_PATH }}/chunks
+            ${{ env.SAVE_PATH }}/final_parts
+            ${{ env.SAVE_PATH }}/minerador.log
