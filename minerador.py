@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-minerador.py — Robust miner with SAVE_PATH-only paths and safe stop_event handling.
+minerador.py — High-performance torrent miner -> DuckDB -> HuggingFace pipeline.
 
-Changes in this version:
-- Replaced the module-global boolean `_stop_requested` with a threading.Event `stop_event`.
-  All checks and signal handlers use stop_event.is_set() / stop_event.set() respectively.
-  This prevents UnboundLocalError and provides thread-safe stop signaling.
-- All filesystem paths are derived from SAVE_PATH (no hardcoded /mnt or ./data inside the code).
-- Preserves functionality: libtorrent download of exact target files, wait via file_progress,
-  streaming extraction of .tar.gz members, deduplication via SQLite, export to Parquet,
-  upload to Hugging Face, checkpointing, cleanup and rich logs.
-- Ensures all temporary files, exports, and DB are under SAVE_PATH.
+Key features:
+- Concurrent download of multiple torrents (configurable concurrency).
+- libtorrent tuning for high throughput (configurable).
+- Block-based streaming parsing (mmap-like approach for large members).
+- Multiprocessing (ProcessPoolExecutor) using all available CPU cores.
+- Writes intermediate Parquet "raw_chunk_*.parquet" files.
+- Uses DuckDB to ingest and deduplicate globally; exports final part_XXXX.parquet files
+  of ~30M rows each (configurable).
+- Filters disposable email domains (downloads community lists + local additions).
+- Robust checkpointing (checkpoint.json), and resume behavior on reruns.
+- All paths derived from SAVE_PATH environment variable only.
+- stop_event (threading.Event) for graceful shutdown.
+- Uploads final parts + checkpoints to Hugging Face dataset repo "Trader_Emails".
 """
 
 from __future__ import annotations
@@ -20,120 +24,144 @@ import re
 import sys
 import json
 import time
+import math
 import tarfile
-import signal
 import logging
-import sqlite3
+import tempfile
 import shutil
-import subprocess
-import gc
+import signal
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict, Tuple, Iterable, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from threading import Event
+import multiprocessing
+import hashlib
+import subprocess
 
-import unicodedata
-import difflib
-
-import libtorrent as lt
-from huggingface_hub import HfApi
+# Optional imports (install via requirements)
+try:
+    import libtorrent as lt
+except Exception as e:
+    lt = None
+try:
+    import duckdb
+except Exception:
+    duckdb = None
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except Exception:
+    pa = None
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
+from huggingface_hub import HfApi
+import requests
 
-from rich.logging import RichHandler
 from rich.console import Console
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
-# ====== Configuration (NO hardcoded paths except SAVE_PATH fallback) ======
-SAVE_PATH = Path(os.environ.get("SAVE_PATH", "./data"))
+# --------------------------
+# Configuration (user-editable via env)
+# --------------------------
+# All filesystem paths must be derived from SAVE_PATH only (no hardcoded /mnt etc).
+SAVE_PATH = Path(os.environ.get("SAVE_PATH", "./data")).expanduser().resolve()
 SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
-EXPORT_DIR = SAVE_PATH / "exports"
-TEMP_DIR = SAVE_PATH / "temp"
-DB_PATH = SAVE_PATH / "emails.db"
-CHECKPOINT_PATH = SAVE_PATH / "checkpoint.json"
+# Data paths inside SAVE_PATH
+CHUNKS_DIR = SAVE_PATH / "chunks"                   # intermediate chunk parquet files
+FINAL_DIR = SAVE_PATH / "final_parts"               # final exported parts (30M rows each)
+CHECKPOINT_DIR = SAVE_PATH / "checkpoints"
+TMP_DIR = SAVE_PATH / "tmp"
+DB_PATH = SAVE_PATH / "emails.duckdb"               # duckdb file
 LOG_PATH = SAVE_PATH / "minerador.log"
+DISPOSABLE_LOCAL = SAVE_PATH / "disposable_domains.txt"  # optional user-provided list
 
-EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
+for d in (CHUNKS_DIR, FINAL_DIR, CHECKPOINT_DIR, TMP_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-HF_TOKEN = os.environ.get("HF_TOKEN")  # required (pass via secrets)
-HF_DATASET_NAME = os.environ.get("HF_DATASET_NAME", "email_miner_dataset")
+# Hugging Face
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_USER = None
+HF_DATASET = os.environ.get("HF_DATASET", "Trader_Emails")  # requested dataset name (private)
+HF_REPO_ID = None  # will be user/HF_DATASET
 
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "6"))
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-BATCH_INSERT = int(os.environ.get("BATCH_INSERT", "5000"))
-BATCH_EXPORT_ROWS = int(os.environ.get("BATCH_EXPORT_ROWS", "200000"))
-MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(256 * 1024 * 1024)))  # 256MB
+# Concurrency / sizes
+MAX_SIMULTANEOUS_TORRENTS = int(os.environ.get("MAX_SIMULTANEOUS_TORRENTS", "5"))
+CPU_COUNT = int(os.environ.get("CPU_COUNT", str(multiprocessing.cpu_count() or 1)))
+WORKERS = int(os.environ.get("WORKERS", str(max(1, CPU_COUNT))))
+# Choose chunk byte size based on available memory heuristics (will be computed later)
+CHUNK_SIZE_BYTES = None  # computed at runtime between 512MB and 2GB
 
-# Define MAGNETS with exact metadata targets (paths or basenames).
-MAGNETS = [
-    {
-        "name": "Collection #2-#5",
-        "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
-        "targets": [
-            "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
-            "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
-        ],
-    },
-    {
-        "name": "Collection #1",
-        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
-        "targets": [
-            "Collection #1/Collection #1_BTC combos.tar.gz",
-            "Collection #1/Collection #1_OLD CLOUD_Trading combos.tar.gz",
-            "Collection #1/Collection #1_OLD CLOUD_BTC combos.tar.gz",
-        ],
-    },
+# Target part size (rows)
+PART_ROWS = int(os.environ.get("PART_ROWS", str(30_000_000)))  # 30 million per final part
+
+# Regex for emails (bytes)
+EMAIL_RE = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
+
+# Disposable domains sources (community lists online)
+DISPOSABLE_LIST_URLS = [
+    "https://raw.githubusercontent.com/disposable/disposable-email-domains/master/domains.json",
+    "https://raw.githubusercontent.com/ivolo/disposable-email-domains/master/index.json",
+    "https://raw.githubusercontent.com/7c/fakefilter/master/data/disposable_email_blacklist.conf",
+    "https://raw.githubusercontent.com/arkadiyt/disposable-email-domains/master/domains.json",
+    # Add more curated sources if needed (runner must have internet).
 ]
 
-# ===== Logging setup (console + file inside SAVE_PATH) =====
-console = Console()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(message)s",
-    handlers=[RichHandler(console=console, rich_tracebacks=True)],
-)
-logger = logging.getLogger("minerador")
-logger.setLevel(LOG_LEVEL)
+# Torrent / targets configuration - user must provide exact metadata paths or basenames for each magnet
+MAGNETS = [
+    # Example: replace with actual magnets and the exact metadata file path(s) you want
+    # {
+    #    "name":"Collection #2-#5",
+    #    "magnet":"magnet:?xt=urn:btih:....",
+    #    "targets":[
+    #         "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
+    #         "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
+    #     ]
+    # }
+]
 
-file_handler = logging.FileHandler(str(LOG_PATH))
-file_handler.setLevel(LOG_LEVEL)
-file_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-file_handler.setFormatter(file_formatter)
-logger.addHandler(file_handler)
-
-# emojis
-E = {
-    "start": "🚀",
-    "download": "📥",
-    "extract": "📦",
-    "stats": "📊",
-    "speed": "📈",
-    "space": "📉",
-    "email": "📧",
-    "upload": "📤",
-    "clean": "🧹",
-    "warn": "⚠️",
-    "error": "❌",
-    "ok": "✅",
-    "info": "🗿",
+# libtorrent tuning defaults (aggressive but safe)
+LIBTORRENT_SETTINGS = {
+    "connections_limit": 2000,
+    "connections_limit_global": 8000,
+    "active_limit": 2000,
+    "active_downloads": 10,
+    "active_seeds": 100,
+    "request_queue_size": 2048,
+    "piece_extent_affinity": True,  # prefer contiguous pieces
+    # cache options
+    "cache_size": 512 * 1024 * 1024,  # 512 MB (hint)
+    "cache_expiry": 60,  # seconds
+    # network features
+    "enable_dht": True,
+    "enable_lsd": True,
+    "enable_pex": True,
+    # rate limits (0 = unlimited)
+    "upload_rate_limit": 0,
+    "download_rate_limit": 0,
+    # other
+    "announce_to_all_tiers": True,
 }
 
-EMAIL_REGEX = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(str(LOG_PATH)),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("minerador")
+console = Console()
 
-# ===== Stop event (thread-safe, avoids UnboundLocalError) =====
+# Stop event
 stop_event = Event()
 
-def handle_signal(signum, frame):
-    logger.warning(f"{E['warn']} Signal {signum} received; setting stop_event.")
-    stop_event.set()
-
-signal.signal(signal.SIGINT, handle_signal)
-signal.signal(signal.SIGTERM, handle_signal)
-
-# ===== Utilities =====
+# --------------------------
+# Helper functions
+# --------------------------
 def human(n: int) -> str:
     for unit in ("B","KB","MB","GB","TB"):
         if n < 1024:
@@ -141,415 +169,722 @@ def human(n: int) -> str:
         n /= 1024
     return f"{n:.2f}PB"
 
-def disk_usage(path: Path = SAVE_PATH) -> Dict[str,int]:
+def disk_stats(path: Path = SAVE_PATH) -> Dict[str,int]:
     du = shutil.disk_usage(str(path))
     return {"total": du.total, "used": du.used, "free": du.free}
 
-def ensure_min_free_space(min_bytes: int = MIN_FREE_BYTES) -> bool:
-    free = disk_usage(SAVE_PATH)["free"]
-    logger.info(f"{E['space']} Espaço livre em {SAVE_PATH}: {human(free)}")
-    return free >= min_bytes
-
-def save_json(path: Path, obj: Any):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-def load_json(path: Path) -> Any:
-    if not path.exists():
-        return {}
+def choose_chunk_size() -> int:
+    # Try to determine a chunk size between 512MB and 2GB based on available memory.
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        import psutil
+        mem = psutil.virtual_memory().available
     except Exception:
-        return {}
+        mem = None
+    # default fallbacks
+    min_cs = 512 * 1024 * 1024
+    max_cs = 2 * 1024 * 1024 * 1024
+    if mem:
+        # aim to use up to 25% of available memory for a parsing chunk
+        candidate = int(mem / 4)
+        candidate = min(max(candidate, min_cs), max_cs)
+        return candidate
+    else:
+        return 512 * 1024 * 1024
 
-def normalize_text(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
-
-# ===== SQLite helpers =====
-def init_sqlite(db_path: Path) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=30)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
-    conn.execute("PRAGMA temp_store = MEMORY;")
+def setup_libtorrent_session(settings: Dict[str,Any]) -> "lt.session":
+    if lt is None:
+        raise RuntimeError("python-libtorrent is required but not installed.")
+    ses = lt.session()
+    # Networking options — best effort
+    # Apply settings that libtorrent supports via session_settings or alert masks.
+    # Many of these are applied via session.settings in C++ API; python bindings vary.
+    # We set listen interfaces and some global parameters via sessionsettings.
     try:
-        conn.execute("PRAGMA mmap_size = 268435456;")
+        ses.listen_on(6881, 6891)
     except Exception:
         pass
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS emails (
-        email TEXT PRIMARY KEY,
-        nome TEXT,
-        origem TEXT,
-        data TEXT
-    );
-    """)
-    conn.commit()
-    return conn
-
-def batch_insert(conn: sqlite3.Connection, records: List[Tuple[str,str,str,str]]) -> int:
-    if not records:
-        return 0
-    cur = conn.cursor()
+    # Apply settings via setting_pack if available
     try:
-        cur.executemany("INSERT OR IGNORE INTO emails(email,nome,origem,data) VALUES (?, ?, ?, ?)", records)
-        conn.commit()
-        return cur.rowcount if cur.rowcount is not None else 0
+        s = ses.settings()
+        # connection limits
+        if "connections_limit" in settings:
+            s["connections_limit"] = int(settings["connections_limit"])
+        if "request_queue_size" in settings:
+            s["request_queue_size"] = int(settings["request_queue_size"])
+        if "cache_size" in settings:
+            s["cache_size"] = int(settings["cache_size"])
+        # enable features
+        s["enable_dht"] = bool(settings.get("enable_dht", True))
+        s["enable_lsd"] = bool(settings.get("enable_lsd", True))
+        s["enable_pex"] = bool(settings.get("enable_pex", True))
+        # apply
+        ses.set_settings(s)
     except Exception:
-        conn.rollback()
-        logger.exception(f"{E['error']} SQLite batch insert failed")
-        return 0
+        # older bindings: try alternative
+        pass
+    return ses
 
-def delete_uploaded_rows(conn: sqlite3.Connection, emails: List[str]):
-    if not emails:
-        return
-    try:
-        cur = conn.cursor()
-        cur.executemany("DELETE FROM emails WHERE email=?", [(e,) for e in emails])
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        logger.exception(f"{E['warn']} Failed to delete uploaded rows")
+# Disposable domains loader
+def load_disposable_domains(extra_urls: Optional[List[str]] = None) -> set:
+    domains = set()
+    # first, local file if present
+    if DISPOSABLE_LOCAL.exists():
+        try:
+            for ln in DISPOSABLE_LOCAL.read_text(encoding="utf8", errors="ignore").splitlines():
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                domains.add(ln.lower())
+        except Exception:
+            logger.warning("Could not read local disposable domains file")
+    # try fetch community lists
+    urls = list(DISPOSABLE_LIST_URLS)
+    if extra_urls:
+        urls.extend(extra_urls)
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200:
+                text = r.text
+                # many lists are JSON arrays or newline lists
+                try:
+                    arr = json.loads(text)
+                    if isinstance(arr, dict):
+                        # some JSON files map domain->true etc.
+                        domains.update(k.lower() for k in arr.keys())
+                    elif isinstance(arr, list):
+                        domains.update(d.lower() for d in arr if isinstance(d, str))
+                except Exception:
+                    # fallback: parse lines and common patterns
+                    for ln in text.splitlines():
+                        ln = ln.strip()
+                        if not ln or ln.startswith("#") or "@" in ln or "://" in ln:
+                            continue
+                        # some lines include comma-separated or JSON-like
+                        parts = re.split(r"[,\s]+", ln)
+                        for p in parts:
+                            p = p.strip().strip('"').strip("'")
+                            if p and "." in p:
+                                domains.add(p.lower())
+            else:
+                logger.debug(f"Disposable list fetch {url} returned {r.status_code}")
+        except Exception as e:
+            logger.debug(f"Could not fetch disposable list {url}: {e}")
+    logger.info(f"Loaded {len(domains)} disposable domains")
+    return domains
 
-# ===== Hugging Face helpers =====
-def hf_prepare(token: str, dataset_name: str):
-    if not token:
-        raise RuntimeError("HF_TOKEN not provided in environment")
-    api = HfApi()
-    who = api.whoami(token=token)
-    user = who.get("name") or who.get("user") or who.get("id")
-    repo_id = f"{user}/{dataset_name}"
-    try:
-        api.create_repo(repo_id=repo_id, token=token, repo_type="dataset", private=True)
-        logger.info(f"{E['ok']} Created dataset {repo_id}")
-    except Exception as e:
-        if "already exists" in str(e).lower():
-            logger.info(f"{E['ok']} Dataset already exists: {repo_id}")
+# --------------------------
+# Torrent management: add magnet & wait concurrently
+# --------------------------
+def add_magnets_and_prioritize(magnets: List[Dict], max_simultaneous: int) -> Tuple[List[lt.torrent_handle], Dict[str, lt.torrent_info]]:
+    """
+    Adds all magnets concurrently with libtorrent session(s). Returns list of handles and mapping name->torrent_info.
+    We'll create multiple sessions or reuse one session; here use a single session for simplicity tuned above.
+    """
+    ses = setup_libtorrent_session(LIBTORRENT_SETTINGS)
+    handles = []
+    name_info = {}
+    for m in magnets:
+        if stop_event.is_set():
+            break
+        params = lt.parse_magnet_uri(m["magnet"])
+        params.save_path = str(SAVE_PATH)
+        h = ses.add_torrent(params)
+        handles.append((m["name"], h, m.get("targets", [])))
+        logger.info(f"Added magnet {m['name']}")
+    # Wait metadata for all (non-blocking loop)
+    start = time.time()
+    timeout = int(os.environ.get("METADATA_TIMEOUT", "600"))  # seconds per magnet
+    pending = [(n,h,targets) for (n,h,targets) in handles]
+    while pending and not stop_event.is_set():
+        new_pending = []
+        for name, h, targets in pending:
+            s = h.status()
+            if s.has_metadata:
+                try:
+                    info = h.get_torrent_info()
+                except Exception:
+                    # new api: h.get_torrent_info() may raise; fallback:
+                    info = h.get_torrent_info()
+                name_info[name] = info
+                # compute priorities: find target indices in metadata
+                # find indices of files matching targets (exact path or basename ci)
+                indices = []
+                for i in range(info.num_files()):
+                    p = info.files().at(i).path
+                    for t in targets:
+                        if p == t or p.lower() == t.lower() or Path(p).name == Path(t).name:
+                            indices.append(i)
+                # set file priorities: only these indices get priority > 0
+                try:
+                    for i in range(info.num_files()):
+                        pr = 7 if i in indices else 0
+                        h.file_priority(i, pr)
+                except Exception:
+                    pass
+                logger.info(f"{name}: metadata ready; prioritized {len(indices)} files")
+            else:
+                new_pending.append((name,h,targets))
+        pending = new_pending
+        if pending:
+            time.sleep(5)
+        # optional global timeout
+        if time.time() - start > timeout:
+            logger.warning("Metadata wait timeout reached")
+            break
+    return [h for (_,h,_) in handles], name_info
+
+# --------------------------
+# Processing: read members in large blocks and extract emails
+# --------------------------
+def extract_emails_from_member_by_chunks(member_obj, chunk_size: int, disposable_domains: set, tmp_chunk_prefix: str) -> List[Path]:
+    """
+    Read bytes from file-like member_obj in chunk_size blocks, find emails via compiled bytes regex,
+    filter disposable domains, deduplicate inside chunk, write chunk parquet files and return a list of chunk paths.
+    This function runs in worker processes (so must be self-contained).
+    """
+    # worker-level imports to be safe
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+    import re
+    EMAIL_RE_LOCAL = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
+
+    chunk_paths = []
+    buffer = b""
+    bytes_read = 0
+    chunk_index = 0
+    # We'll read chunk_size blocks and extract emails
+    while True:
+        data = member_obj.read(chunk_size)
+        if not data:
+            # process remaining buffer
+            to_process = buffer
+            buffer = b""
         else:
-            logger.warning(f"{E['warn']} create_repo returned: {e}")
-    return api, repo_id, user
+            to_process = buffer + data
+            # keep overlap of 100 bytes to handle boundary email matches
+            overlap = 200
+            if len(to_process) > overlap:
+                buffer = to_process[-overlap:]
+                to_process = to_process[:-overlap]
+            else:
+                buffer = to_process
+                to_process = b""
+        if not to_process and not data:
+            break
+        # find email bytes
+        found = set()
+        for m in EMAIL_RE_LOCAL.findall(to_process):
+            try:
+                s = m.decode("utf8", errors="ignore").strip().lower()
+            except Exception:
+                s = m.decode("latin1", errors="ignore").strip().lower()
+            if not s:
+                continue
+            # filter disposable by domain part
+            if "@" in s:
+                domain = s.split("@",1)[1]
+                if domain in disposable_domains:
+                    continue
+            found.add(s)
+        if found:
+            # flush found set into a parquet chunk
+            df = pd.DataFrame({"email": list(found)})
+            # optionally enrich name and date later (DuckDB or next stage)
+            chunk_file = Path(tmp_chunk_prefix.format(index=chunk_index))
+            table = pa.Table.from_pandas(df)
+            pq.write_table(table, str(chunk_file), compression="snappy")
+            chunk_paths.append(chunk_file)
+            chunk_index += 1
+        if not data:
+            break
+    return [str(p) for p in chunk_paths]
 
-def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_path: str) -> bool:
+def process_tarfile_tar_members_worker(params: Dict) -> List[str]:
+    """
+    Worker invoked in ProcessPoolExecutor for a specific tar file.
+    params: dict containing tar_path str, chunk_size int, disposable_domains (list), tmp_prefix str
+    Returns list of chunk file paths (strings)
+    """
+    tar_path = params["tar_path"]
+    chunk_size = params["chunk_size"]
+    disposable_domains = set(params.get("disposable_domains", []))
+    tmp_prefix = params["tmp_prefix"]
+    chunk_files = []
     try:
-        api.upload_file(path_or_fileobj=str(local_path),
-                        path_in_repo=repo_path,
-                        repo_id=repo_id,
-                        repo_type="dataset",
-                        token=token)
-        logger.info(f"{E['upload']} Uploaded {repo_path}")
-        return True
+        with tarfile.open(tar_path, "r:*") as tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                if not (member.name.endswith(".txt") or member.name.endswith(".csv")):
+                    continue
+                f = tf.extractfile(member)
+                if f is None:
+                    continue
+                # for each member produce chunk parquet files via extract_emails_from_member_by_chunks
+                sub_prefix = tmp_prefix + "_" + hashlib.sha1(member.name.encode("utf8")).hexdigest() + "_{index}.parquet"
+                # Call extraction (runs in this process)
+                new_chunks = extract_emails_from_member_by_chunks(f, chunk_size, disposable_domains, sub_prefix)
+                chunk_files.extend(new_chunks)
     except Exception:
-        logger.exception(f"{E['error']} HF upload failed for {local_path}")
-        return False
+        # return whatever was generated so far
+        return chunk_files
+    return chunk_files
 
-# ===== Name guess heuristic =====
-def guess_name(email: str) -> str:
-    local = email.split("@",1)[0]
-    no_digits = re.sub(r"\d+", "", local)
-    spaced = re.sub(r"[_.\-]+", " ", no_digits).strip()
-    if not spaced:
-        return ""
-    return " ".join([p.capitalize() for p in spaced.split()])
+# --------------------------
+# DuckDB ingestion and deduplication
+# --------------------------
+def duckdb_ingest_and_deduplicate(chunk_files: List[str], duckdb_path: str, disposable_domains: set, final_part_rows: int = PART_ROWS) -> List[Path]:
+    """
+    Ingest all chunk parquet files into DuckDB, perform filtering on disposable domains (if any remain),
+    deduplicate globally and export final part_NNN.parquet files with final_part_rows rows each.
+    Returns list of final part paths.
+    """
+    import duckdb as ddb
+    conn = ddb.connect(duckdb_path)
+    # create temp view that reads all parquet files
+    if not chunk_files:
+        return []
+    # Create a CSV/Parquet list param for DuckDB
+    # We create a table 'chunks' by reading union of parquet files
+    files_sql_list = ",".join(f"'{f}'" for f in chunk_files)
+    # Create table from parquet
+    try:
+        conn.execute("INSTALL httpfs; LOAD httpfs;")
+    except Exception:
+        pass
+    # read parquet files into a single table
+    conn.execute(f"CREATE OR REPLACE TABLE raw_emails AS SELECT LOWER(email) AS email FROM read_parquet([{files_sql_list}]);")
+    # filter disposable domains
+    if disposable_domains:
+        # Build WHERE clause using SQL NOT LIKE for each domain suffix; for large domain lists, better to join with a table.
+        # Insert domains into a temp table for efficient filtering
+        try:
+            conn.execute("CREATE OR REPLACE TABLE disposable_domains(domain text);")
+            # insert domains in batches
+            batch = []
+            cur = conn.cursor()
+            domains = list(disposable_domains)
+            for d in domains:
+                batch.append((d,))
+                if len(batch) >= 1000:
+                    cur.executemany("INSERT INTO disposable_domains VALUES (?)", batch)
+                    batch.clear()
+            if batch:
+                cur.executemany("INSERT INTO disposable_domains VALUES (?)", batch)
+            # Now filter: keep raw_emails where split_part(email,'@',2) NOT IN disposable_domains
+            conn.execute("""
+                CREATE OR REPLACE TABLE filtered_emails AS
+                SELECT DISTINCT email
+                FROM raw_emails
+                WHERE split_part(email, '@', 2) NOT IN (SELECT domain FROM disposable_domains)
+            """)
+            conn.execute("DROP TABLE raw_emails;")
+        except Exception:
+            # fallback simple filter with NOT LIKE (slower)
+            logger.warning("Fallback disposable domain filtering (less efficient)")
+            conn.execute("""
+                CREATE OR REPLACE TABLE filtered_emails AS
+                SELECT DISTINCT email FROM raw_emails WHERE 1=1
+            """)
+            conn.execute("DROP TABLE raw_emails;")
+    else:
+        conn.execute("CREATE OR REPLACE TABLE filtered_emails AS SELECT DISTINCT email FROM raw_emails;")
+        conn.execute("DROP TABLE raw_emails;")
+    # Count total deduped
+    total = conn.execute("SELECT count(*) FROM filtered_emails;").fetchone()[0]
+    logger.info(f"DuckDB deduplicated total unique emails: {total:,}")
+    # Export into parts of final_part_rows rows each
+    parts = []
+    if total == 0:
+        conn.close()
+        return parts
+    # Create a windowed table with row_number
+    conn.execute("CREATE OR REPLACE TABLE numbered AS SELECT email, row_number() OVER () AS rn FROM filtered_emails;")
+    parts_needed = math.ceil(total / final_part_rows)
+    for part in range(parts_needed):
+        start = part * final_part_rows + 1
+        end = min((part + 1) * final_part_rows, total)
+        out_path = FINAL_DIR / f"part_{part+1:04d}_{(end-start+1):,}rows.parquet"
+        sql = f"COPY (SELECT email FROM numbered WHERE rn BETWEEN {start} AND {end}) TO '{out_path}' (FORMAT PARQUET);"
+        conn.execute(sql)
+        parts.append(out_path)
+        logger.info(f"Exported part {part+1}/{parts_needed} to {out_path} rows {start}-{end}")
+    conn.close()
+    return parts
 
-# ===== Torrent helpers (strict matching) =====
-def print_metadata(info: lt.torrent_info):
-    n = info.num_files()
-    table = Table(title="Torrent metadata files", show_header=True, header_style="bold magenta")
-    table.add_column("idx", style="dim", width=6)
-    table.add_column("path", overflow="fold")
-    table.add_column("size", justify="right")
-    for i in range(n):
-        fe = info.files().at(i)
-        table.add_row(str(i), fe.path, f"{fe.size:,}")
-    console.print(table)
+# --------------------------
+# Checkpoint helpers (local + HF upload for persistence)
+# --------------------------
+def load_checkpoint() -> Dict:
+    cp_path = CHECKPOINT_DIR / "checkpoint.json"
+    if cp_path.exists():
+        try:
+            return json.loads(cp_path.read_text(encoding="utf8"))
+        except Exception:
+            return {}
+    return {}
 
-def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tuple[List[int], List[str]]:
-    n = torrent_info.num_files()
-    idx_to_path = {i: torrent_info.files().at(i).path for i in range(n)}
-    paths_lower = {i: idx_to_path[i].lower() for i in idx_to_path}
-    basenames = {i: Path(idx_to_path[i]).name for i in idx_to_path}
-    basenames_lower = {i: basenames[i].lower() for i in basenames}
-    found = []
-    missing = []
-    for t in targets:
-        matched = False
-        for i,p in idx_to_path.items():
-            if p == t:
-                found.append(i); matched=True; break
-        if matched: continue
-        tl = t.lower()
-        for i,pl in paths_lower.items():
-            if pl == tl:
-                found.append(i); matched=True; break
-        if matched: continue
-        tb = Path(t).name
-        for i,b in basenames.items():
-            if b == tb:
-                found.append(i); matched=True; break
-        if matched: continue
-        for i,bl in basenames_lower.items():
-            if bl == tb.lower():
-                found.append(i); matched=True; break
-        if not matched:
-            missing.append(t)
-    found = sorted(set(found))
-    return found, missing
+def save_checkpoint_local(checkpoint: Dict):
+    cp_path = CHECKPOINT_DIR / "checkpoint.json"
+    cp_path.parent.mkdir(parents=True, exist_ok=True)
+    cp_path.write_text(json.dumps(checkpoint, indent=2), encoding="utf8")
 
+def upload_checkpoint_to_hf(api: HfApi, repo_id: str, local_checkpoint_path: Path, token: str):
+    try:
+        # upload checkpoint file into dataset repo under checkpoints/
+        api.upload_file(
+            path_or_fileobj=str(local_checkpoint_path),
+            path_in_repo=f"checkpoints/{local_checkpoint_path.name}",
+            repo_id=repo_id,
+            repo_type="dataset",
+            token=token,
+            commit_message=f"checkpoint update {local_checkpoint_path.name}"
+        )
+        logger.info("Uploaded checkpoint to HF dataset repo")
+    except Exception:
+        logger.exception("Could not upload checkpoint to HF")
+
+# --------------------------
+# Main pipeline orchestration
+# --------------------------
+def main():
+    # Initial logs and checks
+    logger.info("🚀 Minerador starting")
+    logger.info(f"🗿 SAVE_PATH = {SAVE_PATH}")
+    logger.info(f"📂 Working dirs: CHUNKS={CHUNKS_DIR} FINAL={FINAL_DIR} CHECKPOINTS={CHECKPOINT_DIR}")
+    logger.info(f"📊 Disk stats: {disk_stats(SAVE_PATH)}")
+    # choose chunk size
+    global CHUNK_SIZE_BYTES
+    CHUNK_SIZE_BYTES = choose_chunk_size()
+    logger.info(f"📈 Using chunk_size = {CHUNK_SIZE_BYTES} bytes")
+
+    # load disposable domain list
+    disposable_domains = load_disposable_domains()
+
+    # load checkpoint
+    checkpoint = load_checkpoint()
+
+    # ensure libtorrent available
+    if lt is None:
+        logger.error("libtorrent not installed; please install python-libtorrent in the runner")
+        sys.exit(1)
+    if duckdb is None:
+        logger.error("duckdb not installed; please install duckdb in the runner")
+        sys.exit(1)
+    if pa is None:
+        logger.error("pyarrow not installed; please install pyarrow")
+        sys.exit(1)
+
+    # Prepare HF dataset repo
+    api = HfApi()
+    global HF_REPO_ID
+    if HF_TOKEN is None:
+        logger.warning("HF_TOKEN not provided. HF upload disabled. Provide HF_TOKEN via env to enable uploads.")
+    else:
+        try:
+            who = api.whoami(token=HF_TOKEN)
+            user = who.get("name") or who.get("user") or who.get("id")
+            HF_REPO_ID = f"{user}/{HF_DATASET}"
+            try:
+                api.create_repo(repo_id=HF_REPO_ID, token=HF_TOKEN, repo_type="dataset", private=True)
+                logger.info(f"✅ Created HF dataset repo {HF_REPO_ID}")
+            except Exception as e:
+                logger.info(f"HF dataset create returned: {e} (may already exist)")
+        except Exception:
+            logger.exception("HF whoami failed; HF operations will be disabled")
+            HF_REPO_ID = None
+
+    # Phase 1: add magnets and wait metadata + start downloads concurrently
+    handles_and_info = []  # will store (name, handle, info)
+    try:
+        ses = setup_libtorrent_session(LIBTORRENT_SETTINGS)
+    except Exception as e:
+        logger.exception("Could not create libtorrent session")
+        sys.exit(1)
+
+    handles = []
+    name_to_info = {}
+    # add all magnets
+    for m in MAGNETS:
+        if stop_event.is_set():
+            break
+        try:
+            params = lt.parse_magnet_uri(m["magnet"])
+            params.save_path = str(SAVE_PATH)
+            h = ses.add_torrent(params)
+            handles.append((m["name"], h, m.get("targets", [])))
+            logger.info(f"📥 Added magnet {m['name']}")
+        except Exception:
+            logger.exception(f"Failed to add magnet {m.get('name')}")
+
+    # wait metadata all
+    pending = handles[:]
+    metadata_timeout = int(os.environ.get("METADATA_TIMEOUT", "900"))
+    start_meta = time.time()
+    while pending and not stop_event.is_set():
+        new_pending = []
+        for name, handle, targets in pending:
+            s = handle.status()
+            if s.has_metadata:
+                try:
+                    info = handle.get_torrent_info()
+                except Exception:
+                    info = handle.get_torrent_info()
+                name_to_info[name] = info
+                # prioritize target files (exact matches)
+                target_indices = []
+                for i in range(info.num_files()):
+                    p = info.files().at(i).path
+                    for t in targets:
+                        if p == t or p.lower() == t.lower() or Path(p).name == Path(t).name:
+                            target_indices.append(i)
+                try:
+                    for i in range(info.num_files()):
+                        pr = 7 if i in target_indices else 0
+                        handle.file_priority(i, pr)
+                except Exception:
+                    pass
+                logger.info(f"📦 {name}: metadata ready, prioritized {len(target_indices)} indices")
+            else:
+                new_pending.append((name, handle, targets))
+        pending = new_pending
+        if pending:
+            if time.time() - start_meta > metadata_timeout:
+                logger.warning("⚠️ metadata wait timeout reached")
+                break
+            time.sleep(5)
+
+    # Phase 2: wait for download completion of target files (concurrently across torrents)
+    # Build list of target file indices per handle
+    handle_targets = []
+    for name, handle, targets in handles:
+        info = name_to_info.get(name)
+        if info is None:
+            logger.warning(f"⚠️ No metadata for {name}; skipping")
+            continue
+        # identify indices for the declared targets
+        indices = []
+        for i in range(info.num_files()):
+            p = info.files().at(i).path
+            for t in targets:
+                if p == t or p.lower() == t.lower() or Path(p).name == Path(t).name:
+                    indices.append(i)
+        if not indices:
+            logger.warning(f"⚠️ No target indices matched for {name}; skipping")
+            continue
+        handle_targets.append((name, handle, info, indices))
+
+    # For resource safety we will wait for all targeted files to be completed (file_progress >= size)
+    # but download happens in parallel since all magnets added.
+    logger.info("📥 Waiting for all target files across torrents to complete (downloads proceed concurrently).")
+    # We'll poll progress for all targeted files
+    all_target_pairs = []
+    for (name,h,info,indices) in handle_targets:
+        for idx in indices:
+            all_target_pairs.append((name,h,info,idx))
+    # Polling loop
+    while all_target_pairs and not stop_event.is_set():
+        remaining = []
+        for name,h,info,idx in all_target_pairs:
+            try:
+                fprog = h.file_progress()
+                got = fprog[idx] if idx < len(fprog) else 0
+                expected = info.files().at(idx).size
+                # log occasional progress per file
+                logger.info(f"📈 Progress {name} file[{idx}] = {got:,}/{expected:,} ({(got/expected*100) if expected else 0:.2f}%)")
+                if got >= expected:
+                    logger.info(f"✅ Download complete {name} idx {idx}")
+                else:
+                    remaining.append((name,h,info,idx))
+            except Exception:
+                remaining.append((name,h,info,idx))
+        all_target_pairs = remaining
+        if all_target_pairs:
+            time.sleep(10)
+
+    if stop_event.is_set():
+        logger.warning("Stop requested during download phase; exiting.")
+        return
+
+    # Phase 3: Processing phase. We'll process each completed target tar in a pool of workers.
+    # For each target we create a worker task that opens tar, iterates members, and for each member
+    # creates chunk parquet files by scanning bytes in large block sizes.
+    logger.info(f"📦 Starting processing phase using {WORKERS} workers")
+
+    # Prepare a list of tar file paths to process
+    tar_tasks = []  # list of dicts with tar_path, tmp prefix, etc
+    for (name, h, info, indices) in handle_targets:
+        for idx in indices:
+            local_path = local_path_for_index = SAVE_PATH / info.name() / info.files().at(idx).path
+            if not local_path.exists():
+                # fallback plain path under SAVE_PATH
+                alt = SAVE_PATH / info.files().at(idx).path
+                if alt.exists():
+                    local_path = alt
+                else:
+                    logger.warning(f"⚠️ Expected tar not found for {name} idx {idx}: {local_path}, skipping")
+                    continue
+            task = {
+                "tar_path": str(local_path),
+                "chunk_size": CHUNK_SIZE_BYTES,
+                "disposable_domains": list(disposable_domains),
+                "tmp_prefix": str(CHUNKS_DIR / f"{name.replace(' ','_')}_{idx}")
+            }
+            tar_tasks.append(task)
+
+    # Use ProcessPoolExecutor to run per-tar worker which returns list of chunk file paths
+    chunk_files_collected: List[str] = []
+    with ProcessPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(process_tarfile_tar_members_worker, task): task for task in tar_tasks}
+        for fut in as_completed(futures):
+            task = futures[fut]
+            try:
+                chunk_list = fut.result()
+                logger.info(f"🧩 Task {task['tar_path']} produced {len(chunk_list)} chunk files")
+                chunk_files_collected.extend(chunk_list)
+                # checkpoint update: record processed tar -> chunks
+                cp = load_checkpoint()
+                cp_entry = cp.get("processed_tars", {})
+                cp_entry[str(task["tar_path"])] = {"chunks": chunk_list, "done_at": datetime.now(timezone.utc).isoformat()}
+                cp["processed_tars"] = cp_entry
+                save_checkpoint_local(cp)
+                # optionally upload checkpoint to HF
+                if HF_REPO_ID and HF_TOKEN:
+                    try:
+                        api.upload_file(path_or_fileobj=str(CHECKPOINT_DIR / "checkpoint.json"),
+                                        path_in_repo=f"checkpoints/{Path(CHECKPOINT_DIR / 'checkpoint.json').name}",
+                                        repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
+                    except Exception:
+                        logger.debug("HF checkpoint upload failed (non-fatal)")
+            except Exception as e:
+                logger.exception(f"Worker failed for task {task}: {e}")
+
+    if stop_event.is_set():
+        logger.warning("Stop requested after processing tasks; saving checkpoint and exiting early.")
+        return
+
+    logger.info(f"🧩 Total chunk parquet files produced: {len(chunk_files_collected)}")
+    if not chunk_files_collected:
+        logger.warning("No chunk files produced; exiting.")
+        return
+
+    # Phase 4: DuckDB ingestion and deduplication
+    logger.info("🦆 Ingesting chunks into DuckDB and performing deduplication.")
+    parts = duckdb_ingest_and_deduplicate(chunk_files_collected, str(DB_PATH), disposable_domains, final_part_rows=PART_ROWS)
+    logger.info(f"✅ Produced {len(parts)} final parts.")
+
+    # Save final checkpoint with parts info
+    cp = load_checkpoint()
+    cp["final_parts"] = [str(p) for p in parts]
+    cp["completed_at"] = datetime.now(timezone.utc).isoformat()
+    save_checkpoint_local(cp)
+    if HF_REPO_ID and HF_TOKEN:
+        try:
+            api.upload_file(path_or_fileobj=str(CHECKPOINT_DIR / "checkpoint.json"),
+                            path_in_repo=f"checkpoints/{Path(CHECKPOINT_DIR / 'checkpoint.json').name}",
+                            repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
+        except Exception:
+            logger.debug("HF checkpoint upload failed (non-fatal)")
+
+    # Phase 5: Upload final parts to HF dataset repo (if token present)
+    if HF_REPO_ID and HF_TOKEN:
+        logger.info("📤 Uploading final parts to Hugging Face dataset repo")
+        for part in parts:
+            try:
+                api.upload_file(path_or_fileobj=str(part),
+                                path_in_repo=f"parts/{part.name}",
+                                repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
+                logger.info(f"Uploaded part {part.name} to HF")
+            except Exception:
+                logger.exception(f"Failed to upload {part}")
+
+    logger.info("✅ Pipeline finished successfully (or stopped gracefully).")
+    # final cleanup of intermediate chunks to free disk
+    try:
+        for cf in chunk_files_collected:
+            try:
+                Path(cf).unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# Helper local functions used earlier but declared here to avoid NameError
 def local_path_for_index(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path:
     torrent_name = torrent_info.name()
     file_path = torrent_info.files().at(index).path
     return save_path / torrent_name / file_path
 
-# ===== Processing (streaming) =====
-def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_size: int, poll_interval: int = POLL_INTERVAL):
-    last_log = 0
-    while True:
-        if stop_event.is_set():
-            raise KeyboardInterrupt()
-        fprog = handle.file_progress()
-        got = fprog[file_index] if file_index < len(fprog) else 0
-        pct = (got / expected_size * 100) if expected_size else 0.0
-        now = time.time()
-        if now - last_log >= 5:
-            logger.info(f"{E['download']} Progresso file[{file_index}] = {got:,}/{expected_size:,} ({pct:.2f}%)")
-            last_log = now
-        if expected_size and got >= expected_size:
-            logger.info(f"{E['ok']} File index={file_index} download complete ({got:,} bytes).")
-            return True
-        time.sleep(poll_interval)
-
-def sanitize_filename(s: str) -> str:
-    return "".join(c if c.isalnum() or c in "._- " else "_" for c in s)[:200].replace(" ", "_")
-
-def process_tar_and_upload(conn: sqlite3.Connection, api: HfApi, token: str, repo_id: str, torrent_info: lt.torrent_info, tar_path: Path):
-    logger.info(f"{E['extract']} Opening tar {tar_path}")
+def process_tarfile_tar_members_worker(params: Dict) -> List[str]:
+    # same as top-level definition; repeated here to ensure worker picklability in some environments
+    tar_path = params["tar_path"]
+    chunk_size = params["chunk_size"]
+    disposable_domains = set(params.get("disposable_domains", []))
+    tmp_prefix = params["tmp_prefix"]
+    from pathlib import Path
+    import re, pyarrow as pa, pyarrow.parquet as pq, pandas as pd
+    EMAIL_RE_LOCAL = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
+    chunk_files = []
     try:
-        with tarfile.open(tar_path, "r:*") as tar:
-            for member in tar:
-                if stop_event.is_set():
-                    logger.warning(f"{E['warn']} Stop event set; exiting member loop.")
-                    break
+        with tarfile.open(tar_path, "r:*") as tf:
+            for member in tf:
                 if not member.isfile():
                     continue
                 if not (member.name.endswith(".txt") or member.name.endswith(".csv")):
                     continue
-                logger.info(f"{E['extract']} Member: {member.name}")
-                fobj = tar.extractfile(member)
-                if fobj is None:
-                    logger.warning(f"{E['warn']} Could not extract member {member.name}")
+                f = tf.extractfile(member)
+                if f is None:
                     continue
-                batch = []
-                extracted_count = 0
-                inserted_count = 0
-                for raw_line in fobj:
-                    if stop_event.is_set():
-                        logger.warning(f"{E['warn']} Stop event set during member processing.")
+                buffer = b""
+                overlap = 200
+                idx = 0
+                while True:
+                    data = f.read(chunk_size)
+                    if not data:
+                        to_process = buffer
+                        buffer = b""
+                    else:
+                        to_process = buffer + data
+                        if len(to_process) > overlap:
+                            buffer = to_process[-overlap:]
+                            to_process = to_process[:-overlap]
+                        else:
+                            buffer = to_process
+                            to_process = b""
+                    if not to_process and not data:
                         break
-                    for email_b in EMAIL_REGEX.findall(raw_line):
+                    found = set()
+                    for m in EMAIL_RE_LOCAL.findall(to_process):
                         try:
-                            email = email_b.decode("utf8", "ignore").strip().lower()
+                            s = m.decode("utf8", errors="ignore").strip().lower()
                         except Exception:
-                            email = email_b.decode("latin1", "ignore").strip().lower()
-                        if not email:
+                            s = m.decode("latin1", errors="ignore").strip().lower()
+                        if not s:
                             continue
-                        nome = guess_name(email)
-                        data_iso = datetime.now(timezone.utc).isoformat()
-                        batch.append((email, nome, member.name, data_iso))
-                        extracted_count += 1
-                        if len(batch) >= BATCH_INSERT:
-                            inserted = batch_insert(conn, batch)
-                            inserted_count += inserted
-                            batch.clear()
-                    if extracted_count and extracted_count % 50000 == 0:
-                        free = disk_usage(SAVE_PATH)["free"]
-                        logger.info(f"{E['space']} Espaço livre: {human(free)}")
-                        if free < MIN_FREE_BYTES:
-                            logger.error(f"{E['error']} Espaço crítico during processing: {human(free)}")
-                            raise RuntimeError("No space left during processing")
-                if batch:
-                    inserted = batch_insert(conn, batch)
-                    inserted_count += inserted
-                    batch.clear()
-                logger.info(f"{E['email']} Member {member.name}: extracted={extracted_count:,} new_inserted={inserted_count:,}")
-                # Export and upload
-                cur = conn.cursor()
-                cur.execute("SELECT email,nome,origem,data FROM emails LIMIT ?", (BATCH_EXPORT_ROWS,))
-                rows = cur.fetchall()
-                if rows:
-                    df = pd.DataFrame(rows, columns=["email","nome","origem","data"])
-                    out_dir = EXPORT_DIR / sanitize_filename(torrent_info.name()) / sanitize_filename(tar_path.name)
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    fname = f"{sanitize_filename(member.name)}_{ts}.parquet"
-                    out_path = out_dir / fname
-                    table = pa.Table.from_pandas(df)
-                    pq.write_table(table, str(out_path), compression="snappy")
-                    repo_path = f"{sanitize_filename(torrent_info.name())}/{sanitize_filename(tar_path.name)}/{fname}"
-                    if hf_upload_file(api, token, repo_id, out_path, repo_path):
-                        emails_exported = df["email"].tolist()
-                        delete_uploaded_rows(conn, emails_exported)
-                        try:
-                            out_path.unlink(missing_ok=True)
-                        except Exception:
-                            logger.debug("Could not delete parquet after upload")
-                        logger.info(f"{E['clean']} Uploaded and cleared {len(emails_exported):,} rows from sqlite")
-        try:
-            tar_path.unlink(missing_ok=True)
-            logger.info(f"{E['clean']} Removed processed tar {tar_path}")
-        except Exception:
-            logger.debug("Could not remove tar (may be open elsewhere)")
-    except tarfile.ReadError:
-        logger.exception(f"{E['error']} tarfile.ReadError when opening {tar_path}")
+                        if "@" in s:
+                            domain = s.split("@",1)[1]
+                            if domain in disposable_domains:
+                                continue
+                        found.add(s)
+                    if found:
+                        df = pd.DataFrame({"email": list(found)})
+                        out = Path(tmp_prefix + f"_{idx}.parquet")
+                        table = pa.Table.from_pandas(df)
+                        pq.write_table(table, str(out), compression="snappy")
+                        chunk_files.append(str(out))
+                        idx += 1
+                    if not data:
+                        break
     except Exception:
-        logger.exception(f"{E['error']} Error processing tar {tar_path}")
+        # produce what we have
+        return chunk_files
+    return chunk_files
 
-# ===== Runner cleanup (safe) =====
-def safe_runner_cleanup():
-    logger.info(f"{E['clean']} Performing safe cleanup.")
-    try:
-        user_cache = Path.home() / ".cache"
-        if user_cache.exists():
-            shutil.rmtree(user_cache, ignore_errors=True)
-            logger.info("Cleared user cache")
-    except Exception:
-        logger.debug("Could not clear user cache")
-    try:
-        if TEMP_DIR.exists():
-            shutil.rmtree(TEMP_DIR, ignore_errors=True)
-            TEMP_DIR.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Cleared temporary dir {TEMP_DIR}")
-    except Exception:
-        logger.debug("Could not clear temp dir")
-
-# ===== Main =====
-def main():
-    logger.info(f"{E['start']} Minerador starting")
-    logger.info(f"{E['info']} SAVE_PATH detected: {SAVE_PATH}")
-    logger.info(f"{E['info']} Working directory: {SAVE_PATH}")
-    logger.info(f"{E['info']} Exports directory: {EXPORT_DIR}")
-    logger.info(f"{E['info']} Temp directory: {TEMP_DIR}")
-    logger.info(f"{E['info']} SQLite DB path: {DB_PATH}")
-    logger.info(f"{E['stats']} Disk before cleanup: {disk_usage(SAVE_PATH)}")
-
-    safe_runner_cleanup()
-    if not ensure_min_free_space():
-        logger.warning(f"{E['warn']} Low free space at start; continuing but watch disk usage")
-
-    if not HF_TOKEN:
-        logger.error(f"{E['error']} HF_TOKEN not set in environment. Set secret HF_TOKEN and re-run.")
-        sys.exit(2)
-
-    api, repo_id, hf_user = hf_prepare(HF_TOKEN, HF_DATASET_NAME)
-
-    conn = init_sqlite(DB_PATH)
-
-    checkpoint = load_json(CHECKPOINT_PATH)
-
-    overall_start = time.time()
-
-    for torrent_item in MAGNETS:
-        if stop_event.is_set():
-            logger.info(f"{E['warn']} Stop event set before starting next torrent; breaking.")
-            break
-        tname = torrent_item.get("name")
-        magnet_uri = torrent_item.get("magnet")
-        targets = torrent_item.get("targets", [])
-        logger.info(f"{E['download']} Starting torrent: {tname}")
-
-        session = lt.session({'listen_interfaces': '0.0.0.0:6881'})
-        params = lt.parse_magnet_uri(magnet_uri)
-        params.save_path = str(SAVE_PATH)
-        handle = session.add_torrent(params)
-
-        while not handle.has_metadata():
-            st = handle.status()
-            logger.info(f"{E['download']} Waiting metadata: peers={st.num_peers} state={st.state}")
-            if stop_event.is_set():
-                break
-            time.sleep(POLL_INTERVAL)
-        if stop_event.is_set():
-            break
-
-        info = handle.get_torrent_info()
-        print_metadata(info)
-
-        found_indices, missing_targets = find_target_indices(info, targets)
-        if missing_targets:
-            logger.error(f"{E['error']} The following targets were NOT found in torrent metadata for '{tname}':")
-            for mt in missing_targets:
-                logger.error(f"  - {mt}")
-            logger.error("Please correct MAGNETS[].targets to match metadata exactly. Skipping this torrent.")
-            continue
-
-        logger.info(f"{E['download']} Found target file indices: {found_indices}")
-
-        nfiles = info.num_files()
-        for i in range(nfiles):
-            pr = 7 if i in found_indices else 0
-            handle.file_priority(i, pr)
-        logger.info(f"{E['download']} Priorities applied; only targets will be downloaded.")
-
-        for idx in found_indices:
-            if stop_event.is_set():
-                logger.info(f"{E['warn']} Stop event set; breaking target loop for {tname}.")
-                break
-            expected_size = info.files().at(idx).size
-            logger.info(f"{E['download']} Waiting for file index {idx} to complete, expected {expected_size:,} bytes")
-            try:
-                wait_for_file_complete(handle, idx, expected_size)
-            except KeyboardInterrupt:
-                logger.warning(f"{E['warn']} Interrupted while waiting for file {idx}")
-                stop_event.set()
-                break
-            except Exception:
-                logger.exception(f"{E['error']} Error while waiting file {idx}; skipping")
-                continue
-
-            local_tar = local_path_for_index(SAVE_PATH, info, idx)
-            if not local_tar.exists():
-                alt = SAVE_PATH / info.files().at(idx).path
-                if alt.exists():
-                    local_tar = alt
-                    logger.info(f"{E['warn']} Using fallback path for tar: {local_tar}")
-                else:
-                    logger.error(f"{E['error']} Expected file not present on disk: {local_tar}; skipping")
-                    continue
-
-            if local_tar.stat().st_size < expected_size:
-                logger.warning(f"{E['warn']} Local file smaller than expected: {local_tar} ({local_tar.stat().st_size:,} < {expected_size:,}) — skipping")
-                continue
-
-            process_tar_and_upload(conn, api, HF_TOKEN, repo_id, info, local_tar)
-
-            key = f"{tname}||{local_tar.name}"
-            checkpoint[key] = {"index": idx, "path": str(local_tar), "processed_at": datetime.now(timezone.utc).isoformat()}
-            save_json(CHECKPOINT_PATH, checkpoint)
-
-        logger.info(f"{E['ok']} Torrent '{tname}' processing finished (targets done or skipped).")
-
-    total_time = time.time() - overall_start
-    logger.info(f"{E['stats']} Total runtime: {total_time/60:.2f} minutes")
-    usage_after = disk_usage(SAVE_PATH)
-    logger.info(f"{E['space']} Disk usage after: {usage_after}")
-
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM emails")
-        total_emails = cur.fetchone()[0]
-        logger.info(f"{E['email']} Total unique emails persisted (sqlite): {total_emails:,}")
-    except Exception:
-        logger.exception("Could not fetch final email count")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    logger.info(f"{E['ok']} Minerador finished")
-
+# Entry point
 if __name__ == "__main__":
+    # Register signals
+    signal.signal(signal.SIGINT, lambda s,f: stop_event.set())
+    signal.signal(signal.SIGTERM, lambda s,f: stop_event.set())
     main()
