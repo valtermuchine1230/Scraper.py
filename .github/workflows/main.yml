@@ -18,8 +18,6 @@ jobs:
           df -h
           echo "=== lsblk ==="
           lsblk
-          echo "=== mount ==="
-          mount | sed -n '1,200p' || true
 
       - name: Configure SAVE_PATH
         run: |
@@ -31,30 +29,35 @@ jobs:
             mkdir -p $GITHUB_WORKSPACE/data
             echo "SAVE_PATH=$GITHUB_WORKSPACE/data" >> $GITHUB_ENV
           fi
-          echo "Using SAVE_PATH=$SAVE_PATH"
 
-      - name: Safe cleanup to recover space
+      - name: Safe cleanup
         run: |
           sudo rm -rf /var/lib/apt/lists/* || true
           rm -rf $HOME/.cache || true
           rm -rf /tmp/* || true
           df -h
 
-      - name: Setup Python and system deps
-        uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Install system packages (libtorrent + build deps)
+      - name: Install system packages
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y build-essential libssl-dev libffi-dev python3-dev \
-            libtorrent-rasterbar-dev libcurl4-openssl-dev pkg-config
-          python -m pip install --upgrade pip
+          sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            libffi-dev \
+            python3-dev \
+            libtorrent-rasterbar-dev \
+            libcurl4-openssl-dev \
+            pkg-config
 
       - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
+
           pip install \
             duckdb \
             pyarrow \
@@ -62,8 +65,12 @@ jobs:
             requests \
             huggingface_hub \
             rich \
-            python-libtorrent \
-            colorlog
+            colorlog \
+            libtorrent
+
+      - name: Verify libtorrent
+        run: |
+          python -c "import libtorrent as lt; print('libtorrent OK:', lt.version)"
 
       - name: Run minerador
         env:
@@ -71,7 +78,7 @@ jobs:
           HF_DATASET: Trader_Emails
           SAVE_PATH: ${{ env.SAVE_PATH }}
           MAX_SIMULTANEOUS_TORRENTS: "5"
-          WORKERS: ${{ matrix.workers || 4 }}
+          WORKERS: "4"
         run: |
           mkdir -p "$SAVE_PATH"
           python minerador.py
@@ -79,18 +86,16 @@ jobs:
       - name: Post-run diagnostics
         if: always()
         run: |
-          echo "=== df -h ==="
           df -h
-          echo "=== Save path usage ==="
           du -sh "$SAVE_PATH" || true
 
-      - name: Upload diagnostics on failure
+      - name: Upload diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: minerador-diagnostics
           path: |
-            ${{ env.SAVE_PATH }}/checkpoints/checkpoint.json
+            ${{ env.SAVE_PATH }}/checkpoints
             ${{ env.SAVE_PATH }}/chunks
             ${{ env.SAVE_PATH }}/final_parts
             ${{ env.SAVE_PATH }}/minerador.log
