@@ -1,37 +1,88 @@
-name: Minerador -> Hugging Face
+name: Minerador -> Hugging Face🗿📧🙂
 on:
   workflow_dispatch:
 
 jobs:
   mineracao:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 720
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: System packages (libtorrent)
+      - name: Pre-check disk (before)
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential libssl-dev libffi-dev python3-dev \
-            libtorrent-rasterbar-dev libcurl4-openssl-dev
-        # Note: python binding availability depends on runner. If the runner lacks python-libtorrent package,
-        # you may need a self-hosted runner or to compile bindings. This installs system deps.
+          echo "=== df -h before ==="
+          df -h
+          echo "=== lsblk ==="
+          lsblk
+          echo "=== /mnt content (if any) ==="
+          ls -la /mnt || true
+
+      - name: Create /mnt dirs (if exists) and set SAVE_PATH
+        run: |
+          if [ -d /mnt ]; then
+            mkdir -p /mnt/data/minerador
+            echo "SAVE_PATH=/mnt/data/minerador" >> $GITHUB_ENV
+          else
+            mkdir -p $GITHUB_WORKSPACE/data
+            echo "SAVE_PATH=$GITHUB_WORKSPACE/data" >> $GITHUB_ENV
+          fi
+          echo "SAVE_PATH set to $SAVE_PATH"
+
+      - name: Safe cleanup to recover space (sudo)
+        run: |
+          # remove apt lists to reclaim space
+          sudo rm -rf /var/lib/apt/lists/* || true
+          # remove runner caches (user cache) - safe
+          rm -rf $HOME/.cache || true
+          rm -rf /tmp/* || true
+          # DO NOT remove system critical directories (commented out)
+          # sudo rm -rf /opt/hostedtoolcache || true
+          echo "After cleanup:"
+          df -h
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
 
+      - name: Install system packages (libtorrent)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential libssl-dev libffi-dev python3-dev \
+            libtorrent-rasterbar-dev libcurl4-openssl-dev pkg-config
+          python -m pip install --upgrade pip
+
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install huggingface_hub datasets pyarrow pandas rich libtorrent colorlog
 
       - name: Run minerador
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          SAVE_PATH: ${{ github.workspace }}/data
+          HF_DATASET_NAME: email_miner_dataset
+          POLL_INTERVAL: "6"
+          BATCH_INSERT: "5000"
+          BATCH_EXPORT_ROWS: "200000"
         run: |
-          mkdir -p $SAVE_PATH
+          mkdir -p "$SAVE_PATH"
           python minerador.py
+
+      - name: Post-check disk (after)
+        if: always()
+        run: |
+          echo "=== df -h after ==="
+          df -h
+          echo "=== disk usage of SAVE_PATH ==="
+          du -sh "$SAVE_PATH" || true
+
+      - name: Upload diagnostic artifacts (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minerador-diagnostics
+          path: |
+            ${{ github.workspace }}/data/checkpoint.json
+            ${{ github.workspace }}/data/exports
+            ${{ github.workspace }}/data/emails.db
