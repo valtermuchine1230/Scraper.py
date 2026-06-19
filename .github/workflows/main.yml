@@ -12,54 +12,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Diagnose disk and environment
-        run: |
-          echo "=== df -h ==="
-          df -h
-          echo "=== lsblk ==="
-          lsblk
-          echo "=== mount ==="
-          mount | sed -n '1,200p' || true
-
       - name: Configure SAVE_PATH
         run: |
-          if [ -d /mnt ]; then
-            sudo mkdir -p /mnt/downloads
-            sudo chmod 777 /mnt/downloads
-            echo "SAVE_PATH=/mnt/downloads" >> $GITHUB_ENV
-          else
-            mkdir -p $GITHUB_WORKSPACE/data
-            echo "SAVE_PATH=$GITHUB_WORKSPACE/data" >> $GITHUB_ENV
-          fi
+          sudo mkdir -p /mnt/downloads
+          sudo chmod 777 /mnt/downloads
+          echo "SAVE_PATH=/mnt/downloads" >> $GITHUB_ENV
 
-      - name: Safe cleanup to recover space
+      - name: Free disk space
         run: |
-          sudo rm -rf /var/lib/apt/lists/* || true
           rm -rf $HOME/.cache || true
           rm -rf /tmp/* || true
           df -h
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Install system packages
         run: |
-          sudo apt-get update -y
+          sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
+            python3 \
+            python3-pip \
             python3-dev \
+            python3-libtorrent \
+            build-essential \
             libssl-dev \
             libffi-dev \
             libcurl4-openssl-dev \
-            pkg-config \
-            python3-libtorrent
+            pkg-config
 
-      - name: Install Python dependencies
+      - name: Upgrade pip
         run: |
-          python -m pip install --upgrade pip
-          pip install \
+          python3 -m pip install --upgrade pip
+
+      - name: Install Python packages
+        run: |
+          python3 -m pip install \
             pandas \
             pyarrow \
             duckdb \
@@ -71,8 +56,8 @@ jobs:
 
       - name: Verify libtorrent
         run: |
-          python --version
-          python -c "import libtorrent as lt; print('libtorrent version:', lt.version)"
+          python3 --version
+          python3 -c "import libtorrent as lt; print('libtorrent version:', lt.version)"
 
       - name: Run minerador
         env:
@@ -84,27 +69,23 @@ jobs:
           PART_ROWS: "30000000"
         run: |
           mkdir -p "$SAVE_PATH"
-          echo "SAVE_PATH=$SAVE_PATH"
           df -h
-          python minerador.py
-          df -h
+          python3 minerador.py
 
-      - name: Post-run diagnostics
+      - name: Diagnostics
         if: always()
         run: |
-          echo "=== df -h ==="
           df -h
-          echo "=== Save path usage ==="
           du -sh "$SAVE_PATH" || true
 
-      - name: Upload diagnostics on failure
+      - name: Upload diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: minerador-diagnostics
           path: |
-            ${{ env.SAVE_PATH }}/checkpoints
-            ${{ env.SAVE_PATH }}/minerador.log
-            ${{ env.SAVE_PATH }}/chunks
-            ${{ env.SAVE_PATH }}/final_parts
-            ${{ env.SAVE_PATH }}/exports
+            /mnt/downloads/checkpoints
+            /mnt/downloads/minerador.log
+            /mnt/downloads/chunks
+            /mnt/downloads/final_parts
+            /mnt/downloads/exports
