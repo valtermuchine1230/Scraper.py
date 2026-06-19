@@ -24,8 +24,8 @@ jobs:
       - name: Configure SAVE_PATH
         run: |
           if [ -d /mnt ]; then
-            sudo mkdir -p /mnt/downloads || true
-            sudo chmod 777 /mnt/downloads || true
+            sudo mkdir -p /mnt/downloads
+            sudo chmod 777 /mnt/downloads
             echo "SAVE_PATH=/mnt/downloads" >> $GITHUB_ENV
           else
             mkdir -p $GITHUB_WORKSPACE/data
@@ -40,9 +40,9 @@ jobs:
           df -h
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install system packages
         run: |
@@ -52,28 +52,27 @@ jobs:
             python3-dev \
             libssl-dev \
             libffi-dev \
-            libtorrent-rasterbar-dev \
             libcurl4-openssl-dev \
-            pkg-config
+            pkg-config \
+            python3-libtorrent
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install \
-            duckdb \
-            pyarrow \
             pandas \
+            pyarrow \
+            duckdb \
             requests \
             huggingface_hub \
             rich \
             psutil \
             colorlog
 
-      - name: Verify environment
+      - name: Verify libtorrent
         run: |
           python --version
-          pip --version
-          df -h
+          python -c "import libtorrent as lt; print('libtorrent version:', lt.version)"
 
       - name: Run minerador
         env:
@@ -104,7 +103,7 @@ jobs:
         with:
           name: minerador-diagnostics
           path: |
-            ${{ env.SAVE_PATH }}/checkpoints/checkpoint.json
+            ${{ env.SAVE_PATH }}/checkpoints
             ${{ env.SAVE_PATH }}/minerador.log
             ${{ env.SAVE_PATH }}/chunks
             ${{ env.SAVE_PATH }}/final_parts
