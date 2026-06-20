@@ -347,11 +347,97 @@ def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tu
             
     return sorted(list(found_indices)), missing_targets
 
-def local_path_for_index(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path:
-    """Get local path for a torrent file index."""
+def local_path_for_index_robust(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path | None:
+    """
+    Localiza robustamente o arquivo baixado no disco, tolerando múltiplas estruturas de libtorrent.
+    
+    PROBLEMA CORRIGIDO:
+    - file_path pode já conter a pasta raiz do torrent (duplicação de diretório)
+    - file_path pode ser relativo à raiz do torrent
+    - file_path pode ter nomes com espaços alterados ou normalizados
+    
+    SOLUÇÃO:
+    1. Testa construção padrão (save_path / torrent_name / file_path)
+    2. Testa construção sem duplicação (save_path / file_path)
+    3. Testa busca recursiva por basename no disco
+    4. Registra diagnóstico completo se falhar
+    
+    Nunca retorna None sem log detalhado.
+    """
     torrent_name = torrent_info.name()
     file_path = torrent_info.files().at(index).path
-    return save_path / torrent_name / file_path
+    basename = Path(file_path).name
+    
+    # NÍVEL 1: Construção padrão (salvepath / torrent_name / file_path)
+    candidate1 = save_path / torrent_name / file_path
+    if candidate1.exists() and candidate1.is_file():
+        logger.info(f"{E['ok']} [NÍVEL 1] Arquivo localizado: {candidate1}")
+        return candidate1
+    
+    # NÍVEL 2: Sem duplicação (salvepath / file_path)
+    # Este é o caso quando file_path já contém o nome da pasta raiz
+    candidate2 = save_path / file_path
+    if candidate2.exists() and candidate2.is_file():
+        logger.info(f"{E['ok']} [NÍVEL 2] Arquivo localizado (sem duplicação): {candidate2}")
+        return candidate2
+    
+    # NÍVEL 3: Busca recursiva por basename no diretório do torrent
+    torrent_dir = save_path / torrent_name
+    if torrent_dir.exists() and torrent_dir.is_dir():
+        for found_file in torrent_dir.rglob(basename):
+            if found_file.is_file():
+                logger.info(f"{E['ok']} [NÍVEL 3] Arquivo localizado (busca recursiva): {found_file}")
+                return found_file
+    
+    # NÍVEL 4: Busca recursiva a partir do save_path (fallback máximo)
+    for found_file in save_path.rglob(basename):
+        if found_file.is_file():
+            logger.info(f"{E['ok']} [NÍVEL 4] Arquivo localizado (busca global): {found_file}")
+            return found_file
+    
+    # FALHA: Registar diagnóstico completo
+    logger.error(f"{E['error']} ========== DIAGNÓSTICO COMPLETO DE ARQUIVO PERDIDO ==========")
+    logger.error(f"{E['error']} Torrent: {torrent_name}")
+    logger.error(f"{E['error']} File Index: {index}")
+    logger.error(f"{E['error']} File Path (raw): {file_path}")
+    logger.error(f"{E['error']} File Basename: {basename}")
+    logger.error(f"{E['error']} Save Path: {save_path}")
+    logger.error(f"{E['error']} ")
+    logger.error(f"{E['error']} Caminhos testados (NÃO encontrados):")
+    logger.error(f"{E['error']}   [1] {candidate1}")
+    logger.error(f){E['error']}   [2] {candidate2}")
+    if torrent_dir.exists():
+        logger.error(f"{E['error']}   [3] Busca recursiva em {torrent_dir}/")
+    logger.error(f"{E['error']}   [4] Busca global em {save_path}/")
+    logger.error(f"{E['error']} ")
+    logger.error(f"{E['error']} Conteúdo do diretório Torrent ({torrent_dir}):")
+    if torrent_dir.exists() and torrent_dir.is_dir():
+        try:
+            for item in list(torrent_dir.rglob("*"))[:50]:  # Limitar output
+                rel_path = item.relative_to(save_path)
+                if item.is_file():
+                    size = item.stat().st_size
+                    logger.error(f"{E['error']}     FILE: {rel_path} ({human(size)})")
+                else:
+                    logger.error(f"{E['error']}     DIR:  {rel_path}/")
+        except Exception as e:
+            logger.error(f"{E['error']}     [Erro ao listar: {str(e)}]")
+    else:
+        logger.error(f"{E['error']}     [Diretório NÃO existe]")
+    logger.error(f"{E['error']} ")
+    logger.error(f"{E['error']} Conteúdo raiz de Save Path ({save_path}):")
+    try:
+        for item in list(save_path.iterdir())[:20]:  # Apenas nível 1
+            if item.is_file():
+                size = item.stat().st_size
+                logger.error(f"{E['error']}     FILE: {item.name} ({human(size)})")
+            else:
+                logger.error(f"{E['error']}     DIR:  {item.name}/")
+    except Exception as e:
+        logger.error(f"{E['error']}     [Erro ao listar: {str(e)}]")
+    logger.error(f"{E['error']} =========================================================")
+    
+    return None
 
 def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_size: int) -> bool:
     """Wait for a file to finish downloading."""
@@ -641,10 +727,10 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
             
             try:
                 wait_for_file_complete(handle, idx, expected_size)
-                local_path = local_path_for_index(SAVE_PATH, info, idx)
+                local_path = local_path_for_index_robust(SAVE_PATH, info, idx)
                 
-                if not local_path.exists():
-                    logger.error(f"{E['error']} File not found on disk: {local_path}")
+                if local_path is None:
+                    logger.error(f"{E['error']} File not found on disk after exhaustive search (index {idx})")
                     continue
                 
                 all_files.append((tname, local_path, info))
