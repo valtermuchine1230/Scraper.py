@@ -1,28 +1,30 @@
-name: Minerador -> Trader_Emails
+name: Minerador
 
 on:
   workflow_dispatch:
 
 jobs:
-  minerador:
-    runs-on: ubuntu-latest
+  mineracao:
+    runs-on: ubuntu-22.04
     timeout-minutes: 720
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Liberar espaço
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo docker system prune -af || true
+          df -h
+
       - name: Definir SAVE_PATH
         run: |
           sudo mkdir -p /mnt/downloads
           sudo chmod 777 /mnt/downloads
           echo "SAVE_PATH=/mnt/downloads" >> $GITHUB_ENV
-
-      - name: Limpeza do runner
-        run: |
-          rm -rf $HOME/.cache || true
-          rm -rf /tmp/* || true
-          df -h
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -32,55 +34,49 @@ jobs:
       - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             python3-libtorrent \
-            libtorrent-rasterbar-dev
+            libtorrent-rasterbar2.0 \
+            build-essential
 
       - name: Instalar dependências Python
         run: |
           python -m pip install --upgrade pip
 
           pip install \
-            huggingface_hub \
             pandas \
             pyarrow \
-            rich
+            huggingface_hub \
+            rich \
+            psutil
 
       - name: Verificar libtorrent
         run: |
           python --version
-          python -c "import libtorrent as lt; print('libtorrent OK')"
 
-      - name: Criar diretórios
-        run: |
-          mkdir -p "$SAVE_PATH"
-          df -h
+          python -c "
+import libtorrent as lt
+print('libtorrent OK')
+print(lt.version)
+"
 
       - name: Executar minerador
         env:
-          SAVE_PATH: ${{ env.SAVE_PATH }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_DATASET_NAME: Trader_Emails
+          SAVE_PATH: ${{ env.SAVE_PATH }}
           POLL_INTERVAL: "60"
-          LOG_LEVEL: "INFO"
-          BATCH_INSERT: "5000"
-          BATCH_EXPORT_ROWS: "200000"
-          MIN_FREE_BYTES: "268435456"
         run: |
+          mkdir -p "$SAVE_PATH"
+          df -h
           python minerador.py
 
-      - name: Mostrar espaço em disco
-        if: always()
-        run: |
-          df -h
-          du -sh /mnt/downloads || true
-
-      - name: Upload de logs em caso de falha
+      - name: Upload logs em caso de falha
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: minerador-logs
+          name: logs
           path: |
-            /mnt/downloads/minerador.log
             /mnt/downloads/checkpoints
-            /mnt/downloads/exports
+            /mnt/downloads/minerador.log
