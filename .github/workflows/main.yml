@@ -1,73 +1,223 @@
-name: Minerador
+name: Minerador v2 - High Performance Email Mining
 
 on:
+  push:
+    branches:
+      - main
+      - develop
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
   workflow_dispatch:
+    inputs:
+      resume:
+        description: 'Resume from checkpoint'
+        required: false
+        default: 'true'
+
+env:
+  SAVE_PATH: ${{ github.workspace }}/data
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  HF_DATASET_NAME: Trader_Emails
+  LOG_LEVEL: INFO
+  POLL_INTERVAL: 3
+  CHUNK_SIZE: 1073741824  # 1GB
+  BATCH_INSERT: 100000
+  BATCH_EXPORT_ROWS: 30000000  # 30M per file
+  MIN_FREE_BYTES: 536870912  # 512MB
 
 jobs:
-  mineracao:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 720
-
+  minerador:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours maximum
+    
+    permissions:
+      contents: read
+      packages: read
+    
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Liberar espaço
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/lib/android || true
-          docker system prune -af || true
-          df -h
-
-      - name: Definir SAVE_PATH
-        run: |
-          sudo mkdir -p /mnt/downloads
-          sudo chmod 777 /mnt/downloads
-          echo "SAVE_PATH=/mnt/downloads" >> $GITHUB_ENV
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Instalar dependências do sistema
+      - name: Increase swap space
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Configure disk space
+        run: |
+          # Clean up unnecessary files
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo apt-get clean
+          df -h
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            python3-libtorrent \
-            libtorrent-rasterbar2.0 \
-            build-essential
+            build-essential \
+            python3-dev \
+            libtorrent-rasterbar-dev \
+            libssl-dev \
+            libboost-all-dev \
+            pkg-config \
+            git
 
-      - name: Instalar dependências Python
+      - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas pyarrow huggingface_hub rich psutil
+          python -m pip install --upgrade pip setuptools wheel
+          pip install \
+            libtorrent \
+            huggingface-hub \
+            pandas \
+            pyarrow \
+            duckdb \
+            rich \
+            pydantic
 
-      - name: Verificar Python
-        run: |
-          python --version
-
-      - name: Verificar libtorrent
-        run: |
-          python -c "import libtorrent"
-
-      - name: Executar minerador
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_DATASET_NAME: Trader_Emails
-          SAVE_PATH: ${{ env.SAVE_PATH }}
-          POLL_INTERVAL: "60"
+      - name: Create data directories
         run: |
           mkdir -p "$SAVE_PATH"
-          df -h
-          python minerador.py
+          mkdir -p "$SAVE_PATH/exports"
+          mkdir -p "$SAVE_PATH/temp"
+          mkdir -p "$SAVE_PATH/raw_chunks"
+          ls -la "$SAVE_PATH"
 
-      - name: Upload logs em caso de falha
-        if: failure()
+      - name: Download checkpoint artifact
+        if: github.event.inputs.resume == 'true' || always()
+        uses: actions/download-artifact@v4
+        with:
+          name: checkpoint
+          path: ${{ env.SAVE_PATH }}
+        continue-on-error: true
+
+      - name: Display checkpoint status
+        run: |
+          if [ -f "$SAVE_PATH/checkpoint.json" ]; then
+            echo "✅ Checkpoint found:"
+            cat "$SAVE_PATH/checkpoint.json"
+          else
+            echo "⚠️ No checkpoint found, starting fresh"
+          fi
+
+      - name: Run Minerador v2
+        run: |
+          python minerador_v2.py
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: Display logs
+        if: always()
+        run: |
+          if [ -f "$SAVE_PATH/minerador.log" ]; then
+            echo "=== MINERADOR LOG (last 100 lines) ==="
+            tail -100 "$SAVE_PATH/minerador.log"
+          fi
+
+      - name: Compress data for artifact
+        if: always()
+        run: |
+          cd "$SAVE_PATH"
+          
+          # Save checkpoint for next run
+          if [ -f "checkpoint.json" ]; then
+            tar -czf checkpoint.tar.gz checkpoint.json || true
+            tar -czf disposable_domains.tar.gz disposable_domains.json || true
+          fi
+          
+          # Save DuckDB database
+          if [ -f "emails.duckdb" ]; then
+            tar -czf duckdb_backup.tar.gz emails.duckdb || true
+          fi
+          
+          # Save raw chunks
+          if [ -d "raw_chunks" ] && [ "$(ls -A raw_chunks)" ]; then
+            tar -czf raw_chunks.tar.gz raw_chunks/ || true
+          fi
+          
+          ls -lh *.tar.gz 2>/dev/null || true
+
+      - name: Upload checkpoint artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs
+          name: checkpoint
           path: |
-            /mnt/downloads/checkpoints
-            /mnt/downloads/minerador.log
+            ${{ env.SAVE_PATH }}/checkpoint.json
+            ${{ env.SAVE_PATH }}/disposable_domains.json
+          retention-days: 30
+        continue-on-error: true
+
+      - name: Upload DuckDB backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-backup
+          path: ${{ env.SAVE_PATH }}/emails.duckdb
+          retention-days: 30
+        continue-on-error: true
+
+      - name: Upload raw chunks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-chunks
+          path: ${{ env.SAVE_PATH }}/raw_chunks/
+          retention-days: 30
+        continue-on-error: true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minerador-logs
+          path: |
+            ${{ env.SAVE_PATH }}/minerador.log
+          retention-days: 30
+        continue-on-error: true
+
+      - name: Disk usage summary
+        if: always()
+        run: |
+          echo "=== Disk Usage ==="
+          df -h
+          echo ""
+          echo "=== Data Directory ==="
+          du -sh "$SAVE_PATH"/*
+          echo ""
+          echo "=== File Count ==="
+          find "$SAVE_PATH" -type f | wc -l
+
+      - name: Cleanup large temporary files
+        if: always()
+        run: |
+          cd "$SAVE_PATH"
+          rm -rf temp/
+          rm -rf raw_chunks/*.parquet
+          du -sh . || true
+
+      - name: Status summary
+        if: always()
+        run: |
+          echo "✅ Workflow completed"
+          echo "📁 Data saved to: $SAVE_PATH"
+          echo "📊 Artifacts uploaded for next run"
+          if [ -f "$SAVE_PATH/checkpoint.json" ]; then
+            echo "✅ Checkpoint persisted"
+          fi
