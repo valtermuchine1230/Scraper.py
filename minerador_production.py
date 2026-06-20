@@ -147,6 +147,21 @@ signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
 # ===== UTILITIES =====
+
+def normalize_string_robust(s: str) -> str:
+    """
+    Normaliza strings para resolver quebras de linha inesperadas,
+    espaços duplicados ou invisíveis e diferenças de path.
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    # Substituir qualquer whitespace (incluindo \n, \r, \t) por espaço único
+    s = re.sub(r'\s+', ' ', s)
+    # Normalizar barras de diretório para o padrão UNIX
+    s = s.replace('\\', '/')
+    # Remover espaços nas extremidades e converter para minúsculas
+    return s.strip().lower()
+
 def human(n: int) -> str:
     """Convert bytes to human readable format."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -261,66 +276,76 @@ def create_libtorrent_session() -> lt.session:
 
 def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tuple[List[int], List[str]]:
     """
-    Find target file indices in torrent using an intelligent resolution engine.
-    Matches by exact path, basename evaluation, and substring analysis.
-    Never fails silently and dumps metadata paths on missing items.
+    Find target file indices in torrent using um sistema de matching em 3 níveis.
+    Normaliza paths para garantir tolerância a falhas na formatação visual.
+    Nunca falha silenciosamente e expõe o catálogo de metadata completo em caso de falha.
     """
     n = torrent_info.num_files()
     files_storage = torrent_info.files()
-    idx_to_path = {i: files_storage.at(i).path for i in range(n)}
     
-    found = []
-    missing = []
+    # 1. Catálogo de ficheiros e pré-computação das versões normalizadas
+    file_catalog = {}
+    for i in range(n):
+        raw_path = files_storage.at(i).path
+        norm_path = normalize_string_robust(raw_path)
+        basename = norm_path.split('/')[-1]
+        file_catalog[i] = {
+            'raw': raw_path,
+            'norm': norm_path,
+            'basename': basename,
+            'size': files_storage.at(i).size
+        }
+    
+    found_indices = set()
+    missing_targets = []
     
     for t in targets:
-        matched = False
-        target_norm = t.replace("\\", "/").lower()
-        target_basename = target_norm.split("/")[-1]
+        target_norm = normalize_string_robust(t)
+        target_basename = target_norm.split('/')[-1]
         
-        # 1. Match exato ou case-insensitive completo
-        for i, p in idx_to_path.items():
-            p_norm = p.replace("\\", "/").lower()
-            if p_norm == target_norm:
-                found.append(i)
+        matched = False
+        
+        # NÍVEL 1: Match Exato Normalizado
+        for i, fdata in file_catalog.items():
+            if fdata['norm'] == target_norm:
+                found_indices.add(i)
                 matched = True
-                logger.info(f"{E['ok']} Target mapeado perfeitamente (Exact Match): '{t}' -> '{p}'")
+                logger.info(f"{E['ok']} Nível 1 (Match Exato): '{t}' -> '{fdata['raw']}'")
                 break
                 
-        if matched:
-            continue
+        if matched: continue
             
-        # 2. Match por Nome Final do Ficheiro (Basename)
-        for i, p in idx_to_path.items():
-            p_norm = p.replace("\\", "/").lower()
-            p_basename = p_norm.split("/")[-1]
-            if p_basename == target_basename:
-                found.append(i)
+        # NÍVEL 2: Match por Nome Final do Ficheiro (Basename)
+        for i, fdata in file_catalog.items():
+            if fdata['basename'] == target_basename:
+                found_indices.add(i)
                 matched = True
-                logger.info(f"{E['ok']} Target resolvido inteligentemente (Basename Match): '{t}' -> '{p}'")
+                logger.info(f"{E['ok']} Nível 2 (Basename): '{t}' -> '{fdata['raw']}'")
                 break
                 
-        if matched:
-            continue
+        if matched: continue
             
-        # 3. Match Parcial (Substring ou Conteúdo contido)
-        for i, p in idx_to_path.items():
-            p_norm = p.replace("\\", "/").lower()
-            if target_basename in p_norm or p_norm in target_norm:
-                found.append(i)
+        # NÍVEL 3: Match Parcial (Substring Robusta)
+        for i, fdata in file_catalog.items():
+            # Verifica se o basename do target está contido no path real normalizado
+            # Ou se o basename real está contido no path do target normalizado
+            if target_basename in fdata['norm'] or fdata['basename'] in target_norm:
+                found_indices.add(i)
                 matched = True
-                logger.info(f"{E['ok']} Target resolvido inteligentemente (Partial Match): '{t}' -> '{p}'")
+                logger.info(f"{E['warn']} Nível 3 (Match Parcial): '{t}' -> '{fdata['raw']}'")
                 break
                 
         if not matched:
-            missing.append(t)
+            missing_targets.append(t)
             logger.error(f"{E['error']} Impossível encontrar correspondência para o target: '{t}'")
             
-    if missing:
+    # Fallback rigoroso com logging se houver targets desaparecidos
+    if missing_targets:
         logger.warning(f"{E['warn']} LISTA COMPLETA DE FICHEIROS DISPONÍVEIS NO TORRENT DE METADATA ({torrent_info.name()}):")
-        for i, p in idx_to_path.items():
-            logger.warning(f"  -> Index [{i}]: '{p}' ({human(files_storage.at(i).size)})")
+        for i, fdata in file_catalog.items():
+            logger.warning(f"  -> Index [{i}]: Raw='{fdata['raw']}' | Normalizado='{fdata['norm']}' | Size={human(fdata['size'])}")
             
-    return sorted(set(found)), missing
+    return sorted(list(found_indices)), missing_targets
 
 def local_path_for_index(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path:
     """Get local path for a torrent file index."""
