@@ -14,10 +14,10 @@ jobs:
 
       - name: Liberar espaço
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/lib/android
-          sudo docker system prune -af || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+          docker system prune -af || true
           df -h
 
       - name: Definir SAVE_PATH
@@ -34,7 +34,6 @@ jobs:
       - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
-
           sudo apt-get install -y \
             python3-libtorrent \
             libtorrent-rasterbar2.0 \
@@ -43,23 +42,15 @@ jobs:
       - name: Instalar dependências Python
         run: |
           python -m pip install --upgrade pip
+          pip install pandas pyarrow huggingface_hub rich psutil
 
-          pip install \
-            pandas \
-            pyarrow \
-            huggingface_hub \
-            rich \
-            psutil
-
-      - name: Verificar libtorrent
+      - name: Verificar Python
         run: |
           python --version
 
-          python -c "
-import libtorrent as lt
-print('libtorrent OK')
-print(lt.version)
-"
+      - name: Verificar libtorrent
+        run: |
+          python -c "import libtorrent"
 
       - name: Executar minerador
         env:
