@@ -4,14 +4,21 @@ on:
   push:
     branches:
       - main
+
   schedule:
     - cron: '0 */6 * * *'  # Every 6 hours
+
   workflow_dispatch:
     inputs:
       resume:
         description: 'Resume from checkpoint'
         required: false
         default: 'true'
+
+# 🔴 FIX CRÍTICO: evita cancelamento por execuções sobrepostas
+concurrency:
+  group: minerador-production
+  cancel-in-progress: false
 
 env:
   SAVE_PATH: ${{ github.workspace }}/data
@@ -28,12 +35,13 @@ env:
 jobs:
   minerador:
     runs-on: ubuntu-latest
+
     timeout-minutes: 360
-    
+
     permissions:
       contents: read
       packages: read
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -93,26 +101,27 @@ jobs:
           ls -la "$SAVE_PATH"
 
       - name: Download checkpoint from HF
-        continue-on-error: true
         run: |
           python << 'EOF'
           import os
           from huggingface_hub import HfApi
-          
+
           token = os.environ.get("HF_TOKEN")
-          if token:
-            api = HfApi()
-            try:
-              api.hf_hub_download(
-                repo_id="$(whoami)/minerador_checkpoints",
-                filename="state.json",
-                local_dir="${{ env.SAVE_PATH }}",
-                token=token,
-                repo_type="dataset"
-              )
-              print("✅ Checkpoint downloaded")
-            except:
-              print("⚠️ No checkpoint found, starting fresh")
+          repo_owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
+
+          if token and repo_owner:
+              api = HfApi()
+              try:
+                  api.hf_hub_download(
+                      repo_id=f"{repo_owner}/minerador_checkpoints",
+                      filename="state.json",
+                      local_dir=os.environ.get("SAVE_PATH"),
+                      token=token,
+                      repo_type="dataset"
+                  )
+                  print("✅ Checkpoint downloaded")
+              except Exception as e:
+                  print("⚠️ No checkpoint found or failed:", str(e))
           EOF
 
       - name: Run Minerador Production
