@@ -1,13 +1,11 @@
-name: Minerador v2 - High Performance Email Mining
+name: Minerador Production - High Performance Pipeline
 
 on:
   push:
     branches:
       - main
-      - develop
   schedule:
-    # Run every 6 hours
-    - cron: '0 */6 * * *'
+    - cron: '0 */6 * * *'  # Every 6 hours
   workflow_dispatch:
     inputs:
       resume:
@@ -18,18 +16,19 @@ on:
 env:
   SAVE_PATH: ${{ github.workspace }}/data
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
-  HF_DATASET_NAME: Trader_Emails
+  HF_REPO_EMAILS: Trader_Emails
+  HF_REPO_CHECKPOINT: minerador_checkpoints
   LOG_LEVEL: INFO
   POLL_INTERVAL: 3
-  CHUNK_SIZE: 1073741824  # 1GB
-  BATCH_INSERT: 100000
-  BATCH_EXPORT_ROWS: 30000000  # 30M per file
-  MIN_FREE_BYTES: 536870912  # 512MB
+  CHUNK_SIZE: 1073741824
+  BATCH_INSERT_DDB: 500000
+  ROWS_PER_FINAL_FILE: 30000000
+  MIN_FREE_BYTES: 536870912
 
 jobs:
   minerador:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours maximum
+    timeout-minutes: 360
     
     permissions:
       contents: read
@@ -41,7 +40,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -56,9 +55,8 @@ jobs:
           sudo swapon /swapfile
           free -h
 
-      - name: Configure disk space
+      - name: Clean up disk space
         run: |
-          # Clean up unnecessary files
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
@@ -75,8 +73,7 @@ jobs:
             libtorrent-rasterbar-dev \
             libssl-dev \
             libboost-all-dev \
-            pkg-config \
-            git
+            pkg-config
 
       - name: Install Python dependencies
         run: |
@@ -88,136 +85,71 @@ jobs:
             pyarrow \
             duckdb \
             rich \
-            pydantic
+            psutil
 
       - name: Create data directories
         run: |
-          mkdir -p "$SAVE_PATH"
-          mkdir -p "$SAVE_PATH/exports"
-          mkdir -p "$SAVE_PATH/temp"
-          mkdir -p "$SAVE_PATH/raw_chunks"
+          mkdir -p "$SAVE_PATH"/{exports,temp,raw_chunks}
           ls -la "$SAVE_PATH"
 
-      - name: Download checkpoint artifact
-        if: github.event.inputs.resume == 'true' || always()
-        uses: actions/download-artifact@v4
-        with:
-          name: checkpoint
-          path: ${{ env.SAVE_PATH }}
+      - name: Download checkpoint from HF
         continue-on-error: true
-
-      - name: Display checkpoint status
         run: |
-          if [ -f "$SAVE_PATH/checkpoint.json" ]; then
-            echo "✅ Checkpoint found:"
-            cat "$SAVE_PATH/checkpoint.json"
-          else
-            echo "⚠️ No checkpoint found, starting fresh"
-          fi
+          python << 'EOF'
+          import os
+          from huggingface_hub import HfApi
+          
+          token = os.environ.get("HF_TOKEN")
+          if token:
+            api = HfApi()
+            try:
+              api.hf_hub_download(
+                repo_id="$(whoami)/minerador_checkpoints",
+                filename="state.json",
+                local_dir="${{ env.SAVE_PATH }}",
+                token=token,
+                repo_type="dataset"
+              )
+              print("✅ Checkpoint downloaded")
+            except:
+              print("⚠️ No checkpoint found, starting fresh")
+          EOF
 
-      - name: Run Minerador v2
+      - name: Run Minerador Production
         run: |
-          python minerador_v2.py
-        continue-on-error: true
+          python minerador_production.py
         env:
           PYTHONUNBUFFERED: 1
 
-      - name: Display logs
+      - name: Display logs (last 200 lines)
         if: always()
         run: |
           if [ -f "$SAVE_PATH/minerador.log" ]; then
-            echo "=== MINERADOR LOG (last 100 lines) ==="
-            tail -100 "$SAVE_PATH/minerador.log"
+            echo "=== MINERADOR LOG ==="
+            tail -200 "$SAVE_PATH/minerador.log"
           fi
 
-      - name: Compress data for artifact
+      - name: Show disk usage
         if: always()
         run: |
-          cd "$SAVE_PATH"
-          
-          # Save checkpoint for next run
-          if [ -f "checkpoint.json" ]; then
-            tar -czf checkpoint.tar.gz checkpoint.json || true
-            tar -czf disposable_domains.tar.gz disposable_domains.json || true
-          fi
-          
-          # Save DuckDB database
-          if [ -f "emails.duckdb" ]; then
-            tar -czf duckdb_backup.tar.gz emails.duckdb || true
-          fi
-          
-          # Save raw chunks
-          if [ -d "raw_chunks" ] && [ "$(ls -A raw_chunks)" ]; then
-            tar -czf raw_chunks.tar.gz raw_chunks/ || true
-          fi
-          
-          ls -lh *.tar.gz 2>/dev/null || true
-
-      - name: Upload checkpoint artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkpoint
-          path: |
-            ${{ env.SAVE_PATH }}/checkpoint.json
-            ${{ env.SAVE_PATH }}/disposable_domains.json
-          retention-days: 30
-        continue-on-error: true
-
-      - name: Upload DuckDB backup
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: duckdb-backup
-          path: ${{ env.SAVE_PATH }}/emails.duckdb
-          retention-days: 30
-        continue-on-error: true
-
-      - name: Upload raw chunks
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: raw-chunks
-          path: ${{ env.SAVE_PATH }}/raw_chunks/
-          retention-days: 30
-        continue-on-error: true
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: minerador-logs
-          path: |
-            ${{ env.SAVE_PATH }}/minerador.log
-          retention-days: 30
-        continue-on-error: true
-
-      - name: Disk usage summary
-        if: always()
-        run: |
-          echo "=== Disk Usage ==="
+          echo "=== DISK USAGE ==="
           df -h
           echo ""
-          echo "=== Data Directory ==="
-          du -sh "$SAVE_PATH"/*
-          echo ""
-          echo "=== File Count ==="
-          find "$SAVE_PATH" -type f | wc -l
+          echo "=== DATA DIRECTORY ==="
+          du -sh "$SAVE_PATH"/* 2>/dev/null || true
 
-      - name: Cleanup large temporary files
+      - name: Clean temporary files
         if: always()
         run: |
-          cd "$SAVE_PATH"
-          rm -rf temp/
-          rm -rf raw_chunks/*.parquet
-          du -sh . || true
+          rm -rf "$SAVE_PATH"/temp
+          rm -rf "$SAVE_PATH"/raw_chunks/*.parquet
+          du -sh "$SAVE_PATH"
 
       - name: Status summary
         if: always()
         run: |
           echo "✅ Workflow completed"
-          echo "📁 Data saved to: $SAVE_PATH"
-          echo "📊 Artifacts uploaded for next run"
-          if [ -f "$SAVE_PATH/checkpoint.json" ]; then
-            echo "✅ Checkpoint persisted"
+          echo "📁 Data: $SAVE_PATH"
+          if [ -f "$SAVE_PATH/state.json" ]; then
+            echo "✅ State persisted for next run"
           fi
