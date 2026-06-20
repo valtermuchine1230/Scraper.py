@@ -405,7 +405,7 @@ def local_path_for_index_robust(save_path: Path, torrent_info: lt.torrent_info, 
     logger.error(f"{E['error']} ")
     logger.error(f"{E['error']} Caminhos testados (NÃO encontrados):")
     logger.error(f"{E['error']}   [1] {candidate1}")
-    logger.error(f){E['error']}   [2] {candidate2}")
+    logger.error(f"{E['error']}   [2] {candidate2}")
     if torrent_dir.exists():
         logger.error(f"{E['error']}   [3] Busca recursiva em {torrent_dir}/")
     logger.error(f"{E['error']}   [4] Busca global em {save_path}/")
