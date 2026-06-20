@@ -81,9 +81,9 @@ MAGNETS = [
         "name": "Collection #1",
         "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
         "targets": [
-            "Collection #1_BTC combos.tar.gz",
-            "Collection #1_OLD CLOUD_Trading combos.tar.gz",
-            "Collection #1_OLD CLOUD_BTC combos.tar.gz",
+            "Collection #1/Collection #1_BTC combos.tar.gz",
+            "Collection #1/Collection #1_OLD CLOUD_Trading combos.tar.gz",
+            "Collection #1/Collection #1_OLD CLOUD_BTC combos.tar.gz",
         ],
     },
 ]
@@ -260,23 +260,66 @@ def create_libtorrent_session() -> lt.session:
         raise
 
 def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tuple[List[int], List[str]]:
-    """Find target file indices in torrent."""
+    """
+    Find target file indices in torrent using an intelligent resolution engine.
+    Matches by exact path, basename evaluation, and substring analysis.
+    Never fails silently and dumps metadata paths on missing items.
+    """
     n = torrent_info.num_files()
-    idx_to_path = {i: torrent_info.files().at(i).path for i in range(n)}
+    files_storage = torrent_info.files()
+    idx_to_path = {i: files_storage.at(i).path for i in range(n)}
     
     found = []
     missing = []
     
     for t in targets:
         matched = False
+        target_norm = t.replace("\\", "/").lower()
+        target_basename = target_norm.split("/")[-1]
+        
+        # 1. Match exato ou case-insensitive completo
         for i, p in idx_to_path.items():
-            if p == t or p.lower() == t.lower():
+            p_norm = p.replace("\\", "/").lower()
+            if p_norm == target_norm:
                 found.append(i)
                 matched = True
+                logger.info(f"{E['ok']} Target mapeado perfeitamente (Exact Match): '{t}' -> '{p}'")
                 break
+                
+        if matched:
+            continue
+            
+        # 2. Match por Nome Final do Ficheiro (Basename)
+        for i, p in idx_to_path.items():
+            p_norm = p.replace("\\", "/").lower()
+            p_basename = p_norm.split("/")[-1]
+            if p_basename == target_basename:
+                found.append(i)
+                matched = True
+                logger.info(f"{E['ok']} Target resolvido inteligentemente (Basename Match): '{t}' -> '{p}'")
+                break
+                
+        if matched:
+            continue
+            
+        # 3. Match Parcial (Substring ou Conteúdo contido)
+        for i, p in idx_to_path.items():
+            p_norm = p.replace("\\", "/").lower()
+            if target_basename in p_norm or p_norm in target_norm:
+                found.append(i)
+                matched = True
+                logger.info(f"{E['ok']} Target resolvido inteligentemente (Partial Match): '{t}' -> '{p}'")
+                break
+                
         if not matched:
             missing.append(t)
-    
+            logger.error(f"{E['error']} Impossível encontrar correspondência para o target: '{t}'")
+            
+    if missing:
+        logger.warning(f"{E['warn']} LISTA COMPLETA DE FICHEIROS DISPONÍVEIS NO TORRENT DE METADATA ({torrent_info.name()}):")
+        for i, p in idx_to_path.items():
+            logger.warning(f"  -> Index [{i}]: '{p}' ({human(files_storage.at(i).size)})")
+            
     return sorted(set(found)), missing
 
 def local_path_for_index(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path:
@@ -520,7 +563,7 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
             found, missing = find_target_indices(info, targets)
             
             if missing:
-                logger.error(f"{E['error']} Missing targets in {name}")
+                logger.error(f"{E['error']} Missing targets in {name} após busca inteligente.")
                 raise RuntimeError(f"Targets not found in metadata")
             
             # Set priorities
@@ -528,7 +571,7 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
             for i in range(nfiles):
                 handle.file_priority(i, 7 if i in found else 0)
             
-            logger.info(f"{E['ok']} {name} ready, targets: {found}")
+            logger.info(f"{E['ok']} {name} ready, targets mapeados com sucesso: {found}")
             return (name, (handle, info, found))
         except Exception as e:
             logger.exception(f"{E['error']} Torrent {name} failed")
