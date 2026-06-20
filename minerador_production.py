@@ -71,7 +71,7 @@ MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 MAGNETS = [
     {
         "name": "Collection #2-#5",
-        "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce",
+        "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
         "targets": [
             "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
             "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
@@ -79,7 +79,7 @@ MAGNETS = [
     },
     {
         "name": "Collection #1",
-        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce",
+        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
         "targets": [
             "Collection #1/Collection #1_BTC combos.tar.gz",
             "Collection #1/Collection #1_OLD CLOUD_Trading combos.tar.gz",
@@ -227,24 +227,37 @@ def batch_insert_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tuple]) -
 # ===== LIBTORRENT =====
 def create_libtorrent_session() -> lt.session:
     """Create optimized libtorrent session."""
-    session = lt.session({"listen_interfaces": "0.0.0.0:6881"})
-    cpu_count = os.cpu_count() or 4
-    
-    settings = lt.settings_pack()
-    settings.set_int("connections_limit", min(cpu_count * 100, 800))
-    settings.set_int("connections_limit_global", min(cpu_count * 500, 4000))
-    settings.set_int("active_limit", min(cpu_count * 50, 200))
-    settings.set_int("request_queue_size", 1024)
-    settings.set_int("cache_size", 4096)
-    settings.set_bool("enable_dht", True)
-    settings.set_bool("enable_lsd", True)
-    settings.set_bool("enable_pex", True)
-    settings.set_int("upload_rate_limit", 0)
-    settings.set_int("download_rate_limit", 0)
-    
-    session.apply_settings(settings)
-    logger.info(f"{E['cpu']} Libtorrent configurado")
-    return session
+    try:
+        # Try modern libtorrent API (v2.x)
+        session = lt.session()
+        
+        # Configure via settings_pack if available
+        try:
+            settings = lt.settings_pack()
+            cpu_count = os.cpu_count() or 4
+            
+            settings.set_int("connections_limit", min(cpu_count * 100, 800))
+            settings.set_int("connections_limit_global", min(cpu_count * 500, 4000))
+            settings.set_int("active_limit", min(cpu_count * 50, 200))
+            settings.set_int("request_queue_size", 1024)
+            settings.set_int("cache_size", 4096)
+            settings.set_bool("enable_dht", True)
+            settings.set_bool("enable_lsd", True)
+            settings.set_bool("enable_pex", True)
+            settings.set_int("upload_rate_limit", 0)
+            settings.set_int("download_rate_limit", 0)
+            
+            session.apply_settings(settings)
+        except AttributeError:
+            # Fallback for older libtorrent versions
+            logger.info(f"{E['info']} Using fallback libtorrent configuration")
+            pass
+        
+        logger.info(f"{E['cpu']} Libtorrent session created")
+        return session
+    except Exception as e:
+        logger.exception(f"{E['error']} Failed to create libtorrent session")
+        raise
 
 def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tuple[List[int], List[str]]:
     """Find target file indices in torrent."""
@@ -416,12 +429,16 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
             if "already exists" in str(e).lower():
                 logger.info(f"{E['ok']} Dataset exists: {repo_id}")
             else:
-                logger.warning(f"{E['warn']} Create repo: {e}")
+                logger.warning(f"{E['warn']} Create repo: {str(e)[:100]}")
     
     return api, emails_repo, checkpoint_repo
 
 def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_path: str) -> bool:
     """Upload file to HF with retry."""
+    if not local_path.exists():
+        logger.warning(f"{E['warn']} File not found for upload: {local_path}")
+        return False
+    
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -639,8 +656,8 @@ def phase5_deduplicate_duckdb(conn: duckdb.DuckDBPyConnection) -> int:
         logger.info(f"{E['stats']} Records before dedup: {count_before:,}")
         
         # Use SELECT DISTINCT for deduplication
-        conn.execute("CREATE TABLE emails_dedup AS SELECT DISTINCT * FROM emails_raw;")
-        conn.execute("DROP TABLE emails_raw;")
+        conn.execute("CREATE TABLE IF NOT EXISTS emails_dedup AS SELECT DISTINCT * FROM emails_raw;")
+        conn.execute("DROP TABLE IF EXISTS emails_raw;")
         conn.execute("ALTER TABLE emails_dedup RENAME TO emails_raw;")
         conn.commit()
         
@@ -664,24 +681,28 @@ def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
     offset = 0
     
     while not stop_event.is_set():
-        rows_df = conn.execute(
-            f"SELECT * FROM emails_raw LIMIT {ROWS_PER_FINAL_FILE} OFFSET {offset};"
-        ).fetchdf()
-        
-        if rows_df.shape[0] == 0:
+        try:
+            rows_df = conn.execute(
+                f"SELECT * FROM emails_raw LIMIT {ROWS_PER_FINAL_FILE} OFFSET {offset};"
+            ).fetchdf()
+            
+            if rows_df.shape[0] == 0:
+                break
+            
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            final_file = EXPORT_DIR / f"Trader_Emails_{file_num:03d}_{ts}.parquet"
+            
+            table = pa.Table.from_pandas(rows_df)
+            pq.write_table(table, str(final_file), compression="snappy")
+            
+            final_files.append(final_file)
+            logger.info(f"{E['ok']} Generated: {final_file.name} ({rows_df.shape[0]:,} rows)")
+            
+            file_num += 1
+            offset += ROWS_PER_FINAL_FILE
+        except Exception:
+            logger.exception(f"{E['error']} Failed to export final file")
             break
-        
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        final_file = EXPORT_DIR / f"Trader_Emails_{file_num:03d}_{ts}.parquet"
-        
-        table = pa.Table.from_pandas(rows_df)
-        pq.write_table(table, str(final_file), compression="snappy")
-        
-        final_files.append(final_file)
-        logger.info(f"{E['ok']} Generated: {final_file.name} ({rows_df.shape[0]:,} rows)")
-        
-        file_num += 1
-        offset += ROWS_PER_FINAL_FILE
     
     logger.info(f"{E['ok']} PHASE 6 complete: {len(final_files)} final datasets generated")
     return final_files
@@ -745,7 +766,12 @@ def main():
     
     # Initialize DuckDB and libtorrent
     conn = init_duckdb(DB_PATH)
-    session = create_libtorrent_session()
+    
+    try:
+        session = create_libtorrent_session()
+    except Exception as e:
+        logger.exception(f"{E['error']} Failed to initialize libtorrent")
+        sys.exit(1)
     
     try:
         overall_start = time.time()
