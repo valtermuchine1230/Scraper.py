@@ -1,10 +1,10 @@
-name: Minerador -> Hugging Face
+name: Minerador -> Trader_Emails
 
 on:
   workflow_dispatch:
 
 jobs:
-  mineracao:
+  minerador:
     runs-on: ubuntu-latest
     timeout-minutes: 720
 
@@ -12,80 +12,75 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure SAVE_PATH
+      - name: Definir SAVE_PATH
         run: |
           sudo mkdir -p /mnt/downloads
           sudo chmod 777 /mnt/downloads
           echo "SAVE_PATH=/mnt/downloads" >> $GITHUB_ENV
 
-      - name: Free disk space
+      - name: Limpeza do runner
         run: |
           rm -rf $HOME/.cache || true
           rm -rf /tmp/* || true
           df -h
 
-      - name: Install system packages
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            python3 \
-            python3-pip \
-            python3-dev \
             python3-libtorrent \
-            build-essential \
-            libssl-dev \
-            libffi-dev \
-            libcurl4-openssl-dev \
-            pkg-config
+            libtorrent-rasterbar-dev
 
-      - name: Upgrade pip
+      - name: Instalar dependências Python
         run: |
-          python3 -m pip install --upgrade pip
+          python -m pip install --upgrade pip
 
-      - name: Install Python packages
-        run: |
-          python3 -m pip install \
+          pip install \
+            huggingface_hub \
             pandas \
             pyarrow \
-            duckdb \
-            requests \
-            huggingface_hub \
-            rich \
-            psutil \
-            colorlog
+            rich
 
-      - name: Verify libtorrent
+      - name: Verificar libtorrent
         run: |
-          python3 --version
-          python3 -c "import libtorrent as lt; print('libtorrent version:', lt.version)"
+          python --version
+          python -c "import libtorrent as lt; print('libtorrent OK')"
 
-      - name: Run minerador
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_DATASET_NAME: Trader_Emails
-          SAVE_PATH: ${{ env.SAVE_PATH }}
-          POLL_INTERVAL: "60"
-          WORKERS: "4"
-          PART_ROWS: "30000000"
+      - name: Criar diretórios
         run: |
           mkdir -p "$SAVE_PATH"
           df -h
-          python3 minerador.py
 
-      - name: Diagnostics
+      - name: Executar minerador
+        env:
+          SAVE_PATH: ${{ env.SAVE_PATH }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_NAME: Trader_Emails
+          POLL_INTERVAL: "60"
+          LOG_LEVEL: "INFO"
+          BATCH_INSERT: "5000"
+          BATCH_EXPORT_ROWS: "200000"
+          MIN_FREE_BYTES: "268435456"
+        run: |
+          python minerador.py
+
+      - name: Mostrar espaço em disco
         if: always()
         run: |
           df -h
-          du -sh "$SAVE_PATH" || true
+          du -sh /mnt/downloads || true
 
-      - name: Upload diagnostics
+      - name: Upload de logs em caso de falha
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: minerador-diagnostics
+          name: minerador-logs
           path: |
-            /mnt/downloads/checkpoints
             /mnt/downloads/minerador.log
-            /mnt/downloads/chunks
-            /mnt/downloads/final_parts
+            /mnt/downloads/checkpoints
             /mnt/downloads/exports
