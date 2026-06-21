@@ -14,14 +14,13 @@ ARQUITETURA:
 
 PERSISTÊNCIA: Tudo no Hugging Face → recuperação completa após timeout
 
-OTIMIZAÇÕES DE MEMÓRIA:
-  - process_tar_with_mmap(): Streaming com ParquetWriter (memória constante)
-  - phase4_load_to_duckdb(): INSERT FROM read_parquet() nativo (sem DataFrame)
-  - ALTERAÇÃO 1: CHUNK_SIZE = 256 MB (de 1 GB)
-  - ALTERAÇÃO 2: MAX_WORKERS = min(6, cpu_count)
-  - ALTERAÇÃO 3: MAX_INFLIGHT = min(8, cpu_count * 2)
-  - ALTERAÇÃO 4: Logs de memória detalhados (GB usado/livre)
-  - ALTERAÇÃO 5: gc.collect() periódico após processamento
+OTIMIZAÇÕES DE MEMÓRIA (VERSÃO OTIMIZADA):
+  - ALTERAÇÃO 1: PRAGMA memory_limit='8GB' (de 12GB)
+  - ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB) ✓
+  - ALTERAÇÃO 3: MAX_WORKERS = min(6, cpu_count)
+  - ALTERAÇÃO 4: MAX_INFLIGHT = 8 (conservador)
+  - ALTERAÇÃO 5: gc.collect() após cada escrita (ParquetWriter)
+  - ALTERAÇÃO 6: Logs detalhados de RAM (% | usada GB | livre GB)
 """
 
 from __future__ import annotations
@@ -76,7 +75,7 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "500000"))
 ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "30000000"))
 
-# ALTERAÇÃO 1: REDUZIR CHUNK_SIZE DE 1GB PARA 256MB
+# ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB) - JÁ IMPLEMENTADO
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))
 
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
@@ -221,7 +220,8 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(str(db_path))
     
     conn.execute("PRAGMA threads=8;")
-    conn.execute("PRAGMA memory_limit='12GB';")
+    # ALTERAÇÃO 1: REDUZIR MEMORY_LIMIT DE 12GB PARA 8GB
+    conn.execute("PRAGMA memory_limit='8GB';")
     
     conn.execute("""
         CREATE TABLE IF NOT EXISTS emails_raw (
@@ -482,7 +482,7 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
             # Guess name from email
             local_part = email.split("@")[0]
             local_part = re.sub(r"\d+", "", local_part)
-            local_part = re.sub(r"[_.\-]+", " ", local_part).strip()
+            local_part = re.sub(r"[_.\\-]+", " ", local_part).strip()
             nome = " ".join([p.capitalize() for p in local_part.split()]) if local_part else ""
             
             results.append((email, nome, origin, data_iso))
@@ -503,7 +503,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
     Extract tar.gz with mmap + regex + ProcessPoolExecutor + STREAMING.
     Com otimizações de memória: CHUNK_SIZE 256MB, MAX_WORKERS 6, MAX_INFLIGHT 8.
     """
-    # ALTERAÇÃO 2: LIMITAR WORKERS A MÁXIMO 6 (conservador, mantém paralelismo)
+    # ALTERAÇÃO 3: LIMITAR WORKERS A MÁXIMO 6 (conservador, mantém paralelismo)
     cpu_count = min(6, os.cpu_count() or 4)
     chunk_files = []
     
@@ -535,15 +535,15 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 
                 with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                    # ALTERAÇÃO 3: LIMITAR MAX_INFLIGHT A 8 (evita explosão de memória)
-                    MAX_INFLIGHT = min(8, (os.cpu_count() or 4) * 2)
+                    # ALTERAÇÃO 4: LIMITAR MAX_INFLIGHT A 8 (evita explosão de memória)
+                    MAX_INFLIGHT = 8
                     inflight = set()
                     chunk_idx = 0
                     
                     def check_memory():
                         """Monitorar memória com log detalhado."""
                         mem = psutil.virtual_memory()
-                        # ALTERAÇÃO 4: LOG DETALHADO COM GB USADO/LIVRE
+                        # ALTERAÇÃO 6: LOG DETALHADO COM GB USADO/LIVRE
                         if mem.percent > 85:
                             logger.warning(
                                 f"⚠️ RAM ALTA: "
@@ -611,14 +611,20 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                         )
                         
                         writer.write_table(table)
-                        row_count += len(records)
+                        
+                        # ALTERAÇÃO 5: LIBERAR MEMÓRIA APÓS ESCRITA
+                        del table
+                        del records
+                        gc.collect()
+                        
+                        row_count += len(records) if records else 0
                         chunk_batch_count += 1
                         
                         if chunk_batch_count % 10 == 0:
                             logger.info(f"{E['email']} Member {member.name}: {row_count:,} emails processados")
 
                     while True:
-                        # ALTERAÇÃO 1: USAR CHUNK_SIZE REDUZIDO (256MB)
+                        # ALTERAÇÃO 2: USAR CHUNK_SIZE REDUZIDO (256MB)
                         chunk_data = fobj.read(CHUNK_SIZE)
                         if not chunk_data:
                             break
@@ -662,7 +668,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                     logger.info(f"{E['ok']} Chunk finalizado: {current_chunk_file.name} ({row_count:,} registros)")
                 
                 # ALTERAÇÃO 5: LIBERAR MEMÓRIA APÓS PROCESSAR CADA MEMBER
-                del writer, records
+                del writer, schema
                 gc.collect()
         
         # Clean tar
@@ -1062,18 +1068,20 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, checkpoint_repo: 
 
 def main():
     """Main orchestration."""
-    logger.info(f"{E['start']} Minerador Production v1")
+    logger.info(f"{E['start']} Minerador Production v1 (OTIMIZADO)")
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['info']} CPU cores: {os.cpu_count()}")
     logger.info(f"{E['stats']} Disk usage: {disk_usage(SAVE_PATH)}")
     
-    # ALTERAÇÃO 4: INFORMAR CONFIGURAÇÕES DE OTIMIZAÇÃO NO STARTUP
-    logger.info(f"{E['cpu']} Otimizações aplicadas:")
-    logger.info(f"  - CHUNK_SIZE: 256 MB (de 1 GB)")
-    logger.info(f"  - MAX_WORKERS: min(6, {os.cpu_count() or 4})")
-    logger.info(f"  - MAX_INFLIGHT: min(8, {(os.cpu_count() or 4) * 2})")
-    logger.info(f"  - Logs de memória: RAM% | usada(GB) | livre(GB)")
-    logger.info(f"  - gc.collect() periódico: SIM")
+    # ALTERAÇÕES APLICADAS: Mostrar configurações de otimização no startup
+    logger.info(f"{E['cpu']} ═══ OTIMIZAÇÕES DE MEMÓRIA APLICADAS ═══")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 1: PRAGMA memory_limit = 8GB (de 12GB)")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB)")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 3: MAX_WORKERS = min(6, {os.cpu_count() or 4})")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 4: MAX_INFLIGHT = 8")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 5: gc.collect() após ParquetWriter")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 6: RAM% | usada(GB) | livre(GB)")
+    logger.info(f"{E['cpu']} ════════════════════════════════════════")
     
     # Verify HF token
     if not HF_TOKEN:
