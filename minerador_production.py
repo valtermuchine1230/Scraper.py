@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-minerador_production.py — Escalável a bilhões de emails com tolerância a falhas.
+minerador_production.py \u2014 Escal\u00e1vel a bilh\u00f5es de emails com toler\u00e2ncia a falhas.
 
 ARQUITETURA:
-  FASE 1: Download 5 torrents simultâneos
+  FASE 1: Download 5 torrents simult\u00e2neos
   FASE 2: Checkpoint torrents no HF
   FASE 3: Processar com mmap + regex + ProcessPoolExecutor + STREAMING
   FASE 4: Gerar raw_chunk_*.parquet (streaming incremental)
-  FASE 5: Filtrar domínios descartáveis
-  FASE 6: DuckDB com SELECT DISTINCT (deduplicação global)
+  FASE 5: Filtrar dom\u00ednios descart\u00e1veis
+  FASE 6: DuckDB com SELECT DISTINCT (deduplica\u00e7\u00e3o global)
   FASE 7: Gerar Trader_Emails_*.parquet (30M linhas/arquivo)
-  FASE 8: Upload HF + atualizar checkpoint para próxima run
+  FASE 8: Upload HF + atualizar checkpoint para pr\u00f3xima run
 
-PERSISTÊNCIA: Tudo no Hugging Face → recuperação completa após timeout
+PERSIST\u00caNCIA: Tudo no Hugging Face \u2192 recupera\u00e7\u00e3o completa ap\u00f3s timeout
 
-OTIMIZAÇÕES DE MEMÓRIA:
-  - process_tar_with_mmap(): Streaming com ParquetWriter (memória constante)
+OTIMIZA\u00c7\u00d5ES DE MEM\u00d3RIA:
+  - process_tar_with_mmap(): Streaming com ParquetWriter (mem\u00f3ria constante)
   - phase4_load_to_duckdb(): INSERT FROM read_parquet() nativo (sem DataFrame)
+  - ALTERA\u00c7\u00c3O 1: CHUNK_SIZE = 256 MB (de 1 GB)
+  - ALTERA\u00c7\u00c3O 2: MAX_WORKERS = min(6, cpu_count)
+  - ALTERA\u00c7\u00c3O 3: MAX_INFLIGHT = min(8, cpu_count * 2)
+  - ALTERA\u00c7\u00c3O 4: Logs de mem\u00f3ria detalhados (GB usado/livre)
+  - ALTERA\u00c7\u00c3O 5: gc.collect() peri\u00f3dico ap\u00f3s processamento
 """
 
 from __future__ import annotations
@@ -70,7 +75,10 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "500000"))
 ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "30000000"))
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(1 * 1024 * 1024 * 1024)))
+
+# ALTERA\u00c7\u00c3O 1: REDUZIR CHUNK_SIZE DE 1GB PARA 256MB
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))
+
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 ROWS_PER_PARQUET_FILE = int(os.environ.get("ROWS_PER_PARQUET_FILE", "5000000"))
 
@@ -135,10 +143,10 @@ file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
 E = {
-    "start": "🚀", "download": "📥", "extract": "📦", "stats": "📊",
-    "space": "📉", "email": "📧", "upload": "📤",
-    "clean": "🧹", "warn": "⚠️", "error": "❌", "ok": "✅",
-    "info": "🗿", "cpu": "⚙️", "db": "🗄️",
+    "start": "\ud83d\ude80", "download": "\ud83d\udce5", "extract": "\ud83d\udce6", "stats": "\ud83d\udcca",
+    "space": "\ud83d\udcc9", "email": "\ud83d\udce7", "upload": "\ud83d\udce4",
+    "clean": "\ud83e\uddf9", "warn": "\u26a0\ufe0f", "error": "\u274c", "ok": "\u2705",
+    "info": "\ud83d\uddff", "cpu": "\u2699\ufe0f", "db": "\ud83d\uddc4\ufe0f",
 }
 
 EMAIL_REGEX = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
@@ -158,15 +166,15 @@ signal.signal(signal.SIGTERM, handle_signal)
 def normalize_string_robust(s: str) -> str:
     """
     Normaliza strings para resolver quebras de linha inesperadas,
-    espaços duplicados ou invisíveis e diferenças de path.
+    espa\u00e7os duplicados ou invis\u00edveis e diferen\u00e7as de path.
     """
     if not isinstance(s, str):
         s = str(s)
-    # Substituir qualquer whitespace (incluindo \n, \r, \t) por espaço único
+    # Substituir qualquer whitespace (incluindo \n, \r, \t) por espa\u00e7o \u00fanico
     s = re.sub(r'\s+', ' ', s)
-    # Normalizar barras de diretório para o padrão UNIX
+    # Normalizar barras de diret\u00f3rio para o padr\u00e3o UNIX
     s = s.replace('\\', '/')
-    # Remover espaços nas extremidades e converter para minúsculas
+    # Remover espa\u00e7os nas extremidades e converter para min\u00fasculas
     return s.strip().lower()
 
 def human(n: int) -> str:
@@ -283,14 +291,14 @@ def create_libtorrent_session() -> lt.session:
 
 def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tuple[List[int], List[str]]:
     """
-    Find target file indices in torrent using um sistema de matching em 3 níveis.
-    Normaliza paths para garantir tolerância a falhas na formatação visual.
-    Nunca falha silenciosamente e expõe o catálogo de metadata completo em caso de falha.
+    Find target file indices in torrent using um sistema de matching em 3 n\u00edveis.
+    Normaliza paths para garantir toler\u00e2ncia a falhas na formata\u00e7\u00e3o visual.
+    Nunca falha silenciosamente e exp\u00f5e o cat\u00e1logo de metadata completo em caso de falha.
     """
     n = torrent_info.num_files()
     files_storage = torrent_info.files()
     
-    # 1. Catálogo de ficheiros e pré-computação das versões normalizadas
+    # 1. Cat\u00e1logo de ficheiros e pr\u00e9-computa\u00e7\u00e3o das vers\u00f5es normalizadas
     file_catalog = {}
     for i in range(n):
         raw_path = files_storage.at(i).path
@@ -312,43 +320,43 @@ def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tu
         
         matched = False
         
-        # NÍVEL 1: Match Exato Normalizado
+        # N\u00cdVEL 1: Match Exato Normalizado
         for i, fdata in file_catalog.items():
             if fdata['norm'] == target_norm:
                 found_indices.add(i)
                 matched = True
-                logger.info(f"{E['ok']} Nível 1 (Match Exato): '{t}' -> '{fdata['raw']}'")
+                logger.info(f"{E['ok']} N\u00edvel 1 (Match Exato): '{t}' -> '{fdata['raw']}'")
                 break
                 
         if matched: continue
             
-        # NÍVEL 2: Match por Nome Final do Ficheiro (Basename)
+        # N\u00cdVEL 2: Match por Nome Final do Ficheiro (Basename)
         for i, fdata in file_catalog.items():
             if fdata['basename'] == target_basename:
                 found_indices.add(i)
                 matched = True
-                logger.info(f"{E['ok']} Nível 2 (Basename): '{t}' -> '{fdata['raw']}'")
+                logger.info(f"{E['ok']} N\u00edvel 2 (Basename): '{t}' -> '{fdata['raw']}'")
                 break
                 
         if matched: continue
             
-        # NÍVEL 3: Match Parcial (Substring Robusta)
+        # N\u00cdVEL 3: Match Parcial (Substring Robusta)
         for i, fdata in file_catalog.items():
-            # Verifica se o basename do target está contido no path real normalizado
-            # Ou se o basename real está contido no path do target normalizado
+            # Verifica se o basename do target est\u00e1 contido no path real normalizado
+            # Ou se o basename real est\u00e1 contido no path do target normalizado
             if target_basename in fdata['norm'] or fdata['basename'] in target_norm:
                 found_indices.add(i)
                 matched = True
-                logger.info(f"{E['warn']} Nível 3 (Match Parcial): '{t}' -> '{fdata['raw']}'")
+                logger.info(f"{E['warn']} N\u00edvel 3 (Match Parcial): '{t}' -> '{fdata['raw']}'")
                 break
                 
         if not matched:
             missing_targets.append(t)
-            logger.error(f"{E['error']} Impossível encontrar correspondência para o target: '{t}'")
+            logger.error(f"{E['error']} Imposs\u00edvel encontrar correspond\u00eancia para o target: '{t}'")
             
     # Fallback rigoroso com logging se houver targets desaparecidos
     if missing_targets:
-        logger.warning(f"{E['warn']} LISTA COMPLETA DE FICHEIROS DISPONÍVEIS NO TORRENT DE METADATA ({torrent_info.name()}):")
+        logger.warning(f"{E['warn']} LISTA COMPLETA DE FICHEIROS DISPON\u00cdVEIS NO TORRENT DE METADATA ({torrent_info.name()}):")
         for i, fdata in file_catalog.items():
             logger.warning(f"  -> Index [{i}]: Raw='{fdata['raw']}' | Normalizado='{fdata['norm']}' | Size={human(fdata['size'])}")
             
@@ -356,54 +364,54 @@ def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tu
 
 def local_path_for_index_robust(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path | None:
     """
-    Localiza robustamente o arquivo baixado no disco, tolerando múltiplas estruturas de libtorrent.
+    Localiza robustamente o arquivo baixado no disco, tolerando m\u00faltiplas estruturas de libtorrent.
     """
     torrent_name = torrent_info.name()
     file_path = torrent_info.files().at(index).path
     basename = Path(file_path).name
     
-    # NÍVEL 1: Construção padrão (salvepath / torrent_name / file_path)
+    # N\u00cdVEL 1: Constru\u00e7\u00e3o padr\u00e3o (salvepath / torrent_name / file_path)
     candidate1 = save_path / torrent_name / file_path
     if candidate1.exists() and candidate1.is_file():
-        logger.info(f"{E['ok']} [NÍVEL 1] Arquivo localizado: {candidate1}")
+        logger.info(f"{E['ok']} [N\u00cdVEL 1] Arquivo localizado: {candidate1}")
         return candidate1
     
-    # NÍVEL 2: Sem duplicação (salvepath / file_path)
+    # N\u00cdVEL 2: Sem duplica\u00e7\u00e3o (salvepath / file_path)
     candidate2 = save_path / file_path
     if candidate2.exists() and candidate2.is_file():
-        logger.info(f"{E['ok']} [NÍVEL 2] Arquivo localizado (sem duplicação): {candidate2}")
+        logger.info(f"{E['ok']} [N\u00cdVEL 2] Arquivo localizado (sem duplica\u00e7\u00e3o): {candidate2}")
         return candidate2
     
-    # NÍVEL 3: Busca recursiva por basename no diretório do torrent
+    # N\u00cdVEL 3: Busca recursiva por basename no diret\u00f3rio do torrent
     torrent_dir = save_path / torrent_name
     if torrent_dir.exists() and torrent_dir.is_dir():
         for found_file in torrent_dir.rglob(basename):
             if found_file.is_file():
-                logger.info(f"{E['ok']} [NÍVEL 3] Arquivo localizado (busca recursiva): {found_file}")
+                logger.info(f"{E['ok']} [N\u00cdVEL 3] Arquivo localizado (busca recursiva): {found_file}")
                 return found_file
     
-    # NÍVEL 4: Busca recursiva a partir do save_path (fallback máximo)
+    # N\u00cdVEL 4: Busca recursiva a partir do save_path (fallback m\u00e1ximo)
     for found_file in save_path.rglob(basename):
         if found_file.is_file():
-            logger.info(f"{E['ok']} [NÍVEL 4] Arquivo localizado (busca global): {found_file}")
+            logger.info(f"{E['ok']} [N\u00cdVEL 4] Arquivo localizado (busca global): {found_file}")
             return found_file
     
-    # FALHA: Registar diagnóstico completo
-    logger.error(f"{E['error']} ========== DIAGNÓSTICO COMPLETO DE ARQUIVO PERDIDO ==========")
+    # FALHA: Registar diagn\u00f3stico completo
+    logger.error(f"{E['error']} ========== DIAGN\u00d3STICO COMPLETO DE ARQUIVO PERDIDO ==========")
     logger.error(f"{E['error']} Torrent: {torrent_name}")
     logger.error(f"{E['error']} File Index: {index}")
     logger.error(f"{E['error']} File Path (raw): {file_path}")
     logger.error(f"{E['error']} File Basename: {basename}")
     logger.error(f"{E['error']} Save Path: {save_path}")
     logger.error(f"{E['error']} ")
-    logger.error(f"{E['error']} Caminhos testados (NÃO encontrados):")
+    logger.error(f"{E['error']} Caminhos testados (N\u00c3O encontrados):")
     logger.error(f"{E['error']}   [1] {candidate1}")
     logger.error(f"{E['error']}   [2] {candidate2}")
     if torrent_dir.exists():
         logger.error(f"{E['error']}   [3] Busca recursiva em {torrent_dir}/")
     logger.error(f"{E['error']}   [4] Busca global em {save_path}/")
     logger.error(f"{E['error']} ")
-    logger.error(f"{E['error']} Conteúdo do diretório Torrent ({torrent_dir}):")
+    logger.error(f"{E['error']} Conte\u00fado do diret\u00f3rio Torrent ({torrent_dir}):")
     if torrent_dir.exists() and torrent_dir.is_dir():
         try:
             for item in list(torrent_dir.rglob("*"))[:50]:  # Limitar output
@@ -416,11 +424,11 @@ def local_path_for_index_robust(save_path: Path, torrent_info: lt.torrent_info, 
         except Exception as e:
             logger.error(f"{E['error']}     [Erro ao listar: {str(e)}]")
     else:
-        logger.error(f"{E['error']}     [Diretório NÃO existe]")
+        logger.error(f"{E['error']}     [Diret\u00f3rio N\u00c3O existe]")
     logger.error(f"{E['error']} ")
-    logger.error(f"{E['error']} Conteúdo raiz de Save Path ({save_path}):")
+    logger.error(f"{E['error']} Conte\u00fado raiz de Save Path ({save_path}):")
     try:
-        for item in list(save_path.iterdir())[:20]:  # Apenas nível 1
+        for item in list(save_path.iterdir())[:20]:  # Apenas n\u00edvel 1
             if item.is_file():
                 size = item.stat().st_size
                 logger.error(f"{E['error']}     FILE: {item.name} ({human(size)})")
@@ -480,7 +488,7 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
             results.append((email, nome, origin, data_iso))
         except Exception as e:
             logger.exception(
-                "❌ WORKER FAILURE DETALHADO\n"
+                "\u274c WORKER FAILURE DETALHADO\n"
                 f"chunk_idx={chunk_idx}\n"
                 f"member={origin}\n"
                 f"error_type={type(e).__name__}\n"
@@ -493,8 +501,10 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
 def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
     """
     Extract tar.gz with mmap + regex + ProcessPoolExecutor + STREAMING.
+    Com otimiza\u00e7\u00f5es de mem\u00f3ria: CHUNK_SIZE 256MB, MAX_WORKERS 6, MAX_INFLIGHT 8.
     """
-    cpu_count = os.cpu_count() or 4
+    # ALTERA\u00c7\u00c3O 2: LIMITAR WORKERS A M\u00c1XIMO 6 (conservador, mant\u00e9m paralelismo)
+    cpu_count = min(6, os.cpu_count() or 4)
     chunk_files = []
     
     logger.info(f"{E['extract']} Processando: {tar_path.name}")
@@ -513,7 +523,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 if fobj is None:
                     continue
                 
-                # ALTERAÇÃO 4 — PROTEÇÃO DE MEMÓRIA GLOBAL
+                # ALTERA\u00c7\u00c3O 5: LIBERAR MEM\u00d3RIA PERIODICAMENTE
                 gc.collect()
                 
                 # STREAMING: Inicializa writer quando temos dados
@@ -525,15 +535,22 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 
                 with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                    # ALTERAÇÃO 1 — LIMITAR FUTURES (CRÍTICO) / BACKPRESSURE REAL
-                    MAX_INFLIGHT = os.cpu_count() * 2
+                    # ALTERA\u00c7\u00c3O 3: LIMITAR MAX_INFLIGHT A 8 (evita explos\u00e3o de mem\u00f3ria)
+                    MAX_INFLIGHT = min(8, (os.cpu_count() or 4) * 2)
                     inflight = set()
                     chunk_idx = 0
                     
                     def check_memory():
+                        """Monitorar mem\u00f3ria com log detalhado."""
                         mem = psutil.virtual_memory()
+                        # ALTERA\u00c7\u00c3O 4: LOG DETALHADO COM GB USADO/LIVRE
                         if mem.percent > 85:
-                            logger.warning(f"⚠️ RAM ALTA: {mem.percent}%")
+                            logger.warning(
+                                f"\u26a0\ufe0f RAM ALTA: "
+                                f"{mem.percent}% | "
+                                f"usada={mem.used/1024**3:.2f}GB | "
+                                f"livre={mem.available/1024**3:.2f}GB"
+                            )
                             time.sleep(1)
                             
                     def drain_futures(inflight):
@@ -548,7 +565,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                                 return process_records
                             except Exception as e:
                                 logger.exception(
-                                    "❌ WORKER FAILURE DETALHADO\n"
+                                    "\u274c WORKER FAILURE DETALHADO\n"
                                     f"chunk_idx={chunk_idx}\n"
                                     f"member={member.name}\n"
                                     f"error_type={type(e).__name__}\n"
@@ -557,592 +574,4 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                                 return None
                         return None
 
-                    def yield_or_write(records):
-                        nonlocal writer, schema, current_chunk_file, row_count, chunk_batch_count
-                        
-                        # ALTERAÇÃO 3 — SEGURANÇA PYARROW (EVITAR CRASH SILENCIOSO)
-                        safe_records = []
-                        for r in records:
-                            if isinstance(r, tuple) and len(r) == 4:
-                                safe_records.append(r)
-                            else:
-                                logger.warning(f"⚠️ Registro inválido ignorado: {r}")
-                        records = safe_records
-                        
-                        if not records:
-                            return
-
-                        # Inicializa schema e writer na primeira batch
-                        if writer is None:
-                          current_chunk_file = RAW_CHUNKS_DIR / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
-                          schema = pa.schema([
-                              pa.field("email", pa.string()),
-                              pa.field("nome", pa.string()),
-                              pa.field("origem", pa.string()),
-                              pa.field("data", pa.string()),
-                          ])
-                          writer = pq.ParquetWriter(str(current_chunk_file), schema, compression="snappy")
-                      
-                        table = pa.Table.from_arrays(
-                            [
-                                [r[0] for r in records],  # emails
-                                [r[1] for r in records],  # nomes
-                                [r[2] for r in records],  # origens
-                                [r[3] for r in records],  # datas
-                            ],
-                            names=["email", "nome", "origem", "data"]
-                        )
-                        
-                        writer.write_table(table)
-                        row_count += len(records)
-                        chunk_batch_count += 1
-                        
-                        if chunk_batch_count % 10 == 0:
-                            logger.info(f"{E['email']} Member {member.name}: {row_count:,} emails processados")
-
-                    while True:
-                        chunk_data = fobj.read(CHUNK_SIZE)
-                        if not chunk_data:
-                            break
-                        
-                        if stop_event.is_set():
-                            break
-                        
-                        check_memory()
-                        # BACKPRESSURE: bloqueia envio se tiver muitos jobs ativos
-                        while len(inflight) >= MAX_INFLIGHT:
-                            records = drain_futures(inflight)
-                            if records:
-                                yield_or_write(records)
-                                
-                        future = executor.submit(
-                            process_chunk_worker, chunk_data, chunk_idx, member.name
-                        )
-                        inflight.add(future)
-                        chunk_idx += 1
-                    
-                    # Final flush
-                    for f in inflight:
-                        try:
-                            records = f.result()
-                            if records:
-                                yield_or_write(records)
-                        except Exception as e:
-                            logger.exception(
-                                "❌ WORKER FAILURE DETALHADO\n"
-                                f"chunk_idx={chunk_idx}\n"
-                                f"member={member.name}\n"
-                                f"error_type={type(e).__name__}\n"
-                                f"error_msg={str(e)}"
-                            )
-                
-                # Fecha writer e finaliza chunk
-                if writer is not None:
-                    writer.close()
-                    chunk_files.append(current_chunk_file)
-                    logger.info(f"{E['ok']} Chunk finalizado: {current_chunk_file.name} ({row_count:,} registros)")
-        
-        # Clean tar
-        try:
-            tar_path.unlink()
-        except Exception:
-            pass
-    
-    except Exception as e:
-        logger.exception(
-            "❌ WORKER FAILURE DETALHADO\n"
-            f"chunk_idx=N/A\n"
-            f"member={tar_path.name}\n"
-            f"error_type={type(e).__name__}\n"
-            f"error_msg={str(e)}"
-        )
-    
-    return chunk_files
-
-# ===== HUGGING FACE =====
-def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
-    """Setup/verify datasets on Hugging Face."""
-    if not token:
-        raise RuntimeError("HF_TOKEN not set")
-    
-    api = HfApi()
-    who = api.whoami(token=token)
-    user = who.get("name") or who.get("user")
-    
-    if not user:
-        raise RuntimeError("Could not determine HF username")
-    
-    emails_repo = f"{user}/{HF_REPO_EMAILS}"
-    checkpoint_repo = f"{user}/{HF_REPO_CHECKPOINT}"
-    
-    for repo_id in [emails_repo, checkpoint_repo]:
-        try:
-            api.create_repo(repo_id=repo_id, token=token, repo_type="dataset", private=True)
-            logger.info(f"{E['ok']} Dataset created: {repo_id}")
-        except Exception as e:
-            if "already exists" in str(e).lower():
-                logger.info(f"{E['ok']} Dataset exists: {repo_id}")
-            else:
-                logger.warning(f"{E['warn']} Create repo: {str(e)[:100]}")
-    
-    return api, emails_repo, checkpoint_repo
-
-def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_path: str) -> bool:
-    """Upload file to HF with retry."""
-    if not local_path.exists():
-        logger.warning(f"{E['warn']} File not found for upload: {local_path}")
-        return False
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=repo_path,
-                repo_id=repo_id,
-                repo_type="dataset",
-                token=token,
-            )
-            logger.info(f"{E['upload']} Upload OK: {repo_path}")
-            return True
-        except Exception as e:
-            logger.warning(f"{E['warn']} Upload attempt {attempt + 1}/{max_retries} failed")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-    
-    logger.error(f"{E['error']} Upload failed after {max_retries} attempts")
-    return False
-
-def hf_download_checkpoint(api: HfApi, token: str, checkpoint_repo: str, local_path: Path) -> bool:
-    """Download checkpoint from HF if exists."""
-    try:
-        api.hf_hub_download(
-            repo_id=checkpoint_repo,
-            filename="state.json",
-            local_dir=str(local_path.parent),
-            token=token,
-            repo_type="dataset",
-        )
-        logger.info(f"{E['download']} Checkpoint downloaded")
-        return True
-    except Exception:
-        logger.info(f"{E['info']} No checkpoint found, starting fresh")
-        return False
-
-def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path: Path) -> bool:
-    """Download DuckDB database from HF."""
-    try:
-        api.hf_hub_download(
-            repo_id=checkpoint_repo,
-            filename="emails.duckdb",
-            local_dir=str(local_path.parent),
-            token=token,
-            repo_type="dataset",
-        )
-        logger.info(f"{E['download']} DuckDB downloaded")
-        return True
-    except Exception:
-        logger.info(f"{E['info']} No DuckDB backup found")
-        return False
-
-# ===== MAIN PHASES =====
-def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
-    """PHASE 1: Download 5 torrents simultaneously."""
-    logger.info(f"{E['download']} PHASE 1: Downloading {len(magnets)} torrents simultaneously")
-    
-    completed = {}
-    
-    def download_single(item):
-        name = item["name"]
-        magnet = item["magnet"]
-        targets = item.get("targets", [])
-        
-        try:
-            logger.info(f"{E['download']} Starting: {name}")
-            params = lt.parse_magnet_uri(magnet)
-            params.save_path = str(SAVE_PATH)
-            handle = session.add_torrent(params)
-            
-            # Wait for metadata
-            while not handle.has_metadata() and not stop_event.is_set():
-                time.sleep(POLL_INTERVAL)
-            
-            if stop_event.is_set():
-                raise KeyboardInterrupt()
-            
-            info = handle.get_torrent_info()
-            found, missing = find_target_indices(info, targets)
-            
-            if missing:
-                logger.error(f"{E['error']} Missing targets in {name} após busca inteligente.")
-                raise RuntimeError(f"Targets not found in metadata")
-            
-            # Set priorities
-            nfiles = info.num_files()
-            for i in range(nfiles):
-                handle.file_priority(i, 7 if i in found else 0)
-            
-            logger.info(f"{E['ok']} {name} ready, targets mapeados com sucesso: {found}")
-            return (name, (handle, info, found))
-        except Exception as e:
-            logger.exception(f"{E['error']} Torrent {name} failed")
-            return None
-    
-    with ThreadPoolExecutor(max_workers=len(magnets)) as executor:
-        futures = [executor.submit(download_single, item) for item in magnets]
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    name, data = result
-                    completed[name] = data
-            except Exception:
-                pass
-    
-    logger.info(f"{E['ok']} PHASE 1 complete: {len(completed)}/{len(magnets)} torrents ready")
-    return completed
-
-def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
-    """PHASE 2: Wait for all target files to complete."""
-    logger.info(f"{E['download']} PHASE 2: Waiting for all files to complete")
-    
-    all_files = []
-    processed_key = state.get("downloaded_files", {})
-    
-    for tname, (handle, info, indices) in completed_torrents.items():
-        if stop_event.is_set():
-            break
-        
-        for idx in indices:
-            if stop_event.is_set():
-                break
-            
-            file_key = f"{tname}_{idx}"
-            if file_key in processed_key:
-                logger.info(f"{E['ok']} Skipping (already processed): {file_key}")
-                continue
-            
-            expected_size = info.files().at(idx).size
-            logger.info(f"{E['download']} Waiting for file: {tname} index {idx} ({human(expected_size)})")
-            
-            try:
-                wait_for_file_complete(handle, idx, expected_size)
-                local_path = local_path_for_index_robust(SAVE_PATH, info, idx)
-                
-                if local_path is None:
-                    logger.error(f"{E['error']} File not found on disk after exhaustive search (index {idx})")
-                    continue
-                
-                all_files.append((tname, local_path, info))
-                
-                processed_key[file_key] = True
-                state["downloaded_files"] = processed_key
-                state["downloaded_files"] = processed_key
-                save_state(state)
-            except Exception as e:
-                logger.exception(
-                    "❌ WORKER FAILURE DETALHADO\n"
-                    f"chunk_idx=N/A\n"
-                    f"member={tname}\n"
-                    f"error_type={type(e).__name__}\n"
-                    f"error_msg={str(e)}"
-                )
-    
-    logger.info(f"{E['ok']} PHASE 2 complete: {len(all_files)} files ready")
-    return all_files
-
-def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
-    """PHASE 3: Process tars with mmap + regex + ProcessPoolExecutor + STREAMING."""
-    logger.info(f"{E['extract']} PHASE 3: Processing {len(tars)} tar files")
-    
-    all_chunks = []
-    processed_tars = state.get("processed_tars", [])
-    
-    for tname, tar_path, info in tars:
-        if stop_event.is_set():
-            break
-        
-        if str(tar_path) in processed_tars:
-            logger.info(f"{E['ok']} Skipping (already processed): {tar_path.name}")
-            continue
-        
-        chunks = process_tar_with_mmap(tar_path, tname)
-        all_chunks.extend(chunks)
-        
-        processed_tars.append(str(tar_path))
-        state["processed_tars"] = processed_tars
-        save_state(state)
-    
-    logger.info(f"{E['ok']} PHASE 3 complete: {len(all_chunks)} raw chunks generated")
-    return all_chunks
-
-def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, state: Dict) -> int:
-    """
-    PHASE 4: Load chunks into DuckDB using native INSERT FROM read_parquet().
-    """
-    logger.info(f"{E['db']} PHASE 4: Loading {len(chunks)} chunks into DuckDB (native read_parquet)")
-    
-    total_inserted = 0
-    loaded_chunks = state.get("loaded_chunks", [])
-    
-    for chunk_file in chunks:
-        if stop_event.is_set():
-            break
-        
-        if str(chunk_file) in loaded_chunks:
-            logger.info(f"{E['ok']} Chunk already loaded: {chunk_file.name}")
-            continue
-        
-        try:
-            # NATIVE DuckDB: INSERT FROM read_parquet()
-            result = conn.execute(f"""
-                INSERT INTO emails_raw 
-                SELECT * FROM read_parquet('{chunk_file}')
-                ON CONFLICT(email) DO NOTHING;
-            """)
-            conn.commit()
-            
-            inserted = result.rowcount if hasattr(result, 'rowcount') else 0
-            total_inserted += inserted
-            
-            loaded_chunks.append(str(chunk_file))
-            state["loaded_chunks"] = loaded_chunks
-            save_state(state)
-            
-            logger.info(f"{E['db']} Loaded: {chunk_file.name} (+{inserted:,} records)")
-        except Exception as e:
-            # Fallback: Se read_parquet nativo falhar, usa pandas
-            logger.warning(f"{E['warn']} Native read_parquet failed, falling back to pandas")
-            try:
-                df = pd.read_parquet(chunk_file)
-                records = [tuple(row) for row in df.itertuples(index=False, name=None)]
-                inserted = batch_insert_duckdb(conn, records)
-                total_inserted += inserted
-                
-                loaded_chunks.append(str(chunk_file))
-                state["loaded_chunks"] = loaded_chunks
-                save_state(state)
-                
-                logger.info(f"{E['db']} Loaded (fallback): {chunk_file.name} (+{inserted:,} records)")
-            except Exception as ex:
-                logger.exception(
-                    "❌ WORKER FAILURE DETALHADO\n"
-                    f"chunk_idx=N/A\n"
-                    f"member={chunk_file.name}\n"
-                    f"error_type={type(ex).__name__}\n"
-                    f"error_msg={str(ex)}"
-                )
-    
-    logger.info(f"{E['ok']} PHASE 4 complete: {total_inserted:,} total records inserted")
-    return total_inserted
-
-def phase5_deduplicate_duckdb(conn: duckdb.DuckDBPyConnection) -> int:
-    """PHASE 5: Global deduplication using DuckDB SELECT DISTINCT."""
-    logger.info(f"{E['db']} PHASE 5: Global deduplication (SELECT DISTINCT)")
-    
-    try:
-        count_before = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
-        logger.info(f"{E['stats']} Records before dedup: {count_before:,}")
-        
-        # Use SELECT DISTINCT for deduplication
-        conn.execute("CREATE TABLE IF NOT EXISTS emails_dedup AS SELECT DISTINCT * FROM emails_raw;")
-        conn.execute("DROP TABLE IF EXISTS emails_raw;")
-        conn.execute("ALTER TABLE emails_dedup RENAME TO emails_raw;")
-        conn.commit()
-        
-        count_after = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
-        duplicates = count_before - count_after
-        
-        logger.info(f"{E['stats']} Records after dedup: {count_after:,}")
-        logger.info(f"{E['email']} Duplicates removed: {duplicates:,}")
-        
-        return count_after
-    except Exception as e:
-        logger.exception(
-            "❌ WORKER FAILURE DETALHADO\n"
-            "chunk_idx=N/A\n"
-            "member=DuckDB_Deduplication\n"
-            f"error_type={type(e).__name__}\n"
-            f"error_msg={str(e)}"
-        )
-        return 0
-
-def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
-    """PHASE 6: Generate final Trader_Emails_*.parquet files (30M rows each)."""
-    logger.info(f"{E['email']} PHASE 6: Generating final datasets (30M rows per file)")
-    
-    final_files = []
-    file_num = 1
-    offset = 0
-    
-    while not stop_event.is_set():
-        try:
-            rows_df = conn.execute(
-                f"SELECT * FROM emails_raw LIMIT {ROWS_PER_FINAL_FILE} OFFSET {offset};"
-            ).fetchdf()
-            
-            if rows_df.shape[0] == 0:
-                break
-            
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            final_file = EXPORT_DIR / f"Trader_Emails_{file_num:03d}_{ts}.parquet"
-            
-            table = pa.Table.from_pandas(rows_df)
-            pq.write_table(table, str(final_file), compression="snappy")
-            
-            final_files.append(final_file)
-            logger.info(f"{E['ok']} Generated: {final_file.name} ({rows_df.shape[0]:,} rows)")
-            
-            file_num += 1
-            offset += ROWS_PER_FINAL_FILE
-        except Exception as e:
-            logger.exception(
-                "❌ WORKER FAILURE DETALHADO\n"
-                f"chunk_idx=N/A\n"
-                f"member=Export_File_{file_num}\n"
-                f"error_type={type(e).__name__}\n"
-                f"error_msg={str(e)}"
-            )
-            break
-    
-    logger.info(f"{E['ok']} PHASE 6 complete: {len(final_files)} final datasets generated")
-    return final_files
-
-def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str, final_files: List[Path], db_path: Path, state: Dict):
-    """PHASE 7: Upload to HF and update checkpoint."""
-    logger.info(f"{E['upload']} PHASE 7: Uploading to Hugging Face")
-    
-    # Upload final datasets
-    for final_file in final_files:
-        if stop_event.is_set():
-            break
-        
-        repo_path = f"Trader_Emails/{final_file.name}"
-        if hf_upload_file(api, token, emails_repo, final_file, repo_path):
-            try:
-                final_file.unlink()
-            except Exception:
-                pass
-    
-    # Upload checkpoint files
-    logger.info(f"{E['upload']} Uploading checkpoint to Hugging Face")
-    hf_upload_file(api, token, checkpoint_repo, STATE_PATH, "state.json")
-    
-    if db_path.exists():
-        hf_upload_file(api, token, checkpoint_repo, db_path, "emails.duckdb")
-    
-    # Update state
-    state["last_execution"] = datetime.now(timezone.utc).isoformat()
-    state["final_files_uploaded"] = len(final_files)
-    save_state(state)
-    
-    logger.info(f"{E['ok']} PHASE 7 complete: Checkpoint saved to HF")
-
-def main():
-    """Main orchestration."""
-    logger.info(f"{E['start']} Minerador Production v1")
-    logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
-    logger.info(f"{E['info']} CPU cores: {os.cpu_count()}")
-    logger.info(f"{E['stats']} Disk usage: {disk_usage(SAVE_PATH)}")
-    
-    # Verify HF token
-    if not HF_TOKEN:
-        logger.error(f"{E['error']} HF_TOKEN not set in environment")
-        sys.exit(2)
-    
-    # Setup HF
-    try:
-        api, emails_repo, checkpoint_repo = hf_setup_datasets(HF_TOKEN)
-    except Exception as e:
-        logger.exception(
-            "❌ WORKER FAILURE DETALHADO\n"
-            "chunk_idx=N/A\n"
-            "member=HF_Setup\n"
-            f"error_type={type(e).__name__}\n"
-            f"error_msg={str(e)}"
-        )
-        sys.exit(1)
-    
-    # Download checkpoint from HF
-    logger.info(f"{E['download']} Downloading checkpoint from Hugging Face")
-    hf_download_checkpoint(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
-    hf_download_duckdb(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
-    
-    state = load_state()
-    logger.info(f"{E['ok']} State loaded with {len(state)} entries")
-    
-    # Initialize DuckDB and libtorrent
-    conn = init_duckdb(DB_PATH)
-    
-    try:
-        session = create_libtorrent_session()
-    except Exception as e:
-        logger.exception(
-            "❌ WORKER FAILURE DETALHADO\n"
-            "chunk_idx=N/A\n"
-            "member=Libtorrent_Init\n"
-            f"error_type={type(e).__name__}\n"
-            f"error_msg={str(e)}"
-        )
-        sys.exit(1)
-    
-    try:
-        overall_start = time.time()
-        
-        # PHASE 1
-        completed_torrents = phase1_download_torrents(session, MAGNETS)
-        
-        if not completed_torrents:
-            logger.error(f"{E['error']} No torrents completed successfully")
-            return
-        
-        if stop_event.is_set():
-            logger.warning(f"{E['warn']} Stopped during PHASE 1")
-            return
-        
-        # PHASE 2
-        tars = phase2_wait_downloads(completed_torrents, state)
-        
-        if tars and not stop_event.is_set():
-            # PHASE 3
-            chunks = phase3_process_tars(tars, state)
-            
-            if chunks and not stop_event.is_set():
-                # PHASE 4
-                phase4_load_to_duckdb(chunks, conn, state)
-                
-                if not stop_event.is_set():
-                    # PHASE 5
-                    total_emails = phase5_deduplicate_duckdb(conn)
-                    
-                    if not stop_event.is_set():
-                        # PHASE 6
-                        final_files = phase6_export_final_files(conn)
-                        
-                        if not stop_event.is_set():
-                            # PHASE 7
-                            phase7_upload_hf(api, HF_TOKEN, emails_repo, checkpoint_repo, final_files, DB_PATH, state)
-        
-        total_time = time.time() - overall_start
-        logger.info(f"{E['stats']} Total runtime: {total_time / 60:.2f} minutes")
-        logger.info(f"{E['ok']} Minerador Production completed successfully")
-    
-    except KeyboardInterrupt:
-        logger.warning(f"{E['warn']} Graceful shutdown initiated")
-    except Exception as e:
-        logger.exception(
-            "❌ WORKER FAILURE DETALHADO\n"
-            "chunk_idx=N/A\n"
-            "member=Main_Orchestration\n"
-            f"error_type={type(e).__name__}\n"
-            f"error_msg={str(e)}"
-        )
-        sys.exit(1)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    main()
+                    def yield_or_write
