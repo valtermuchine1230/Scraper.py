@@ -499,11 +499,15 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
     """
     Extract tar.gz with mmap + regex + ProcessPoolExecutor + STREAMING.
     
-    OPTIMIZAÇÕES:
+    OTIMIZAÇÕES:
     - Usa PyArrow ParquetWriter para gravação incremental
     - Memória constante (~50-100MB em buffer de arrow)
     - Não acumula dezenas de milhões de registros em RAM
     - Gera múltiplos raw_chunk_*.parquet incrementalmente
+    
+    CORREÇÕES APLICADAS (v2):
+    - from_pylist() substituído por from_arrays() para receber tuples
+    - writer.filename removido, usando variável separada current_chunk_file
     """
     cpu_count = os.cpu_count() or 4
     chunk_files = []
@@ -527,8 +531,10 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 # STREAMING: Inicializa writer quando temos dados
                 writer = None
                 schema = None
+                current_chunk_file = None
                 row_count = 0
                 chunk_batch_count = 0
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 
                 with ProcessPoolExecutor(max_workers=cpu_count) as executor:
                     futures = []
@@ -555,18 +561,28 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                             if records:
                                 # Inicializa schema e writer na primeira batch
                                 if writer is None:
+                                    # CORREÇÃO 1: Guardar caminho em variável separada
+                                    current_chunk_file = RAW_CHUNKS_DIR / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
                                     schema = pa.schema([
                                         pa.field("email", pa.string()),
                                         pa.field("nome", pa.string()),
                                         pa.field("origem", pa.string()),
                                         pa.field("data", pa.string()),
                                     ])
-                                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                                    chunk_file = RAW_CHUNKS_DIR / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
-                                    writer = pq.ParquetWriter(str(chunk_file), schema, compression="snappy")
+                                    writer = pq.ParquetWriter(str(current_chunk_file), schema, compression="snappy")
+                                
+                                # CORREÇÃO 2: Usar from_arrays() para receber tuples
+                                table = pa.Table.from_arrays(
+                                    [
+                                        [r[0] for r in records],  # emails
+                                        [r[1] for r in records],  # nomes
+                                        [r[2] for r in records],  # origens
+                                        [r[3] for r in records],  # datas
+                                    ],
+                                    names=["email", "nome", "origem", "data"]
+                                )
                                 
                                 # Grava incrementalmente
-                                table = pa.Table.from_pylist(records)
                                 writer.write_table(table)
                                 row_count += len(records)
                                 chunk_batch_count += 1
@@ -581,8 +597,9 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 # Fecha writer e finaliza chunk
                 if writer is not None:
                     writer.close()
-                    chunk_files.append(writer.filename)
-                    logger.info(f"{E['ok']} Chunk finalizado: {Path(writer.filename).name} ({row_count:,} registros)")
+                    # CORREÇÃO 2: Usar current_chunk_file em vez de writer.filename
+                    chunk_files.append(current_chunk_file)
+                    logger.info(f"{E['ok']} Chunk finalizado: {current_chunk_file.name} ({row_count:,} registros)")
         
         # Clean tar
         try:
