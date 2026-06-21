@@ -30,6 +30,8 @@ import tarfile
 import signal
 import logging
 import shutil
+import psutil
+import gc
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any, Set
@@ -355,19 +357,6 @@ def find_target_indices(torrent_info: lt.torrent_info, targets: List[str]) -> Tu
 def local_path_for_index_robust(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path | None:
     """
     Localiza robustamente o arquivo baixado no disco, tolerando múltiplas estruturas de libtorrent.
-    
-    PROBLEMA CORRIGIDO:
-    - file_path pode já conter a pasta raiz do torrent (duplicação de diretório)
-    - file_path pode ser relativo à raiz do torrent
-    - file_path pode ter nomes com espaços alterados ou normalizados
-    
-    SOLUÇÃO:
-    1. Testa construção padrão (save_path / torrent_name / file_path)
-    2. Testa construção sem duplicação (save_path / file_path)
-    3. Testa busca recursiva por basename no disco
-    4. Registra diagnóstico completo se falhar
-    
-    Nunca retorna None sem log detalhado.
     """
     torrent_name = torrent_info.name()
     file_path = torrent_info.files().at(index).path
@@ -380,7 +369,6 @@ def local_path_for_index_robust(save_path: Path, torrent_info: lt.torrent_info, 
         return candidate1
     
     # NÍVEL 2: Sem duplicação (salvepath / file_path)
-    # Este é o caso quando file_path já contém o nome da pasta raiz
     candidate2 = save_path / file_path
     if candidate2.exists() and candidate2.is_file():
         logger.info(f"{E['ok']} [NÍVEL 2] Arquivo localizado (sem duplicação): {candidate2}")
@@ -490,7 +478,14 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
             nome = " ".join([p.capitalize() for p in local_part.split()]) if local_part else ""
             
             results.append((email, nome, origin, data_iso))
-        except Exception:
+        except Exception as e:
+            logger.exception(
+                "❌ WORKER FAILURE DETALHADO\n"
+                f"chunk_idx={chunk_idx}\n"
+                f"member={origin}\n"
+                f"error_type={type(e).__name__}\n"
+                f"error_msg={str(e)}"
+            )
             continue
     
     return results
@@ -498,16 +493,6 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
 def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
     """
     Extract tar.gz with mmap + regex + ProcessPoolExecutor + STREAMING.
-    
-    OTIMIZAÇÕES:
-    - Usa PyArrow ParquetWriter para gravação incremental
-    - Memória constante (~50-100MB em buffer de arrow)
-    - Não acumula dezenas de milhões de registros em RAM
-    - Gera múltiplos raw_chunk_*.parquet incrementalmente
-    
-    CORREÇÕES APLICADAS (v2):
-    - from_pylist() substituído por from_arrays() para receber tuples
-    - writer.filename removido, usando variável separada current_chunk_file
     """
     cpu_count = os.cpu_count() or 4
     chunk_files = []
@@ -528,6 +513,9 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 if fobj is None:
                     continue
                 
+                # ALTERAÇÃO 4 — PROTEÇÃO DE MEMÓRIA GLOBAL
+                gc.collect()
+                
                 # STREAMING: Inicializa writer quando temos dados
                 writer = None
                 schema = None
@@ -537,10 +525,81 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 
                 with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                    futures = []
+                    # ALTERAÇÃO 1 — LIMITAR FUTURES (CRÍTICO) / BACKPRESSURE REAL
+                    MAX_INFLIGHT = os.cpu_count() * 2
+                    inflight = set()
                     chunk_idx = 0
                     
-                    # Submete chunks para processamento
+                    def check_memory():
+                        mem = psutil.virtual_memory()
+                        if mem.percent > 85:
+                            logger.warning(f"⚠️ RAM ALTA: {mem.percent}%")
+                            time.sleep(1)
+                            
+                    def drain_futures(inflight):
+                        done = set()
+                        for f in list(inflight):
+                            if f.done():
+                                done.add(f)
+                        for f in done:
+                            inflight.remove(f)
+                            try:
+                                process_records = f.result()
+                                return process_records
+                            except Exception as e:
+                                logger.exception(
+                                    "❌ WORKER FAILURE DETALHADO\n"
+                                    f"chunk_idx={chunk_idx}\n"
+                                    f"member={member.name}\n"
+                                    f"error_type={type(e).__name__}\n"
+                                    f"error_msg={str(e)}"
+                                )
+                                return None
+                        return None
+
+                    def yield_or_write(records):
+                        nonlocal writer, schema, current_chunk_file, row_count, chunk_batch_count
+                        
+                        # ALTERAÇÃO 3 — SEGURANÇA PYARROW (EVITAR CRASH SILENCIOSO)
+                        safe_records = []
+                        for r in records:
+                            if isinstance(r, tuple) and len(r) == 4:
+                                safe_records.append(r)
+                            else:
+                                logger.warning(f"⚠️ Registro inválido ignorado: {r}")
+                        records = safe_records
+                        
+                        if not records:
+                            return
+
+                        # Inicializa schema e writer na primeira batch
+                        if writer is None:
+                          current_chunk_file = RAW_CHUNKS_DIR / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
+                          schema = pa.schema([
+                              pa.field("email", pa.string()),
+                              pa.field("nome", pa.string()),
+                              pa.field("origem", pa.string()),
+                              pa.field("data", pa.string()),
+                          ])
+                          writer = pq.ParquetWriter(str(current_chunk_file), schema, compression="snappy")
+                      
+                        table = pa.Table.from_arrays(
+                            [
+                                [r[0] for r in records],  # emails
+                                [r[1] for r in records],  # nomes
+                                [r[2] for r in records],  # origens
+                                [r[3] for r in records],  # datas
+                            ],
+                            names=["email", "nome", "origem", "data"]
+                        )
+                        
+                        writer.write_table(table)
+                        row_count += len(records)
+                        chunk_batch_count += 1
+                        
+                        if chunk_batch_count % 10 == 0:
+                            logger.info(f"{E['email']} Member {member.name}: {row_count:,} emails processados")
+
                     while True:
                         chunk_data = fobj.read(CHUNK_SIZE)
                         if not chunk_data:
@@ -549,55 +608,37 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                         if stop_event.is_set():
                             break
                         
-                        future = executor.submit(process_chunk_worker, chunk_data, chunk_idx, member.name)
-                        futures.append(future)
+                        check_memory()
+                        # BACKPRESSURE: bloqueia envio se tiver muitos jobs ativos
+                        while len(inflight) >= MAX_INFLIGHT:
+                            records = drain_futures(inflight)
+                            if records:
+                                yield_or_write(records)
+                                
+                        future = executor.submit(
+                            process_chunk_worker, chunk_data, chunk_idx, member.name
+                        )
+                        inflight.add(future)
                         chunk_idx += 1
                     
-                    # Processa resultados conforme ficam prontos
-                    for future in as_completed(futures):
+                    # Final flush
+                    for f in inflight:
                         try:
-                            records = future.result()
-                            
+                            records = f.result()
                             if records:
-                                # Inicializa schema e writer na primeira batch
-                                if writer is None:
-                                    # CORREÇÃO 1: Guardar caminho em variável separada
-                                    current_chunk_file = RAW_CHUNKS_DIR / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
-                                    schema = pa.schema([
-                                        pa.field("email", pa.string()),
-                                        pa.field("nome", pa.string()),
-                                        pa.field("origem", pa.string()),
-                                        pa.field("data", pa.string()),
-                                    ])
-                                    writer = pq.ParquetWriter(str(current_chunk_file), schema, compression="snappy")
-                                
-                                # CORREÇÃO 2: Usar from_arrays() para receber tuples
-                                table = pa.Table.from_arrays(
-                                    [
-                                        [r[0] for r in records],  # emails
-                                        [r[1] for r in records],  # nomes
-                                        [r[2] for r in records],  # origens
-                                        [r[3] for r in records],  # datas
-                                    ],
-                                    names=["email", "nome", "origem", "data"]
-                                )
-                                
-                                # Grava incrementalmente
-                                writer.write_table(table)
-                                row_count += len(records)
-                                chunk_batch_count += 1
-                                
-                                # Flush periódico para manter memória baixa
-                                if chunk_batch_count % 10 == 0:
-                                    logger.info(f"{E['email']} Member {member.name}: {row_count:,} emails processados")
-                        
+                                yield_or_write(records)
                         except Exception as e:
-                            logger.exception(f"{E['error']} Worker failed")
+                            logger.exception(
+                                "❌ WORKER FAILURE DETALHADO\n"
+                                f"chunk_idx={chunk_idx}\n"
+                                f"member={member.name}\n"
+                                f"error_type={type(e).__name__}\n"
+                                f"error_msg={str(e)}"
+                            )
                 
                 # Fecha writer e finaliza chunk
                 if writer is not None:
                     writer.close()
-                    # CORREÇÃO 2: Usar current_chunk_file em vez de writer.filename
                     chunk_files.append(current_chunk_file)
                     logger.info(f"{E['ok']} Chunk finalizado: {current_chunk_file.name} ({row_count:,} registros)")
         
@@ -608,7 +649,13 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
             pass
     
     except Exception as e:
-        logger.exception(f"{E['error']} Tar processing failed")
+        logger.exception(
+            "❌ WORKER FAILURE DETALHADO\n"
+            f"chunk_idx=N/A\n"
+            f"member={tar_path.name}\n"
+            f"error_type={type(e).__name__}\n"
+            f"error_msg={str(e)}"
+        )
     
     return chunk_files
 
@@ -790,9 +837,16 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
                 
                 processed_key[file_key] = True
                 state["downloaded_files"] = processed_key
+                state["downloaded_files"] = processed_key
                 save_state(state)
-            except Exception:
-                logger.exception(f"{E['error']} Wait failed")
+            except Exception as e:
+                logger.exception(
+                    "❌ WORKER FAILURE DETALHADO\n"
+                    f"chunk_idx=N/A\n"
+                    f"member={tname}\n"
+                    f"error_type={type(e).__name__}\n"
+                    f"error_msg={str(e)}"
+                )
     
     logger.info(f"{E['ok']} PHASE 2 complete: {len(all_files)} files ready")
     return all_files
@@ -825,12 +879,6 @@ def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
 def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, state: Dict) -> int:
     """
     PHASE 4: Load chunks into DuckDB using native INSERT FROM read_parquet().
-    
-    OTIMIZAÇÕES:
-    - Evita pd.read_parquet() (carrega tudo em RAM)
-    - Evita listas de tuples (memória extra)
-    - DuckDB lê parquet nativamente com streaming
-    - ~3-5x mais rápido que Python loop
     """
     logger.info(f"{E['db']} PHASE 4: Loading {len(chunks)} chunks into DuckDB (native read_parquet)")
     
@@ -876,8 +924,14 @@ def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, s
                 save_state(state)
                 
                 logger.info(f"{E['db']} Loaded (fallback): {chunk_file.name} (+{inserted:,} records)")
-            except Exception:
-                logger.exception(f"{E['error']} Failed to load chunk")
+            except Exception as ex:
+                logger.exception(
+                    "❌ WORKER FAILURE DETALHADO\n"
+                    f"chunk_idx=N/A\n"
+                    f"member={chunk_file.name}\n"
+                    f"error_type={type(ex).__name__}\n"
+                    f"error_msg={str(ex)}"
+                )
     
     logger.info(f"{E['ok']} PHASE 4 complete: {total_inserted:,} total records inserted")
     return total_inserted
@@ -903,8 +957,14 @@ def phase5_deduplicate_duckdb(conn: duckdb.DuckDBPyConnection) -> int:
         logger.info(f"{E['email']} Duplicates removed: {duplicates:,}")
         
         return count_after
-    except Exception:
-        logger.exception(f"{E['error']} Deduplication failed")
+    except Exception as e:
+        logger.exception(
+            "❌ WORKER FAILURE DETALHADO\n"
+            "chunk_idx=N/A\n"
+            "member=DuckDB_Deduplication\n"
+            f"error_type={type(e).__name__}\n"
+            f"error_msg={str(e)}"
+        )
         return 0
 
 def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
@@ -935,8 +995,14 @@ def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
             
             file_num += 1
             offset += ROWS_PER_FINAL_FILE
-        except Exception:
-            logger.exception(f"{E['error']} Failed to export final file")
+        except Exception as e:
+            logger.exception(
+                "❌ WORKER FAILURE DETALHADO\n"
+                f"chunk_idx=N/A\n"
+                f"member=Export_File_{file_num}\n"
+                f"error_type={type(e).__name__}\n"
+                f"error_msg={str(e)}"
+            )
             break
     
     logger.info(f"{E['ok']} PHASE 6 complete: {len(final_files)} final datasets generated")
@@ -988,7 +1054,13 @@ def main():
     try:
         api, emails_repo, checkpoint_repo = hf_setup_datasets(HF_TOKEN)
     except Exception as e:
-        logger.exception(f"{E['error']} HF setup failed")
+        logger.exception(
+            "❌ WORKER FAILURE DETALHADO\n"
+            "chunk_idx=N/A\n"
+            "member=HF_Setup\n"
+            f"error_type={type(e).__name__}\n"
+            f"error_msg={str(e)}"
+        )
         sys.exit(1)
     
     # Download checkpoint from HF
@@ -1005,7 +1077,13 @@ def main():
     try:
         session = create_libtorrent_session()
     except Exception as e:
-        logger.exception(f"{E['error']} Failed to initialize libtorrent")
+        logger.exception(
+            "❌ WORKER FAILURE DETALHADO\n"
+            "chunk_idx=N/A\n"
+            "member=Libtorrent_Init\n"
+            f"error_type={type(e).__name__}\n"
+            f"error_msg={str(e)}"
+        )
         sys.exit(1)
     
     try:
@@ -1052,7 +1130,13 @@ def main():
     except KeyboardInterrupt:
         logger.warning(f"{E['warn']} Graceful shutdown initiated")
     except Exception as e:
-        logger.exception(f"{E['error']} Unexpected error during execution")
+        logger.exception(
+            "❌ WORKER FAILURE DETALHADO\n"
+            "chunk_idx=N/A\n"
+            "member=Main_Orchestration\n"
+            f"error_type={type(e).__name__}\n"
+            f"error_msg={str(e)}"
+        )
         sys.exit(1)
     finally:
         try:
