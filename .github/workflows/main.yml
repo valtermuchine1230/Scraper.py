@@ -93,8 +93,10 @@ jobs:
       - name: Verify critical packages
         run: |
           python -c "import pybloom_live; print('✅ pybloom_live OK')"
-          python -c "import libtorrent; print('✅ libtorrent OK')"
           python -c "import duckdb; print('✅ duckdb OK')"
+          python -c "import pandas; print('✅ pandas OK')"
+          python -c "import pyarrow; print('✅ pyarrow OK')"
+          python -c "from huggingface_hub import HfApi; print('✅ huggingface_hub OK')"
 
       - name: Create data directories
         run: |
@@ -114,6 +116,7 @@ jobs:
 
           if token and repo_owner:
               api = HfApi()
+
               try:
                   api.hf_hub_download(
                       repo_id=f"{repo_owner}/minerador_checkpoints",
@@ -123,8 +126,9 @@ jobs:
                       repo_type="dataset"
                   )
                   print("✅ Checkpoint downloaded")
+
               except Exception as e:
-                  print("⚠️ No checkpoint found or failed:", str(e))
+                  print("⚠️ No checkpoint found:", e)
           EOF
 
       - name: Run Minerador Production
@@ -146,22 +150,28 @@ jobs:
         run: |
           echo "=== DISK USAGE ==="
           df -h
+
           echo ""
           echo "=== DATA DIRECTORY ==="
-          du -sh "$SAVE_PATH"/* 2>/dev/null || true
+          if [ -d "$SAVE_PATH" ]; then
+            du -sh "$SAVE_PATH"/* 2>/dev/null || true
+          fi
 
       - name: Clean temporary files
         if: always()
         run: |
-          rm -rf "$SAVE_PATH"/temp
-          rm -rf "$SAVE_PATH"/raw_chunks/*.parquet
-          du -sh "$SAVE_PATH"
+          if [ -d "$SAVE_PATH" ]; then
+            rm -rf "$SAVE_PATH"/temp
+            rm -rf "$SAVE_PATH"/raw_chunks/*.parquet
+            du -sh "$SAVE_PATH"
+          fi
 
       - name: Status summary
         if: always()
         run: |
           echo "✅ Workflow completed"
           echo "📁 Data: $SAVE_PATH"
+
           if [ -f "$SAVE_PATH/state.json" ]; then
             echo "✅ State persisted for next run"
           fi
