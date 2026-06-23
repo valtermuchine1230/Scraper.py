@@ -2,6 +2,9 @@
 """
 minerador_production.py — Escalável a bilhões de emails com tolerância a falhas.
 
+INSTALAÇÃO DE DEPENDÊNCIAS:
+    pip install -r requirements.txt
+
 ARQUITETURA:
   FASE 1: Download 5 torrents simultâneos
   FASE 2: Checkpoint torrents no HF
@@ -49,18 +52,52 @@ from typing import List, Tuple, Dict, Any, Set
 from threading import Event, Lock
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-import libtorrent as lt
-from huggingface_hub import HfApi
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-import duckdb
+try:
+    import libtorrent as lt
+except ImportError:
+    print("❌ ERROR: python-libtorrent not installed")
+    print("   Executar: pip install python-libtorrent==2.0.9")
+    sys.exit(1)
 
-# 🌸 BLOOM FILTER — Import
-from pybloom_live import BloomFilter
+try:
+    from huggingface_hub import HfApi
+except ImportError:
+    print("❌ ERROR: huggingface_hub not installed")
+    print("   Executar: pip install 'huggingface-hub>=0.21.0'")
+    sys.exit(1)
 
-from rich.logging import RichHandler
-from rich.console import Console
+try:
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:
+    print("❌ ERROR: pandas ou pyarrow not installed")
+    print("   Executar: pip install 'pandas>=2.0.0' 'pyarrow>=14.0.0'")
+    sys.exit(1)
+
+try:
+    import duckdb
+except ImportError:
+    print("❌ ERROR: duckdb not installed")
+    print("   Executar: pip install 'duckdb>=0.9.0'")
+    sys.exit(1)
+
+try:
+    from pybloom_live import BloomFilter
+except ImportError:
+    print("❌ ERROR: pybloom_live not installed")
+    print("   Executar: pip install 'pybloom-live>=4.0.1'")
+    print("")
+    print("   NOTA: O pacote é instalado via 'pybloom-live' mas importado como 'pybloom_live'")
+    sys.exit(1)
+
+try:
+    from rich.logging import RichHandler
+    from rich.console import Console
+except ImportError:
+    print("❌ ERROR: rich not installed")
+    print("   Executar: pip install 'rich>=13.0.0'")
+    sys.exit(1)
 
 # ===== CONFIGURATION =====
 SAVE_PATH = Path(os.environ.get("SAVE_PATH", "./data"))
@@ -85,7 +122,7 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "500000"))
 ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "30000000"))
 
-# ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB) - JÁ IMPLEMENTADO
+# ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB)
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))
 
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
@@ -795,7 +832,10 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                     )
 
                 # ALTERAÇÃO 5: LIBERAR MEMÓRIA APÓS PROCESSAR CADA MEMBER
-                del writer, schema
+                if writer:
+                    del writer
+                if schema:
+                    del schema
                 gc.collect()
 
         # Clean tar
