@@ -46,13 +46,13 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python 3.11
+      # 🔥 FIX CRÍTICO: Python 3.10 (compatibilidade com pybloomfilter)
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
           cache: 'pip'
 
-      # 🔥 FIX CRÍTICO: dependências de compilação C/C++
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -85,10 +85,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
-      # 🔥 FIX CRÍTICO: instala bloom filter FORÇADO antes do resto
+      # 🔥 FIX: instala dependência C ANTES do requirements
       - name: Install critical dependency (bloom filter)
         run: |
-          pip install pybloomfiltermmap3==0.5.3
+          pip install pybloomfiltermmap3==0.5.2
 
       - name: Install Python dependencies
         run: |
@@ -128,7 +128,6 @@ jobs:
                       local_dir=os.environ.get("SAVE_PATH")
                   )
                   print("✅ Checkpoint downloaded:", path)
-
               except Exception as e:
                   print("⚠️ No checkpoint found:", e)
           EOF
