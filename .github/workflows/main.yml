@@ -46,7 +46,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      # 🔥 FIX CRÍTICO: Python 3.10 (compatibilidade com pybloomfilter)
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
@@ -85,18 +84,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
-      # 🔥 FIX: instala dependência C ANTES do requirements
-      - name: Install critical dependency (bloom filter)
-        run: |
-          pip install pybloomfiltermmap3==0.5.2
-
       - name: Install Python dependencies
         run: |
           pip install --no-cache-dir -r requirements.txt
 
       - name: Verify critical packages
         run: |
-          python -c "import pybloomfiltermmap3; print('✅ pybloomfiltermmap3 OK')"
           python -c "import duckdb; print('✅ duckdb OK')"
           python -c "import pandas; print('✅ pandas OK')"
           python -c "import pyarrow; print('✅ pyarrow OK')"
