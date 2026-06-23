@@ -26,7 +26,7 @@ env:
   HF_REPO_CHECKPOINT: minerador_checkpoints
   LOG_LEVEL: INFO
   POLL_INTERVAL: 3
-  CHUNK_SIZE: 1073741824
+  CHUNK_SIZE: 67108864
   BATCH_INSERT_DDB: 500000
   ROWS_PER_FINAL_FILE: 30000000
   MIN_FREE_BYTES: 536870912
@@ -92,7 +92,7 @@ jobs:
 
       - name: Verify critical packages
         run: |
-          python -c "import pybloom_live; print('✅ pybloom_live OK')"
+          python -c "import pybloomfiltermmap3; print('✅ pybloomfiltermmap3 OK')"
           python -c "import duckdb; print('✅ duckdb OK')"
           python -c "import pandas; print('✅ pandas OK')"
           python -c "import pyarrow; print('✅ pyarrow OK')"
@@ -175,3 +175,4 @@ jobs:
           if [ -f "$SAVE_PATH/state.json" ]; then
             echo "✅ State persisted for next run"
           fi
+```
