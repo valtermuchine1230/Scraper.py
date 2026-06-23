@@ -254,7 +254,7 @@ def load_state() -> Dict[str, Any]:
     """Load execution state."""
     if STATE_PATH.exists():
         try:
-            with open(STATE_PATH, "w") as f:
+            with open(STATE_PATH, "r") as f:
                 return json.load(f)
         except Exception:
             return {}
@@ -715,6 +715,10 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                         nonlocal writer, schema, current_chunk_file, row_count, chunk_batch_count
                         nonlocal bloom_skipped  # 🌸 BLOOM FILTER — acesso ao contador
 
+                        # Proteção defensiva e garantia de existência em todos os caminhos
+                        if not records:
+                            return
+
                         # ALTERAÇÃO 3: SEGURANÇA PYARROW (EVITAR CRASH SILENCIOSO)
                         safe_records = []
                         for r in records:
@@ -747,12 +751,12 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                             records = filtered_records
 
                         if not records:
-                            return  # Todos os emails eram duplicatas
+                            return  # Todos os emails eram duplicatas ou filtrados
                         # =====================================================
                         # 🌸 FIM DA VERIFICAÇÃO DO BLOOM FILTER
                         # =====================================================
 
-                        # Inicializa schema e writer na primeira batch
+                        # Inicializa schema e writer na primeira batch com dados válidos
                         if writer is None:
                             current_chunk_file = RAW_CHUNKS_DIR / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
                             schema = pa.schema([
@@ -773,14 +777,17 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                             names=["email", "nome", "origem", "data"]
                         )
 
+                        # Guardar de forma totalmente segura o tamanho antes da liberação de memória
+                        count = len(records)
+
                         writer.write_table(table)
 
-                        # ALTERAÇÃO 5: LIBERAR MEMÓRIA APÓS ESCRITA
+                        # ALTERAÇÃO 5: LIBERAR MEMÓRIA APÓS ESCRITA (Ordem estrita e segura)
                         del table
                         del records
                         gc.collect()
 
-                        row_count += len(records) if records else 0
+                        row_count += count
                         chunk_batch_count += 1
 
                         if chunk_batch_count % 10 == 0:
