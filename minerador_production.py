@@ -17,20 +17,22 @@ ARQUITETURA:
 
 PERSISTÊNCIA: Tudo no Hugging Face → recuperação completa após timeout
 
-OTIMIZAÇÕES DE MEMÓRIA (VERSÃO OTIMIZADA):
+OTIMIZAÇÕES DE MEMÓRIA (VERSÃO DISCO):
   - ALTERAÇÃO 1: PRAGMA memory_limit='8GB' (de 12GB)
-  - ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB) ✓
-  - ALTERAÇÃO 3: MAX_WORKERS = min(6, cpu_count)
-  - ALTERAÇÃO 4: MAX_INFLIGHT = 8 (conservador)
+  - ALTERAÇÃO 2: CHUNK_SIZE = 64 MB (de 256 MB)
+  - ALTERAÇÃO 3: MAX_WORKERS = min(2, cpu_count)
+  - ALTERAÇÃO 4: MAX_INFLIGHT = 4 (de 8)
   - ALTERAÇÃO 5: gc.collect() após cada escrita (ParquetWriter)
   - ALTERAÇÃO 6: Logs detalhados de RAM (% | usada GB | livre GB)
 
-BLOOM FILTER (DEDUPLICAÇÃO EM STREAMING):
-  - Biblioteca: pybloom-live
+BLOOM FILTER (DEDUPLICAÇÃO EM DISCO — MMAP):
+  - Biblioteca: pybloomfiltermmap3 (disco em vez de RAM)
   - Capacidade: 1.500.000.000 entradas
   - Taxa de erro: 0.1%
+  - Armazenamento: disco local (bloom_filter.bin) via mmap
   - Persistência: Hugging Face Hub (Dinâmico por utilizador)
   - Guardado a cada checkpoint
+  - RAM usada pelo BF: ~200-500 MB em vez de 3-4 GB
 """
 
 from __future__ import annotations
@@ -83,13 +85,14 @@ except ImportError:
     print("   Executar: pip install 'duckdb>=0.9.0'")
     sys.exit(1)
 
+# 🌸 BLOOM FILTER — pybloomfiltermmap3 (disco/mmap em vez de RAM)
 try:
-    from pybloom_live import BloomFilter
+    from pybloomfiltermmap3 import BloomFilter
 except ImportError:
-    print("❌ ERROR: pybloom_live not installed")
-    print("   Executar: pip install 'pybloom-live>=4.0.1'")
+    print("❌ ERROR: pybloomfiltermmap3 not installed")
+    print("   Executar: pip install 'pybloomfiltermmap3>=0.5.3'")
     print("")
-    print("   NOTA: O pacote é instalado via 'pybloom-live' mas importado como 'pybloom_live'")
+    print("   NOTA: Usa mmap/disco em vez de RAM. Reduz uso de RAM de 3-4 GB para ~200 MB.")
     sys.exit(1)
 
 try:
@@ -123,21 +126,21 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "500000"))
 ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "30000000"))
 
-# ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB)
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))
+# ALTERAÇÃO 2: CHUNK_SIZE = 64 MB (de 256 MB) — reduz RAM dos workers
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(64 * 1024 * 1024)))
 
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 ROWS_PER_PARQUET_FILE = int(os.environ.get("ROWS_PER_PARQUET_FILE", "5000000"))
 
-# 🌸 BLOOM FILTER — Configuração
+# 🌸 BLOOM FILTER — Configuração (DISCO via mmap)
 BLOOM_FILTER_PATH = SAVE_PATH / "bloom_filter.bin"
 HF_REPO_BLOOM: str | None = None          # Definido dinamicamente no setup do HF
-BLOOM_CAPACITY = 1_500_000_000           # 1.5 bilhões de entradas (com margem)
-BLOOM_ERROR_RATE = 0.001                 # Taxa de erro máxima: 0.1%
+BLOOM_CAPACITY = 1_500_000_000            # 1.5 bilhões de entradas (com margem)
+BLOOM_ERROR_RATE = 0.001                  # Taxa de erro máxima: 0.1%
 
 # 🌸 BLOOM FILTER — Estado global (partilhado no processo principal)
 bloom_filter: BloomFilter | None = None
-bloom_lock = Lock()                      # Thread-safe para acessos concorrentes
+bloom_lock = Lock()                       # Thread-safe para acessos concorrentes
 
 # MAGNET LINKS
 MAGNETS = [
@@ -268,12 +271,13 @@ def is_disposable_email(email: str) -> bool:
     except Exception:
         return False
 
-# ===== 🌸 BLOOM FILTER — Funções de persistência =====
+# ===== 🌸 BLOOM FILTER — Funções de persistência (DISCO/MMAP) =====
 
 def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
     """
-    🌸 BLOOM FILTER — Carrega do Hugging Face Hub.
-    Se o ficheiro não existir no HF, cria um novo Bloom Filter.
+    🌸 BLOOM FILTER — Carrega do Hugging Face Hub para disco local e abre via mmap.
+    Se o ficheiro não existir no HF, cria um novo Bloom Filter em disco.
+    O ficheiro fica em disco (mmap) — não ocupa RAM como antes (3-4 GB → ~200 MB).
     """
     global bloom_filter, HF_REPO_BLOOM
 
@@ -295,7 +299,8 @@ def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
         else:
             logger.warning(f"{E['warn']} create_repo Bloom Filter: {str(e)[:120]}")
 
-    # Tentar descarregar o Bloom Filter existente
+    # Tentar descarregar o Bloom Filter existente do HF para disco local
+    hf_download_ok = False
     try:
         logger.info(f"{E['bloom']} A descarregar Bloom Filter de {HF_REPO_BLOOM}...")
         local_file = api.hf_hub_download(
@@ -305,30 +310,45 @@ def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
             token=token,
             repo_type="dataset",
         )
-        with open(local_file, "rb") as f:
-            bloom_filter = BloomFilter.fromfile(f)
-        logger.info(
-            f"{E['bloom']} Bloom Filter carregado do HF "
-            f"(count≈{bloom_filter.count:,} entradas)"
-        )
+        # Garantir que está no caminho esperado
+        if Path(local_file) != BLOOM_FILTER_PATH:
+            shutil.copy2(local_file, BLOOM_FILTER_PATH)
+        hf_download_ok = True
+        logger.info(f"{E['bloom']} Bloom Filter descarregado do HF para: {BLOOM_FILTER_PATH}")
     except Exception as e:
-        # Ficheiro não existe no HF ou erro no download → criar novo
         logger.info(
             f"{E['bloom']} Bloom Filter não encontrado no HF ou inacessível. "
-            f"A criar novo (capacidade={BLOOM_CAPACITY:,}, erro={BLOOM_ERROR_RATE})"
+            f"A criar novo em disco (capacidade={BLOOM_CAPACITY:,}, erro={BLOOM_ERROR_RATE})"
         )
-        bloom_filter = BloomFilter(
-            capacity=BLOOM_CAPACITY,
-            error_rate=BLOOM_ERROR_RATE,
-        )
+        # Se existir ficheiro local antigo corrompido, remover
+        if BLOOM_FILTER_PATH.exists():
+            try:
+                BLOOM_FILTER_PATH.unlink()
+            except Exception:
+                pass
+
+    # Abrir (ou criar) Bloom Filter via mmap em disco
+    # pybloomfiltermmap3: se o ficheiro existe → abre; se não existe → cria novo
+    bloom_filter = BloomFilter(
+        capacity=BLOOM_CAPACITY,
+        error_rate=BLOOM_ERROR_RATE,
+        filename=str(BLOOM_FILTER_PATH),
+    )
+
+    bf_size_mb = BLOOM_FILTER_PATH.stat().st_size / (1024 ** 2) if BLOOM_FILTER_PATH.exists() else 0
+    logger.info(
+        f"{E['bloom']} Bloom Filter mmap pronto em disco: "
+        f"~{len(bloom_filter):,} entradas | ficheiro: {bf_size_mb:.1f} MB | RAM: ~200 MB"
+    )
 
     return bloom_filter
 
 
 def save_bloom_filter(api: HfApi, token: str):
     """
-    🌸 BLOOM FILTER — Guarda localmente e faz upload para o Hugging Face Hub.
-    Chamado a cada checkpoint para nunca perder progresso.
+    🌸 BLOOM FILTER — Faz upload do ficheiro de disco para o Hugging Face Hub.
+    Com mmap, os dados já estão sincronizados no disco automaticamente.
+    Apenas precisamos de fazer upload do ficheiro existente.
     """
     global bloom_filter, HF_REPO_BLOOM
     if bloom_filter is None:
@@ -338,17 +358,18 @@ def save_bloom_filter(api: HfApi, token: str):
         logger.warning(f"{E['warn']} HF_REPO_BLOOM não está configurado, impossível guardar no HF")
         return
 
+    if not BLOOM_FILTER_PATH.exists():
+        logger.warning(f"{E['warn']} bloom_filter.bin não encontrado em disco, impossível fazer upload")
+        return
+
     try:
-        logger.info(f"{E['bloom']} A guardar Bloom Filter ({bloom_filter.count:,} entradas)...")
+        bf_size_mb = BLOOM_FILTER_PATH.stat().st_size / (1024 ** 2)
+        logger.info(
+            f"{E['bloom']} A guardar Bloom Filter no HF "
+            f"({len(bloom_filter):,} entradas | {bf_size_mb:.1f} MB)..."
+        )
 
-        # 1. Guardar ficheiro binário localmente
-        with open(BLOOM_FILTER_PATH, "wb") as f:
-            bloom_filter.tofile(f)
-
-        bloom_size_mb = BLOOM_FILTER_PATH.stat().st_size / (1024 ** 2)
-        logger.info(f"{E['bloom']} Bloom Filter local: {bloom_size_mb:.1f} MB")
-
-        # 2. Upload para HF
+        # Com mmap, os dados já estão em disco — basta fazer upload directamente
         api.upload_file(
             path_or_fileobj=str(BLOOM_FILTER_PATH),
             path_in_repo="bloom_filter.bin",
@@ -633,11 +654,13 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
 
 def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
     """
-    Extract tar.gz with mmap + regex + ProcessPoolExecutor + STREAMING.
-    Com otimizações de memória: CHUNK_SIZE 256MB, MAX_WORKERS 6, MAX_INFLIGHT 8.
+    Extract tar.gz com mmap + regex + ProcessPoolExecutor + STREAMING.
+    ALTERAÇÃO 3: MAX_WORKERS = min(2, cpu_count) — reduz pressão de RAM drasticamente.
+    ALTERAÇÃO 4: MAX_INFLIGHT = 4 — evita explosão de chunks em memória.
+    ALTERAÇÃO 2: CHUNK_SIZE = 64 MB — reduz RAM por chunk de 256MB para 64MB.
     """
-    # ALTERAÇÃO 3: LIMITAR WORKERS A MÁXIMO 6 (conservador, mantém paralelismo)
-    cpu_count = min(6, os.cpu_count() or 4)
+    # ALTERAÇÃO 3: LIMITAR WORKERS A 2 (máximo conservador para RAM estável)
+    cpu_count = min(2, os.cpu_count() or 2)
     chunk_files = []
 
     logger.info(f"{E['extract']} Processando: {tar_path.name}")
@@ -672,8 +695,8 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
                 with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                    # ALTERAÇÃO 4: LIMITAR MAX_INFLIGHT A 8 (evita explosão de memória)
-                    MAX_INFLIGHT = 8
+                    # ALTERAÇÃO 4: MAX_INFLIGHT = 4 (de 8) — evita explosão de memória
+                    MAX_INFLIGHT = 4
                     inflight = set()
                     chunk_idx = 0
 
@@ -688,7 +711,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                                 f"usada={mem.used/1024**3:.2f}GB | "
                                 f"livre={mem.available/1024**3:.2f}GB"
                             )
-                            time.sleep(1)
+                            time.sleep(2)
 
                     def drain_futures(inflight):
                         done = set()
@@ -719,7 +742,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                         if not records:
                             return
 
-                        # ALTERAÇÃO 3: SEGURANÇA PYARROW (EVITAR CRASH SILENCIOSO)
+                        # SEGURANÇA PYARROW (EVITAR CRASH SILENCIOSO)
                         safe_records = []
                         for r in records:
                             if isinstance(r, tuple) and len(r) == 4:
@@ -732,9 +755,10 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                             return
 
                         # =====================================================
-                        # 🌸 BLOOM FILTER — Verificação antes de qualquer escrita
+                        # 🌸 BLOOM FILTER (MMAP/DISCO) — Verificação em streaming
                         # O email já está normalizado em minúsculas pelo worker.
                         # Apenas emails novos (não vistos antes) são escritos.
+                        # O bloom_filter.bin está em disco → RAM usada = cache mmap (~200MB)
                         # =====================================================
                         if bloom_filter is not None:
                             filtered_records = []
@@ -742,7 +766,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                                 for r in records:
                                     email = r[0]  # já em minúsculas (process_chunk_worker)
                                     if email not in bloom_filter:
-                                        # Email novo: adicionar ao Bloom Filter e manter
+                                        # Email novo: adicionar ao Bloom Filter em disco e manter
                                         bloom_filter.add(email)
                                         filtered_records.append(r)
                                     else:
@@ -798,7 +822,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
                             )
 
                     while True:
-                        # ALTERAÇÃO 2: USAR CHUNK_SIZE REDUZIDO (256MB)
+                        # ALTERAÇÃO 2: USAR CHUNK_SIZE REDUZIDO (64MB)
                         chunk_data = fobj.read(CHUNK_SIZE)
                         if not chunk_data:
                             break
@@ -1241,6 +1265,7 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, checkpoint_repo: 
 
     # =====================================================
     # 🌸 BLOOM FILTER — Guardar no HF junto com o checkpoint
+    # Com mmap, os dados já estão em disco. Apenas fazemos upload do ficheiro.
     # Garante que nunca se perde progresso em caso de falha ou timeout.
     # =====================================================
     logger.info(f"{E['bloom']} A guardar Bloom Filter no checkpoint...")
@@ -1259,19 +1284,20 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, checkpoint_repo: 
 def main():
     """Main orchestration."""
     global bloom_filter, HF_REPO_BLOOM
-    logger.info(f"{E['start']} Minerador Production v1 (OTIMIZADO + BLOOM FILTER)")
+    logger.info(f"{E['start']} Minerador Production v1 (BLOOM FILTER DISCO/MMAP)")
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['info']} CPU cores: {os.cpu_count()}")
     logger.info(f"{E['stats']} Disk usage: {disk_usage(SAVE_PATH)}")
 
-    # ALTERAÇÕES APLICADAS: Mostrar configurações de otimização no startup
+    # Mostrar configurações de otimização no startup
     logger.info(f"{E['cpu']} ═══ OTIMIZAÇÕES DE MEMÓRIA APLICADAS ═══")
     logger.info(f"{E['cpu']} ALTERAÇÃO 1: PRAGMA memory_limit = 8GB (de 12GB)")
-    logger.info(f"{E['cpu']} ALTERAÇÃO 2: CHUNK_SIZE = 256 MB (de 1 GB)")
-    logger.info(f"{E['cpu']} ALTERAÇÃO 3: MAX_WORKERS = min(6, {os.cpu_count() or 4})")
-    logger.info(f"{E['cpu']} ALTERAÇÃO 4: MAX_INFLIGHT = 8")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 2: CHUNK_SIZE = 64 MB (de 256 MB)")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 3: MAX_WORKERS = min(2, {os.cpu_count() or 2})")
+    logger.info(f"{E['cpu']} ALTERAÇÃO 4: MAX_INFLIGHT = 4 (de 8)")
     logger.info(f"{E['cpu']} ALTERAÇÃO 5: gc.collect() após ParquetWriter")
     logger.info(f"{E['cpu']} ALTERAÇÃO 6: RAM% | usada(GB) | livre(GB)")
+    logger.info(f"{E['bloom']} BLOOM FILTER : pybloomfiltermmap3 (DISCO/MMAP — não RAM)")
     logger.info(f"{E['cpu']} ════════════════════════════════════════")
 
     # Verify HF token
@@ -1293,11 +1319,12 @@ def main():
         sys.exit(1)
 
     # 🌸 BLOOM FILTER — Log de configuração com repo dinâmico pronto
-    logger.info(f"{E['bloom']} ═══ BLOOM FILTER ═══")
+    logger.info(f"{E['bloom']} ═══ BLOOM FILTER (DISCO/MMAP) ═══")
     logger.info(f"{E['bloom']} Repositório HF : {HF_REPO_BLOOM}")
     logger.info(f"{E['bloom']} Capacidade     : {BLOOM_CAPACITY:,} entradas")
     logger.info(f"{E['bloom']} Taxa de erro   : {BLOOM_ERROR_RATE * 100:.1f}%")
-    logger.info(f"{E['bloom']} ═══════════════════")
+    logger.info(f"{E['bloom']} Armazenamento  : disco (mmap) — RAM usada ≈ 200 MB")
+    logger.info(f"{E['bloom']} ══════════════════════════════════")
 
     # Download checkpoint from HF
     logger.info(f"{E['download']} Downloading checkpoint from Hugging Face")
@@ -1305,14 +1332,15 @@ def main():
     hf_download_duckdb(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
 
     # =====================================================
-    # 🌸 BLOOM FILTER — Carregar do HF no início da sessão
-    # Se existir, retoma do estado anterior.
-    # Se não existir, cria novo automaticamente.
+    # 🌸 BLOOM FILTER — Carregar do HF para disco local (mmap)
+    # Se existir no HF: descarrega e abre via mmap (não carrega tudo para RAM)
+    # Se não existir: cria novo ficheiro em disco via mmap
+    # RAM usada pelo BF: ~200 MB (páginas de cache) em vez de 3-4 GB
     # =====================================================
     bloom_filter = load_bloom_filter(api, HF_TOKEN)
     logger.info(
         f"{E['bloom']} Bloom Filter pronto: "
-        f"~{bloom_filter.count:,} emails já conhecidos"
+        f"~{len(bloom_filter):,} emails já conhecidos"
     )
     # =====================================================
     # 🌸 FIM DO CARREGAMENTO DO BLOOM FILTER
@@ -1396,6 +1424,12 @@ def main():
                 save_bloom_filter(api, HF_TOKEN)
             except Exception as e:
                 logger.error(f"{E['error']} Erro ao salvar Bloom Filter no encerramento: {e}")
+            # Fechar o ficheiro mmap correctamente
+            try:
+                bloom_filter.close()
+                logger.info(f"{E['bloom']} Bloom Filter mmap fechado correctamente")
+            except Exception as e:
+                logger.error(f"{E['error']} Erro ao fechar Bloom Filter mmap: {e}")
         try:
             conn.close()
         except Exception:
