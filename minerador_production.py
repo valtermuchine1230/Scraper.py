@@ -29,7 +29,7 @@ BLOOM FILTER (DEDUPLICAÇÃO EM STREAMING):
   - Biblioteca: pybloom-live
   - Capacidade: 1.500.000.000 entradas
   - Taxa de erro: 0.1%
-  - Persistência: Hugging Face Hub (valter/projet)
+  - Persistência: Hugging Face Hub (Dinâmico por utilizador)
   - Guardado a cada checkpoint
 """
 
@@ -61,6 +61,7 @@ except ImportError:
 
 try:
     from huggingface_hub import HfApi
+    from huggingface_hub.utils import RepositoryNotFoundError
 except ImportError:
     print("❌ ERROR: huggingface_hub not installed")
     print("   Executar: pip install 'huggingface-hub>=0.21.0'")
@@ -130,7 +131,7 @@ ROWS_PER_PARQUET_FILE = int(os.environ.get("ROWS_PER_PARQUET_FILE", "5000000"))
 
 # 🌸 BLOOM FILTER — Configuração
 BLOOM_FILTER_PATH = SAVE_PATH / "bloom_filter.bin"
-HF_REPO_BLOOM = "valter/projet"          # Repositório HF para guardar o Bloom Filter
+HF_REPO_BLOOM: str | None = None          # Definido dinamicamente no setup do HF
 BLOOM_CAPACITY = 1_500_000_000           # 1.5 bilhões de entradas (com margem)
 BLOOM_ERROR_RATE = 0.001                 # Taxa de erro máxima: 0.1%
 
@@ -253,7 +254,7 @@ def load_state() -> Dict[str, Any]:
     """Load execution state."""
     if STATE_PATH.exists():
         try:
-            with open(STATE_PATH, "r") as f:
+            with open(STATE_PATH, "w") as f:
                 return json.load(f)
         except Exception:
             return {}
@@ -274,7 +275,10 @@ def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
     🌸 BLOOM FILTER — Carrega do Hugging Face Hub.
     Se o ficheiro não existir no HF, cria um novo Bloom Filter.
     """
-    global bloom_filter
+    global bloom_filter, HF_REPO_BLOOM
+
+    if not HF_REPO_BLOOM:
+        raise RuntimeError("HF_REPO_BLOOM não está configurado.")
 
     # Garantir que o repositório existe
     try:
@@ -286,10 +290,10 @@ def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
         )
         logger.info(f"{E['bloom']} Repositório HF criado: {HF_REPO_BLOOM}")
     except Exception as e:
-        if "already exists" in str(e).lower():
+        if "already exists" in str(e).lower() or "409" in str(e):
             logger.info(f"{E['bloom']} Repositório HF já existe: {HF_REPO_BLOOM}")
         else:
-            logger.warning(f"{E['warn']} create_repo: {str(e)[:120]}")
+            logger.warning(f"{E['warn']} create_repo Bloom Filter: {str(e)[:120]}")
 
     # Tentar descarregar o Bloom Filter existente
     try:
@@ -307,10 +311,10 @@ def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
             f"{E['bloom']} Bloom Filter carregado do HF "
             f"(count≈{bloom_filter.count:,} entradas)"
         )
-    except Exception:
-        # Ficheiro não existe no HF → criar novo
+    except Exception as e:
+        # Ficheiro não existe no HF ou erro no download → criar novo
         logger.info(
-            f"{E['bloom']} Bloom Filter não encontrado no HF. "
+            f"{E['bloom']} Bloom Filter não encontrado no HF ou inacessível. "
             f"A criar novo (capacidade={BLOOM_CAPACITY:,}, erro={BLOOM_ERROR_RATE})"
         )
         bloom_filter = BloomFilter(
@@ -326,9 +330,12 @@ def save_bloom_filter(api: HfApi, token: str):
     🌸 BLOOM FILTER — Guarda localmente e faz upload para o Hugging Face Hub.
     Chamado a cada checkpoint para nunca perder progresso.
     """
-    global bloom_filter
+    global bloom_filter, HF_REPO_BLOOM
     if bloom_filter is None:
         logger.warning(f"{E['warn']} Bloom Filter é None, nada a guardar")
+        return
+    if not HF_REPO_BLOOM:
+        logger.warning(f"{E['warn']} HF_REPO_BLOOM não está configurado, impossível guardar no HF")
         return
 
     try:
@@ -537,7 +544,7 @@ def local_path_for_index_robust(save_path: Path, torrent_info: lt.torrent_info, 
         logger.error(f"{E['error']}   [3] Busca recursiva em {torrent_dir}/")
     logger.error(f"{E['error']}   [4] Busca global em {save_path}/")
     logger.error(f"{E['error']} ")
-    logger.error(f"{E['error']} Conteúdo do diretório Torrent ({torrent_dir}):")
+    logger.error(f"{E['error']} Conteúdo diretório Torrent ({torrent_dir}):")
     if torrent_dir.exists() and torrent_dir.is_dir():
         try:
             for item in list(torrent_dir.rglob("*"))[:50]:
@@ -858,6 +865,7 @@ def process_tar_with_mmap(tar_path: Path, origin: str) -> List[Path]:
 # ===== HUGGING FACE =====
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
     """Setup/verify datasets on Hugging Face."""
+    global HF_REPO_BLOOM
     if not token:
         raise RuntimeError("HF_TOKEN not set")
 
@@ -870,16 +878,17 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
 
     emails_repo = f"{user}/{HF_REPO_EMAILS}"
     checkpoint_repo = f"{user}/{HF_REPO_CHECKPOINT}"
+    HF_REPO_BLOOM = f"{user}/bloom_filter"
 
-    for repo_id in [emails_repo, checkpoint_repo]:
+    for repo_id in [emails_repo, checkpoint_repo, HF_REPO_BLOOM]:
         try:
             api.create_repo(repo_id=repo_id, token=token, repo_type="dataset", private=True)
             logger.info(f"{E['ok']} Dataset created: {repo_id}")
         except Exception as e:
-            if "already exists" in str(e).lower():
+            if "already exists" in str(e).lower() or "409" in str(e):
                 logger.info(f"{E['ok']} Dataset exists: {repo_id}")
             else:
-                logger.warning(f"{E['warn']} Create repo: {str(e)[:100]}")
+                logger.warning(f"{E['warn']} Create repo {repo_id}: {str(e)[:100]}")
 
     return api, emails_repo, checkpoint_repo
 
@@ -1242,6 +1251,7 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, checkpoint_repo: 
 
 def main():
     """Main orchestration."""
+    global bloom_filter, HF_REPO_BLOOM
     logger.info(f"{E['start']} Minerador Production v1 (OTIMIZADO + BLOOM FILTER)")
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['info']} CPU cores: {os.cpu_count()}")
@@ -1256,13 +1266,6 @@ def main():
     logger.info(f"{E['cpu']} ALTERAÇÃO 5: gc.collect() após ParquetWriter")
     logger.info(f"{E['cpu']} ALTERAÇÃO 6: RAM% | usada(GB) | livre(GB)")
     logger.info(f"{E['cpu']} ════════════════════════════════════════")
-
-    # 🌸 BLOOM FILTER — Log de configuração
-    logger.info(f"{E['bloom']} ═══ BLOOM FILTER ═══")
-    logger.info(f"{E['bloom']} Repositório HF : {HF_REPO_BLOOM}")
-    logger.info(f"{E['bloom']} Capacidade     : {BLOOM_CAPACITY:,} entradas")
-    logger.info(f"{E['bloom']} Taxa de erro   : {BLOOM_ERROR_RATE * 100:.1f}%")
-    logger.info(f"{E['bloom']} ═══════════════════")
 
     # Verify HF token
     if not HF_TOKEN:
@@ -1282,6 +1285,13 @@ def main():
         )
         sys.exit(1)
 
+    # 🌸 BLOOM FILTER — Log de configuração com repo dinâmico pronto
+    logger.info(f"{E['bloom']} ═══ BLOOM FILTER ═══")
+    logger.info(f"{E['bloom']} Repositório HF : {HF_REPO_BLOOM}")
+    logger.info(f"{E['bloom']} Capacidade     : {BLOOM_CAPACITY:,} entradas")
+    logger.info(f"{E['bloom']} Taxa de erro   : {BLOOM_ERROR_RATE * 100:.1f}%")
+    logger.info(f"{E['bloom']} ═══════════════════")
+
     # Download checkpoint from HF
     logger.info(f"{E['download']} Downloading checkpoint from Hugging Face")
     hf_download_checkpoint(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
@@ -1292,7 +1302,6 @@ def main():
     # Se existir, retoma do estado anterior.
     # Se não existir, cria novo automaticamente.
     # =====================================================
-    global bloom_filter
     bloom_filter = load_bloom_filter(api, HF_TOKEN)
     logger.info(
         f"{E['bloom']} Bloom Filter pronto: "
@@ -1363,12 +1372,6 @@ def main():
 
     except KeyboardInterrupt:
         logger.warning(f"{E['warn']} Graceful shutdown initiated")
-        # 🌸 BLOOM FILTER — Guardar mesmo em caso de shutdown gracioso
-        logger.info(f"{E['bloom']} A guardar Bloom Filter antes de sair...")
-        try:
-            save_bloom_filter(api, HF_TOKEN)
-        except Exception:
-            pass
     except Exception as e:
         logger.exception(
             "❌ WORKER FAILURE DETALHADO\n"
@@ -1379,6 +1382,13 @@ def main():
         )
         sys.exit(1)
     finally:
+        # 🌸 BLOOM FILTER — Guardar sempre no graceful shutdown ou interrupções antes de sair
+        if bloom_filter is not None:
+            logger.info(f"{E['bloom']} A assegurar persistência final do Bloom Filter antes do encerramento...")
+            try:
+                save_bloom_filter(api, HF_TOKEN)
+            except Exception as e:
+                logger.error(f"{E['error']} Erro ao salvar Bloom Filter no encerramento: {e}")
         try:
             conn.close()
         except Exception:
