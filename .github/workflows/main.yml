@@ -52,6 +52,17 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      # 🔥 FIX CRÍTICO: dependências de compilação C/C++
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            python3-dev \
+            libffi-dev \
+            libssl-dev \
+            pkg-config
+
       - name: Increase swap space
         run: |
           sudo swapoff -a
@@ -70,31 +81,25 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            python3-dev \
-            libtorrent-rasterbar-dev \
-            libssl-dev \
-            libboost-all-dev \
-            pkg-config
-
-      - name: Upgrade pip
+      - name: Upgrade pip tooling
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
+      # 🔥 FIX CRÍTICO: instala bloom filter FORÇADO antes do resto
+      - name: Install critical dependency (bloom filter)
+        run: |
+          pip install pybloomfiltermmap3==0.5.3
+
       - name: Install Python dependencies
         run: |
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r requirements.txt
 
       - name: Verify critical packages
         run: |
-          python -c "import pybloomfiltermmap3; print('✅ pybloomfiltermmap3 OK')" || true
-          python -c "import duckdb; print('✅ duckdb OK')" || true
-          python -c "import pandas; print('✅ pandas OK')" || true
-          python -c "import pyarrow; print('✅ pyarrow OK')" || true
+          python -c "import pybloomfiltermmap3; print('✅ pybloomfiltermmap3 OK')"
+          python -c "import duckdb; print('✅ duckdb OK')"
+          python -c "import pandas; print('✅ pandas OK')"
+          python -c "import pyarrow; print('✅ pyarrow OK')"
           python -c "from huggingface_hub import hf_hub_download; print('✅ huggingface_hub OK')"
 
       - name: Create data directories
