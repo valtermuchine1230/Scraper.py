@@ -4,6 +4,7 @@ minerador_production.py — Escalável a bilhões de emails com tolerância a fa
 
 INSTALAÇÃO DE DEPENDÊNCIAS:
     pip install -r requirements.txt
+    pip install mmh3  # Substituição do pybloomfiltermmap3
 
 ARQUITETURA:
   FASE 1: Download 5 torrents simultâneos
@@ -25,14 +26,15 @@ OTIMIZAÇÕES DE MEMÓRIA (VERSÃO DISCO):
   - ALTERAÇÃO 5: gc.collect() após cada escrita (ParquetWriter)
   - ALTERAÇÃO 6: Logs detalhados de RAM (% | usada GB | livre GB)
 
-BLOOM FILTER (DEDUPLICAÇÃO EM DISCO — MMAP):
-  - Biblioteca: pybloomfiltermmap3 (disco em vez de RAM)
+BLOOM FILTER (DEDUPLICAÇÃO EM DISCO — MMAP PURE PYTHON):
+  - Implementação: BloomFilterDisk (mmap nativo + mmh3)
+  - Compatibilidade: 100% GitHub Actions (sem compilações C complexas)
   - Capacidade: 1.500.000.000 entradas
   - Taxa de erro: 0.1%
   - Armazenamento: disco local (bloom_filter.bin) via mmap
   - Persistência: Hugging Face Hub (Dinâmico por utilizador)
   - Guardado a cada checkpoint
-  - RAM usada pelo BF: ~200-500 MB em vez de 3-4 GB
+  - RAM usada pelo BF: ~200-500 MB geridos dinamicamente pelo SO
 """
 
 from __future__ import annotations
@@ -48,6 +50,8 @@ import logging
 import shutil
 import psutil
 import gc
+import mmap
+import math
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any, Set
@@ -85,14 +89,14 @@ except ImportError:
     print("   Executar: pip install 'duckdb>=0.9.0'")
     sys.exit(1)
 
-# 🌸 BLOOM FILTER — pybloomfiltermmap3 (disco/mmap em vez de RAM)
+# 🌸 BLOOM FILTER — Dependências nativas + mmh3
 try:
-    from pybloomfiltermmap3 import BloomFilter
+    import mmh3
 except ImportError:
-    print("❌ ERROR: pybloomfiltermmap3 not installed")
-    print("   Executar: pip install 'pybloomfiltermmap3>=0.5.3'")
+    print("❌ ERROR: mmh3 not installed")
+    print("   Executar: pip install mmh3")
     print("")
-    print("   NOTA: Usa mmap/disco em vez de RAM. Reduz uso de RAM de 3-4 GB para ~200 MB.")
+    print("   NOTA: Usado para hashing rápido na implementação de Bloom Filter em Disco.")
     sys.exit(1)
 
 try:
@@ -102,6 +106,79 @@ except ImportError:
     print("❌ ERROR: rich not installed")
     print("   Executar: pip install 'rich>=13.0.0'")
     sys.exit(1)
+
+
+# =====================================================================
+# 🌸 BLOOM FILTER DISK NATIVO (100% Python + OS mmap)
+# =====================================================================
+class BloomFilterDisk:
+    """
+    Bloom Filter implementado nativamente com mmap e mmh3.
+    Altamente estável para GitHub Actions e perfeitamente seguro para a RAM.
+    """
+    def __init__(self, capacity: int, error_rate: float, filename: str):
+        self.capacity = capacity
+        self.error_rate = error_rate
+        self.filename = filename
+
+        # Fórmulas padrão do Bloom Filter
+        self.num_bits = -int((capacity * math.log(error_rate)) / (math.log(2) ** 2))
+        self.num_hashes = int((self.num_bits / capacity) * math.log(2))
+        
+        # Tamanho em bytes (arredondado para cima)
+        self.num_bytes = (self.num_bits + 7) // 8
+        # Adicionamos 8 bytes de cabeçalho para persistir a contagem exata (__len__)
+        self.file_size = 8 + self.num_bytes  
+
+        # Criar ficheiro caso não exista
+        if not os.path.exists(filename):
+            with open(filename, 'wb') as f:
+                f.seek(self.file_size - 1)
+                f.write(b'\0')
+
+        self.file = open(filename, 'r+b')
+        self.mmap = mmap.mmap(self.file.fileno(), self.file_size, access=mmap.ACCESS_WRITE)
+
+    def _get_hashes(self, item: str) -> list[int]:
+        """Gera 'k' hashes utilizando a seed de mmh3."""
+        h1, h2 = mmh3.hash64(item.encode('utf-8'))
+        h1 &= 0xffffffffffffffff
+        h2 &= 0xffffffffffffffff
+        return [(h1 + i * h2) % self.num_bits for i in range(self.num_hashes)]
+
+    def add(self, item: str):
+        """Adiciona um item ativando os bits correspondentes diretamente no mmap."""
+        for bit_idx in self._get_hashes(item):
+            # Os primeiros 8 bytes são o cabeçalho
+            byte_idx = 8 + (bit_idx // 8)
+            bit_offset = bit_idx % 8
+            
+            b = self.mmap[byte_idx]
+            self.mmap[byte_idx] = b | (1 << bit_offset)
+        
+        # Atualizar contagem no cabeçalho (8 bytes) de forma eficiente
+        current_count = int.from_bytes(self.mmap[0:8], byteorder='little')
+        self.mmap[0:8] = (current_count + 1).to_bytes(8, byteorder='little')
+
+    def __contains__(self, item: str) -> bool:
+        """Verifica se o item existe (uso com o operador 'in')."""
+        for bit_idx in self._get_hashes(item):
+            byte_idx = 8 + (bit_idx // 8)
+            bit_offset = bit_idx % 8
+            if not (self.mmap[byte_idx] & (1 << bit_offset)):
+                return False
+        return True
+
+    def __len__(self) -> int:
+        """Retorna o número exato de inserções persistido no disco."""
+        return int.from_bytes(self.mmap[0:8], byteorder='little')
+
+    def close(self):
+        """Força o sync do SO e fecha o ficheiro com segurança."""
+        self.mmap.flush()
+        self.mmap.close()
+        self.file.close()
+
 
 # ===== CONFIGURATION =====
 SAVE_PATH = Path(os.environ.get("SAVE_PATH", "./data"))
@@ -132,14 +209,14 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(64 * 1024 * 1024)))
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 ROWS_PER_PARQUET_FILE = int(os.environ.get("ROWS_PER_PARQUET_FILE", "5000000"))
 
-# 🌸 BLOOM FILTER — Configuração (DISCO via mmap)
+# 🌸 BLOOM FILTER — Configuração (DISCO via mmap nativo)
 BLOOM_FILTER_PATH = SAVE_PATH / "bloom_filter.bin"
 HF_REPO_BLOOM: str | None = None          # Definido dinamicamente no setup do HF
 BLOOM_CAPACITY = 1_500_000_000            # 1.5 bilhões de entradas (com margem)
 BLOOM_ERROR_RATE = 0.001                  # Taxa de erro máxima: 0.1%
 
 # 🌸 BLOOM FILTER — Estado global (partilhado no processo principal)
-bloom_filter: BloomFilter | None = None
+bloom_filter: BloomFilterDisk | None = None
 bloom_lock = Lock()                       # Thread-safe para acessos concorrentes
 
 # MAGNET LINKS
@@ -273,7 +350,7 @@ def is_disposable_email(email: str) -> bool:
 
 # ===== 🌸 BLOOM FILTER — Funções de persistência (DISCO/MMAP) =====
 
-def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
+def load_bloom_filter(api: HfApi, token: str) -> BloomFilterDisk:
     """
     🌸 BLOOM FILTER — Carrega do Hugging Face Hub para disco local e abre via mmap.
     Se o ficheiro não existir no HF, cria um novo Bloom Filter em disco.
@@ -328,8 +405,7 @@ def load_bloom_filter(api: HfApi, token: str) -> BloomFilter:
                 pass
 
     # Abrir (ou criar) Bloom Filter via mmap em disco
-    # pybloomfiltermmap3: se o ficheiro existe → abre; se não existe → cria novo
-    bloom_filter = BloomFilter(
+    bloom_filter = BloomFilterDisk(
         capacity=BLOOM_CAPACITY,
         error_rate=BLOOM_ERROR_RATE,
         filename=str(BLOOM_FILTER_PATH),
@@ -363,13 +439,15 @@ def save_bloom_filter(api: HfApi, token: str):
         return
 
     try:
+        # Garantir que todas as alterações pendentes de mmap são enviadas para o disco OS antes do upload
+        bloom_filter.mmap.flush()
+        
         bf_size_mb = BLOOM_FILTER_PATH.stat().st_size / (1024 ** 2)
         logger.info(
             f"{E['bloom']} A guardar Bloom Filter no HF "
             f"({len(bloom_filter):,} entradas | {bf_size_mb:.1f} MB)..."
         )
 
-        # Com mmap, os dados já estão em disco — basta fazer upload directamente
         api.upload_file(
             path_or_fileobj=str(BLOOM_FILTER_PATH),
             path_in_repo="bloom_filter.bin",
@@ -1265,7 +1343,7 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, checkpoint_repo: 
 
     # =====================================================
     # 🌸 BLOOM FILTER — Guardar no HF junto com o checkpoint
-    # Com mmap, os dados já estão em disco. Apenas fazemos upload do ficheiro.
+    # Com mmap nativo, os dados já estão em disco. Apenas fazemos upload do ficheiro.
     # Garante que nunca se perde progresso em caso de falha ou timeout.
     # =====================================================
     logger.info(f"{E['bloom']} A guardar Bloom Filter no checkpoint...")
@@ -1284,7 +1362,7 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, checkpoint_repo: 
 def main():
     """Main orchestration."""
     global bloom_filter, HF_REPO_BLOOM
-    logger.info(f"{E['start']} Minerador Production v1 (BLOOM FILTER DISCO/MMAP)")
+    logger.info(f"{E['start']} Minerador Production v2 (BLOOM FILTER DISCO/MMAP NATIVO)")
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['info']} CPU cores: {os.cpu_count()}")
     logger.info(f"{E['stats']} Disk usage: {disk_usage(SAVE_PATH)}")
@@ -1297,7 +1375,7 @@ def main():
     logger.info(f"{E['cpu']} ALTERAÇÃO 4: MAX_INFLIGHT = 4 (de 8)")
     logger.info(f"{E['cpu']} ALTERAÇÃO 5: gc.collect() após ParquetWriter")
     logger.info(f"{E['cpu']} ALTERAÇÃO 6: RAM% | usada(GB) | livre(GB)")
-    logger.info(f"{E['bloom']} BLOOM FILTER : pybloomfiltermmap3 (DISCO/MMAP — não RAM)")
+    logger.info(f"{E['bloom']} BLOOM FILTER : BloomFilterDisk (100% Nativo mmap + mmh3)")
     logger.info(f"{E['cpu']} ════════════════════════════════════════")
 
     # Verify HF token
@@ -1319,11 +1397,11 @@ def main():
         sys.exit(1)
 
     # 🌸 BLOOM FILTER — Log de configuração com repo dinâmico pronto
-    logger.info(f"{E['bloom']} ═══ BLOOM FILTER (DISCO/MMAP) ═══")
+    logger.info(f"{E['bloom']} ═══ BLOOM FILTER (DISCO/MMAP NATIVO) ═══")
     logger.info(f"{E['bloom']} Repositório HF : {HF_REPO_BLOOM}")
     logger.info(f"{E['bloom']} Capacidade     : {BLOOM_CAPACITY:,} entradas")
     logger.info(f"{E['bloom']} Taxa de erro   : {BLOOM_ERROR_RATE * 100:.1f}%")
-    logger.info(f"{E['bloom']} Armazenamento  : disco (mmap) — RAM usada ≈ 200 MB")
+    logger.info(f"{E['bloom']} Armazenamento  : disco (mmap) — RAM gerida nativamente pelo SO")
     logger.info(f"{E['bloom']} ══════════════════════════════════")
 
     # Download checkpoint from HF
