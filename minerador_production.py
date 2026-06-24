@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-minerador_production.py — Escalável a bilhões de emails com tolerância a falhas.
+minerador_production.py — Pipeline offline big-data (sem Bloom Filter).
 
-INSTALAÇÃO DE DEPENDÊNCIAS:
+INSTALAÇÃO:
     pip install -r requirements.txt
-    pip install mmh3
 
-ARQUITETURA:
-  FASE 0: Export obrigatório de dados pendentes no DuckDB (se COUNT > 0)
-  FASE 1: Download torrents simultâneos
-  FASE 2: Checkpoint torrents no HF
-  FASE 3: Processar com mmap + regex + ProcessPoolExecutor + STREAMING
-  FASE 4: Gerar raw_chunk_*.parquet (streaming incremental)
-  FASE 5: Carregar chunks → DuckDB (emails_raw)
-  FASE 6: Export obrigatório (dedup + Bloom + Parquet + HF + EXPORT LEDGER)
-  FASE 7: Validação de garantia do ciclo (Parquet OU "NO NEW DATA TO EXPORT")
+ARQUITETURA (4 ETAPAS):
+  ETAPA 1 — Extração bruta: torrents → mmap/regex → raw_chunk_*.parquet (sem dedup)
+  ETAPA 2 — Deduplicação global em disco: DuckDB DISTINCT + anti-join exported_emails
+  ETAPA 3 — Exportação em lotes: emails_batch_0001.(parquet|csv) — 30M linhas/lote
+  ETAPA 4 — Upload HF: apenas batches finais (export ledger / exactly-once)
 
 PERSISTÊNCIA:
-  - Checkpoint   → recuperação de estado (HF minerador_checkpoints)
-  - Export Ledger → exactly-once no HF (state.json.export_ledger)
-  - Bloom Filter → deduplicação global
-  - Emails Parquet → HF_REPO_EMAILS (emails_part_XXXX.parquet)
+  state.json          — checkpoint, export_ledger, etapas
+  emails.duckdb       — emails_raw, emails_deduplicated, exported_emails
+  minerador_checkpoints no HF — retomada
 """
 
 from __future__ import annotations
@@ -34,10 +28,8 @@ import tarfile
 import signal
 import logging
 import shutil
-import psutil
 import gc
 import mmap
-import math
 import hashlib
 import threading
 from pathlib import Path
@@ -77,76 +69,12 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import mmh3
-except ImportError:
-    print("❌ ERROR: mmh3 not installed")
-    print("   Executar: pip install mmh3")
-    sys.exit(1)
-
-try:
     from rich.logging import RichHandler
     from rich.console import Console
 except ImportError:
     print("❌ ERROR: rich not installed")
     print("   Executar: pip install 'rich>=13.0.0'")
     sys.exit(1)
-
-
-# =====================================================================
-# 🔀 BLOOM FILTER DISK NATIVO (100% Python + OS mmap)
-# =====================================================================
-class BloomFilterDisk:
-    def __init__(self, capacity: int, error_rate: float, filename: str):
-        self.capacity = capacity
-        self.error_rate = error_rate
-        self.filename = filename
-
-        self.num_bits = -int((capacity * math.log(error_rate)) / (math.log(2) ** 2))
-        self.num_hashes = int((self.num_bits / capacity) * math.log(2))
-        self.num_bytes = (self.num_bits + 7) // 8
-        self.file_size = 8 + self.num_bytes
-
-        if not os.path.exists(filename):
-            with open(filename, "wb") as f:
-                f.seek(self.file_size - 1)
-                f.write(b"\0")
-
-        self.file = open(filename, "r+b")
-        self.mmap = mmap.mmap(self.file.fileno(), self.file_size, access=mmap.ACCESS_WRITE)
-
-    def _get_hashes(self, item: str) -> list:
-        h1, h2 = mmh3.hash64(item.encode("utf-8"))
-        h1 &= 0xFFFFFFFFFFFFFFFF
-        h2 &= 0xFFFFFFFFFFFFFFFF
-        return [(h1 + i * h2) % self.num_bits for i in range(self.num_hashes)]
-
-    def add(self, item: str):
-        for bit_idx in self._get_hashes(item):
-            byte_idx = 8 + (bit_idx // 8)
-            bit_offset = bit_idx % 8
-            b = self.mmap[byte_idx]
-            self.mmap[byte_idx] = b | (1 << bit_offset)
-        current = int.from_bytes(self.mmap[0:8], byteorder="little")
-        self.mmap[0:8] = (current + 1).to_bytes(8, byteorder="little")
-
-    def __contains__(self, item: str) -> bool:
-        for bit_idx in self._get_hashes(item):
-            byte_idx = 8 + (bit_idx // 8)
-            bit_offset = bit_idx % 8
-            if not (self.mmap[byte_idx] & (1 << bit_offset)):
-                return False
-        return True
-
-    def __len__(self) -> int:
-        return int.from_bytes(self.mmap[0:8], byteorder="little")
-
-    def flush(self):
-        self.mmap.flush()
-
-    def close(self):
-        self.mmap.flush()
-        self.mmap.close()
-        self.file.close()
 
 
 # =====================================================================
@@ -158,6 +86,7 @@ SAVE_PATH.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR = SAVE_PATH / "exports"
 TEMP_DIR = SAVE_PATH / "temp"
 RAW_CHUNKS_DIR = SAVE_PATH / "raw_chunks"
+DEDUP_DIR = SAVE_PATH / "dedup"
 
 DB_PATH = SAVE_PATH / "emails.duckdb"
 STATE_PATH = SAVE_PATH / "state.json"
@@ -165,39 +94,33 @@ LOG_PATH = SAVE_PATH / "minerador.log"
 PROCESSED_CHUNKS_PATH = SAVE_PATH / "processed_chunks.json"
 TORRENT_STATE_PATH = SAVE_PATH / "torrent_state.json"
 
-BLOOM_FILTER_PATH = SAVE_PATH / "bloom_filter.bin"
-BLOOM_META_PATH = SAVE_PATH / "bloom_meta.json"
-BLOOM_COUNT_PATH = SAVE_PATH / "bloom_count.txt"
+DEDUP_PARQUET_PATH = DEDUP_DIR / "emails_deduplicated.parquet"
 
-for d in [EXPORT_DIR, TEMP_DIR, RAW_CHUNKS_DIR]:
+for d in [EXPORT_DIR, TEMP_DIR, RAW_CHUNKS_DIR, DEDUP_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 HF_REPO_EMAILS = os.environ.get("HF_REPO_EMAILS", "emails_dataset")
 HF_REPO_CHECKPOINT = os.environ.get("HF_REPO_CHECKPOINT", "minerador_checkpoints")
-HF_REPO_BLOOM_SUFFIX = os.environ.get("HF_REPO_BLOOM_SUFFIX", "bloom_filter")
 
 CHECKPOINT_INTERVAL_MIN = int(os.environ.get("CHECKPOINT_INTERVAL_MIN", "15"))
-
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "500000"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(64 * 1024 * 1024)))
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 
-EXPORT_BATCH_MIN = int(os.environ.get("EXPORT_BATCH_MIN", "1000000"))
-EXPORT_BATCH_MAX = int(os.environ.get("EXPORT_BATCH_MAX", "5000000"))
-ROWS_PER_PARQUET = int(os.environ.get("ROWS_PER_PARQUET", str(min(EXPORT_BATCH_MAX, 5000000))))
+# Lotes de exportação: 30M (requisito)
+EXPORT_BATCH_SIZE = int(os.environ.get("EXPORT_BATCH_SIZE", "30000000"))
+EXPORT_FORMAT = os.environ.get("EXPORT_FORMAT", "parquet").lower()  # parquet | csv
 
-BLOOM_CAPACITY = 1_500_000_000
-BLOOM_ERROR_RATE = 0.001
+DUCKDB_THREADS = int(os.environ.get("DUCKDB_THREADS", "8"))
+DUCKDB_MEMORY_LIMIT = os.environ.get("DUCKDB_MEMORY_LIMIT", "4GB")
+DUCKDB_TEMP_DIR = os.environ.get("DUCKDB_TEMP_DIR", str(TEMP_DIR))
 
 EXPORT_LEDGER_KEY = "export_ledger"
 EXPORT_ACTIVE_PLAN_KEY = "export_active_plan"
+STAGE_KEY = "pipeline_stage"  # raw | dedup | export | done
 
-HF_REPO_BLOOM: Optional[str] = None
-bloom_filter: Optional[BloomFilterDisk] = None
-bloom_lock = Lock()
 stop_event = Event()
 state_lock = Lock()
 ledger_lock = Lock()
@@ -207,7 +130,7 @@ _g_token: Optional[str] = None
 _g_checkpoint_repo: Optional[str] = None
 _g_periodic_timer: Optional[threading.Timer] = None
 
-_cycle_exported_parquet = False
+_cycle_exported_batch = False
 _cycle_had_pending_at_check = False
 _cycle_ledger_complete = False
 
@@ -243,7 +166,6 @@ E = {
     "info": "🔈",
     "cpu": "⏯",
     "db": "💳",
-    "bloom": "🔀",
     "skip": "🚫",
     "checkpoint": "📩",
     "signal": "❕",
@@ -251,6 +173,7 @@ E = {
     "loop": "➿",
     "export": "📤",
     "ledger": "📒",
+    "dedup": "🧹",
 }
 
 EMAIL_REGEX = re.compile(rb"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", re.IGNORECASE)
@@ -266,7 +189,7 @@ MAGNETS = [
             "&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce"
             "&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce"
             "&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce"
-            "&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce"
+            "&tr=udp%3a%2f%2ftracker.opentracker.i2p.rocks%3a6969%2fannounce"
             "&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce"
             "&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce"
         ),
@@ -426,25 +349,6 @@ def verify_file_integrity(path: Path, min_size: int = 10) -> bool:
     return True
 
 
-def save_bloom_meta():
-    global bloom_filter
-    if bloom_filter is None:
-        return
-    meta = {
-        "capacity": bloom_filter.capacity,
-        "error_rate": bloom_filter.error_rate,
-        "num_bits": bloom_filter.num_bits,
-        "num_hashes": bloom_filter.num_hashes,
-        "num_bytes": bloom_filter.num_bytes,
-        "file_size": bloom_filter.file_size,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-    }
-    with open(BLOOM_META_PATH, "w") as f:
-        json.dump(meta, f, indent=2)
-    with open(BLOOM_COUNT_PATH, "w") as f:
-        f.write(str(len(bloom_filter)))
-
-
 # =====================================================================
 # 📒 EXPORT LEDGER (EXACTLY-ONCE)
 # =====================================================================
@@ -481,13 +385,13 @@ def ledger_max_batch_number(state: Dict[str, Any]) -> int:
     max_n = 0
     for entry in ledger.get("exported_batches", []):
         bid = entry.get("batch_id", "")
-        m = re.match(r"^emails_part_(\d+)$", bid)
+        m = re.match(r"^emails_batch_(\d+)$", bid)
         if m:
             max_n = max(max_n, int(m.group(1)))
     plan = state.get(EXPORT_ACTIVE_PLAN_KEY) or {}
     for b in plan.get("batches", []):
         bid = b.get("batch_id", "")
-        m = re.match(r"^emails_part_(\d+)$", bid)
+        m = re.match(r"^emails_batch_(\d+)$", bid)
         if m:
             max_n = max(max_n, int(m.group(1)))
     return max_n
@@ -514,7 +418,6 @@ def ledger_upsert_entry(state: Dict[str, Any], entry: Dict[str, Any]) -> None:
 
 
 def persist_export_ledger(state: Dict[str, Any]) -> bool:
-    """Persiste export_ledger (e plano activo) em state.json — obrigatório após cada upload."""
     try:
         save_state(state)
         return True
@@ -524,10 +427,6 @@ def persist_export_ledger(state: Dict[str, Any]) -> bool:
 
 
 def build_export_active_plan(state: Dict[str, Any], total_rows: int, batch_size: int) -> Dict[str, Any]:
-    """
-    Plano de batches para uma corrida de exportação.
-    Reutiliza plano existente se total_rows coincidir (recuperação pós-crash).
-    """
     existing = state.get(EXPORT_ACTIVE_PLAN_KEY)
     if (
         isinstance(existing, dict)
@@ -547,7 +446,7 @@ def build_export_active_plan(state: Dict[str, Any], total_rows: int, batch_size:
     offset = 0
     while offset < total_rows:
         limit = min(batch_size, total_rows - offset)
-        batch_id = f"emails_part_{next_num:04d}"
+        batch_id = f"emails_batch_{next_num:04d}"
         status = "uploaded" if ledger_is_uploaded(state, batch_id) else "pending"
         batches.append({
             "batch_id": batch_id,
@@ -586,25 +485,246 @@ def clear_export_active_plan(state: Dict[str, Any]) -> None:
     persist_export_ledger(state)
 
 
-def export_single_batch_parquet(
+# =====================================================================
+# 💳 DUCKDB
+# =====================================================================
+def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(DUCKDB_TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    conn = duckdb.connect(str(db_path))
+    conn.execute(f"PRAGMA threads={DUCKDB_THREADS};")
+    conn.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
+    conn.execute(f"SET temp_directory='{DUCKDB_TEMP_DIR}';")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS emails_raw (
+            email   VARCHAR,
+            nome    VARCHAR,
+            origem  VARCHAR,
+            data    VARCHAR
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS emails_deduplicated (
+            email   VARCHAR,
+            nome    VARCHAR,
+            origem  VARCHAR,
+            data    VARCHAR
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS exported_emails (
+            email VARCHAR PRIMARY KEY
+        );
+    """)
+    conn.commit()
+    return conn
+
+
+def table_exists(conn: duckdb.DuckDBPyConnection, name: str) -> bool:
+    try:
+        r = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
+            [name],
+        ).fetchone()
+        return bool(r and r[0] > 0)
+    except Exception:
+        try:
+            conn.execute(f"SELECT 1 FROM {name} LIMIT 1")
+            return True
+        except Exception:
+            return False
+
+
+def count_table(conn: duckdb.DuckDBPyConnection, name: str) -> int:
+    try:
+        if table_exists(conn, name):
+            return int(conn.execute(f"SELECT COUNT(*) FROM {name};").fetchone()[0])
+    except Exception as e:
+        logger.warning(f"{E['warn']} COUNT {name} falhou: {e}")
+    return 0
+
+
+def list_unloaded_raw_chunks(state: Dict[str, Any]) -> List[Path]:
+    loaded = set(state.get("loaded_chunks", []))
+    chunks = sorted(RAW_CHUNKS_DIR.glob("raw_chunk_*.parquet"))
+    return [p for p in chunks if str(p) not in loaded]
+
+
+def load_raw_chunks_into_duckdb(
+    conn: duckdb.DuckDBPyConnection,
+    state: Dict[str, Any],
+    api: HfApi,
+    token: str,
+    checkpoint_repo: str,
+) -> int:
+    """Ingestão streaming de shards Parquet → emails_raw (sem dedup)."""
+    loaded = state.get("loaded_chunks", [])
+    new_files = list_unloaded_raw_chunks(state)
+    if not new_files:
+        return 0
+
+    logger.info(f"{E['db']} A carregar {len(new_files)} raw chunks → emails_raw")
+    n_loaded = 0
+    for chunk_file in new_files:
+        if stop_event.is_set():
+            break
+        try:
+            conn.execute(f"""
+                INSERT INTO emails_raw
+                SELECT email, nome, origem, data
+                FROM read_parquet('{chunk_file}');
+            """)
+            conn.commit()
+            loaded.append(str(chunk_file))
+            state["loaded_chunks"] = loaded
+            save_state(state)
+            save_processed_chunks(state)
+            n_loaded += 1
+            logger.info(f"{E['db']} Carregado: {chunk_file.name}")
+        except Exception as e:
+            logger.exception(f"{E['error']} Falha read_parquet {chunk_file.name}: {e}")
+    if n_loaded:
+        upload_checkpoint_to_hf(api, token, checkpoint_repo)
+    return n_loaded
+
+
+# =====================================================================
+# ETAPA 2 — DEDUPLICAÇÃO GLOBAL (DISCO)
+# =====================================================================
+def run_global_deduplication(
+    conn: duckdb.DuckDBPyConnection,
+    state: Dict[str, Any],
+) -> int:
+    """
+    DISTINCT em disco via DuckDB + exclusão de emails já exportados (exported_emails).
+    Substitui Bloom Filter — nunca usa set() com dataset inteiro em RAM.
+    """
+    raw_n = count_table(conn, "emails_raw")
+    if raw_n == 0:
+        logger.info(f"{E['info']} emails_raw vazio — nada para deduplicar")
+        return count_table(conn, "emails_deduplicated")
+
+    logger.info(
+        f"{E['dedup']} ETAPA 2: dedup global (raw={raw_n:,}) — DuckDB DISTINCT + spill"
+    )
+
+    conn.execute("DROP TABLE IF EXISTS emails_deduplicated_new;")
+    conn.execute("""
+        CREATE TABLE emails_deduplicated_new AS
+        SELECT DISTINCT
+            LOWER(TRIM(r.email)) AS email,
+            ANY_VALUE(r.nome)    AS nome,
+            ANY_VALUE(r.origem)  AS origem,
+            ANY_VALUE(r.data)    AS data
+        FROM emails_raw r
+        WHERE r.email IS NOT NULL AND TRIM(r.email) <> ''
+        GROUP BY LOWER(TRIM(r.email));
+    """)
+
+    conn.execute("DROP TABLE IF EXISTS emails_to_export;")
+    conn.execute("""
+        CREATE TABLE emails_to_export AS
+        SELECT d.email, d.nome, d.origem, d.data
+        FROM emails_deduplicated_new d
+        LEFT JOIN exported_emails e ON d.email = e.email
+        WHERE e.email IS NULL;
+    """)
+
+    conn.execute("DROP TABLE IF EXISTS emails_deduplicated;")
+    conn.execute("ALTER TABLE emails_to_export RENAME TO emails_deduplicated;")
+    conn.execute("DROP TABLE IF EXISTS emails_deduplicated_new;")
+    conn.commit()
+
+    n = count_table(conn, "emails_deduplicated")
+    logger.info(f"{E['stats']} emails_deduplicated (novos vs exportados): {n:,}")
+
+    try:
+        conn.execute(f"""
+            COPY emails_deduplicated TO '{DEDUP_PARQUET_PATH}'
+            (FORMAT PARQUET, COMPRESSION ZSTD);
+        """)
+        conn.commit()
+        logger.info(f"{E['ok']} Snapshot: {DEDUP_PARQUET_PATH.name} ({human(DEDUP_PARQUET_PATH.stat().st_size)})")
+    except Exception as e:
+        logger.warning(f"{E['warn']} COPY dedup parquet falhou (tabela DuckDB OK): {e}")
+
+    state[STAGE_KEY] = "dedup"
+    state["dedup_completed_at"] = datetime.now(timezone.utc).isoformat()
+    state["dedup_row_count"] = n
+    save_state(state)
+    return n
+
+
+def register_exported_emails_from_batch(
+    conn: duckdb.DuckDBPyConnection,
+    batch_id: str,
+    offset: int,
+    limit: int,
+) -> None:
+    """Persiste emails do lote em exported_emails (dedup global entre corridas)."""
+    conn.execute(f"""
+        INSERT OR IGNORE INTO exported_emails (email)
+        SELECT email FROM emails_deduplicated
+        ORDER BY email
+        LIMIT {int(limit)} OFFSET {int(offset)};
+    """)
+    conn.commit()
+
+
+def clear_raw_after_dedup(conn: duckdb.DuckDBPyConnection, state: Dict[str, Any]):
+    """Liberta staging raw após dedup bem-sucedida (disco como fonte de verdade)."""
+    logger.info(f"{E['clean']} TRUNCATE emails_raw (pós-dedup)")
+    conn.execute("DELETE FROM emails_raw;")
+    conn.commit()
+
+
+# =====================================================================
+# ETAPA 3 — EXPORTAÇÃO EM LOTES (30M)
+# =====================================================================
+def batch_file_extension() -> str:
+    return "csv" if EXPORT_FORMAT == "csv" else "parquet"
+
+
+def export_single_batch_file(
     conn: duckdb.DuckDBPyConnection,
     batch_id: str,
     offset: int,
     limit: int,
 ) -> Tuple[Optional[Path], int]:
-    df = conn.execute(
-        f"""
-        SELECT email, nome, origem, data FROM emails
-        ORDER BY email
-        LIMIT {int(limit)} OFFSET {int(offset)};
-        """
-    ).fetchdf()
-    if df.empty:
+    ext = batch_file_extension()
+    out = EXPORT_DIR / f"{batch_id}.{ext}"
+
+    if EXPORT_FORMAT == "csv":
+        conn.execute(f"""
+            COPY (
+                SELECT email, nome, origem, data
+                FROM emails_deduplicated
+                ORDER BY email
+                LIMIT {int(limit)} OFFSET {int(offset)}
+            ) TO '{out}' (HEADER, DELIMITER ',');
+        """)
+    else:
+        conn.execute(f"""
+            COPY (
+                SELECT email, nome, origem, data
+                FROM emails_deduplicated
+                ORDER BY email
+                LIMIT {int(limit)} OFFSET {int(offset)}
+            ) TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD);
+        """)
+    conn.commit()
+
+    if not out.exists() or out.stat().st_size < 10:
         return None, 0
-    out = EXPORT_DIR / f"{batch_id}.parquet"
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    pq.write_table(table, str(out), compression="snappy")
-    return out, len(df)
+
+    row_count = conn.execute(f"""
+        SELECT COUNT(*) FROM (
+            SELECT email FROM emails_deduplicated
+            ORDER BY email
+            LIMIT {int(limit)} OFFSET {int(offset)}
+        ) t;
+    """).fetchone()[0]
+    return out, int(row_count)
 
 
 def run_ledger_export_pipeline(
@@ -616,13 +736,9 @@ def run_ledger_export_pipeline(
     total_rows: int,
     label: str,
 ) -> Tuple[bool, int, bool]:
-    """
-    Exportação exactly-once com ledger.
-    Retorna: (sucesso_completo, batches_uploaded_nesta_exec, all_batches_uploaded)
-    """
-    global _cycle_exported_parquet
+    global _cycle_exported_batch
 
-    batch_size = max(EXPORT_BATCH_MIN, min(ROWS_PER_PARQUET, EXPORT_BATCH_MAX))
+    batch_size = EXPORT_BATCH_SIZE
     plan = build_export_active_plan(state, total_rows, batch_size)
     batches = plan.get("batches", [])
     uploaded_this_run = 0
@@ -639,7 +755,7 @@ def run_ledger_export_pipeline(
 
         if status == "uploaded" or ledger_is_uploaded(state, batch_id):
             logger.info(
-                f"{E['skip']} [{label}] batch_id={batch_id} já uploaded no ledger — IGNORAR"
+                f"{E['skip']} [{label}] batch_id={batch_id} já uploaded — IGNORAR"
             )
             batch["status"] = "uploaded"
             state[EXPORT_ACTIVE_PLAN_KEY] = plan
@@ -647,7 +763,7 @@ def run_ledger_export_pipeline(
             continue
 
         logger.info(
-            f"{E['export']} [{label}] A processar {batch_id} "
+            f"{E['export']} [{label}] ETAPA 3: {batch_id} "
             f"(offset={offset:,}, limit={limit:,})"
         )
 
@@ -660,11 +776,9 @@ def run_ledger_export_pipeline(
         })
         persist_export_ledger(state)
 
-        parquet_path, row_count = export_single_batch_parquet(
-            conn, batch_id, offset, limit
-        )
-        if parquet_path is None or row_count == 0:
-            logger.error(f"{E['error']} [{label}] Parquet vazio para {batch_id}")
+        out_path, row_count = export_single_batch_file(conn, batch_id, offset, limit)
+        if out_path is None or row_count == 0:
+            logger.error(f"{E['error']} [{label}] Batch vazio para {batch_id}")
             ledger_upsert_entry(state, {
                 "batch_id": batch_id,
                 "row_count": 0,
@@ -678,7 +792,7 @@ def run_ledger_export_pipeline(
             persist_export_ledger(state)
             return False, uploaded_this_run, False
 
-        checksum = compute_file_sha256(parquet_path)
+        checksum = compute_file_sha256(out_path)
         ledger_upsert_entry(state, {
             "batch_id": batch_id,
             "row_count": row_count,
@@ -690,8 +804,8 @@ def run_ledger_export_pipeline(
         state[EXPORT_ACTIVE_PLAN_KEY] = plan
         persist_export_ledger(state)
 
-        repo_path = parquet_path.name
-        upload_ok = _hf_upload_file(api, token, emails_repo, parquet_path, repo_path)
+        repo_path = out_path.name
+        upload_ok = _hf_upload_file(api, token, emails_repo, out_path, repo_path)
         if not upload_ok:
             logger.error(
                 f"{E['error']} [{label}] Upload falhou para {batch_id} — "
@@ -709,6 +823,8 @@ def run_ledger_export_pipeline(
             persist_export_ledger(state)
             return False, uploaded_this_run, False
 
+        register_exported_emails_from_batch(conn, batch_id, offset, limit)
+
         ts_uploaded = datetime.now(timezone.utc).isoformat()
         ledger_upsert_entry(state, {
             "batch_id": batch_id,
@@ -721,27 +837,143 @@ def run_ledger_export_pipeline(
         state[EXPORT_ACTIVE_PLAN_KEY] = plan
         if not persist_export_ledger(state):
             logger.error(
-                f"{E['error']} [{label}] Upload OK mas falha ao persistir ledger — "
-                f"abortar antes de DROP"
+                f"{E['error']} [{label}] Upload OK mas ledger não persistido — abortar"
             )
             return False, uploaded_this_run, False
 
         try:
-            parquet_path.unlink()
+            out_path.unlink()
         except Exception:
             pass
 
         uploaded_this_run += 1
-        _cycle_exported_parquet = True
+        _cycle_exported_batch = True
         logger.info(
-            f"{E['ok']} [{label}] {batch_id} uploaded e registado no ledger "
-            f"({row_count:,} linhas)"
+            f"{E['ok']} [{label}] ETAPA 4: {batch_id} no HF ({row_count:,} linhas)"
         )
 
     all_ok = active_plan_all_uploaded(plan)
     return all_ok, uploaded_this_run, all_ok
 
 
+def drop_deduplicated_after_confirmed_upload(conn: duckdb.DuckDBPyConnection):
+    logger.info(f"{E['clean']} Limpar emails_deduplicated após export completo")
+    conn.execute("DELETE FROM emails_deduplicated;")
+    conn.commit()
+    try:
+        if DEDUP_PARQUET_PATH.exists():
+            DEDUP_PARQUET_PATH.unlink()
+    except Exception:
+        pass
+
+
+def process_pending_export_pipeline(
+    conn: duckdb.DuckDBPyConnection,
+    api: HfApi,
+    token: str,
+    emails_repo: str,
+    checkpoint_repo: str,
+    state: Dict[str, Any],
+    label: str = "ciclo",
+) -> bool:
+    global _cycle_exported_batch, _cycle_ledger_complete
+
+    load_raw_chunks_into_duckdb(conn, state, api, token, checkpoint_repo)
+
+    raw_n = count_table(conn, "emails_raw")
+    dedup_n = count_table(conn, "emails_deduplicated")
+    exported_registry_n = count_table(conn, "exported_emails")
+
+    logger.info(
+        f"{E['db']} [{label}] raw={raw_n:,} dedup_pending={dedup_n:,} "
+        f"exported_registry={exported_registry_n:,}"
+    )
+
+    plan = state.get(EXPORT_ACTIVE_PLAN_KEY)
+    if raw_n == 0 and dedup_n == 0:
+        if isinstance(plan, dict) and not active_plan_all_uploaded(plan):
+            logger.error(
+                f"{E['error']} [{label}] export_active_plan incompleto sem dados — retomar depois"
+            )
+            _cycle_had_pending_at_check = True
+        else:
+            logger.info(f"{E['info']} [{label}] NO NEW DATA TO EXPORT")
+        return False
+
+    if raw_n > 0:
+        dedup_n = run_global_deduplication(conn, state)
+        clear_raw_after_dedup(conn, state)
+
+    if dedup_n == 0:
+        logger.info(f"{E['info']} [{label}] Nenhum email novo após dedup global")
+        drop_deduplicated_after_confirmed_upload(conn)
+        clear_export_active_plan(state)
+        return False
+
+    all_uploaded, n_up, ledger_complete = run_ledger_export_pipeline(
+        conn, api, token, emails_repo, state, dedup_n, label
+    )
+
+    if not ledger_complete:
+        logger.error(
+            f"{E['error']} [{label}] Export ledger INCOMPLETO — manter dados para retomada"
+        )
+        _cycle_had_pending_at_check = True
+        upload_checkpoint_to_hf(api, token, checkpoint_repo)
+        return False
+
+    drop_deduplicated_after_confirmed_upload(conn)
+    clear_export_active_plan(state)
+
+    state["last_export"] = datetime.now(timezone.utc).isoformat()
+    state["last_export_rows"] = dedup_n
+    state["last_export_files"] = n_up
+    state[STAGE_KEY] = "done"
+    persist_export_ledger(state)
+    save_processed_chunks(state)
+    save_torrent_state(state)
+    upload_checkpoint_to_hf(api, token, checkpoint_repo)
+
+    _cycle_ledger_complete = True
+    _cycle_exported_batch = True
+    logger.info(
+        f"{E['ok']} [{label}] Exactly-once: {n_up} batch(es) uploaded"
+    )
+    return True
+
+
+def validate_cycle_export_guarantee(
+    conn: duckdb.DuckDBPyConnection,
+    state: Dict[str, Any],
+) -> int:
+    global _cycle_exported_batch, _cycle_ledger_complete
+
+    pending_raw = count_table(conn, "emails_raw")
+    pending_dedup = count_table(conn, "emails_deduplicated")
+    plan = state.get(EXPORT_ACTIVE_PLAN_KEY)
+
+    if pending_raw > 0 or pending_dedup > 0:
+        logger.error(
+            f"{E['error']} ERRO LÓGICO: dados pendentes raw={pending_raw:,} "
+            f"dedup={pending_dedup:,} após ciclo"
+        )
+        return 3
+
+    if isinstance(plan, dict) and not active_plan_all_uploaded(plan):
+        logger.error(f"{E['error']} ERRO LÓGICO: export_active_plan incompleto")
+        return 3
+
+    if _cycle_exported_batch or _cycle_ledger_complete:
+        logger.info(f"{E['ok']} GARANTIA CICLO: batches no export_ledger")
+        return 0
+
+    logger.info(f"{E['info']} NO NEW DATA TO EXPORT")
+    return 0
+
+
+# =====================================================================
+# HF CHECKPOINT
+# =====================================================================
 def _hf_download_single(
     api: HfApi,
     token: str,
@@ -790,34 +1022,10 @@ def load_checkpoint_from_hf(api: HfApi, token: str, checkpoint_repo: str) -> Dic
             results[filename] = False
             logger.info(f"{E['info']} {filename} não encontrado no HF")
     if any_ok:
-        logger.info("📥 Checkpoint recuperado do HF (inclui export_ledger em state.json)")
+        logger.info("📥 Checkpoint recuperado (export_ledger + exported_emails no DuckDB)")
     else:
         logger.info(f"{E['info']} Nenhum checkpoint remoto — início do zero")
     return results
-
-
-def load_bloom_from_hf(api: HfApi, token: str) -> bool:
-    global HF_REPO_BLOOM
-    if not HF_REPO_BLOOM:
-        return False
-    logger.info(f"{E['bloom']} A recuperar Bloom Filter do HF ({HF_REPO_BLOOM})...")
-    files = [
-        ("bloom_filter.bin", BLOOM_FILTER_PATH),
-        ("bloom_meta.json", BLOOM_META_PATH),
-        ("bloom_count.txt", BLOOM_COUNT_PATH),
-    ]
-    bloom_ok = False
-    for filename, local_path in files:
-        result = _hf_download_single(api, token, HF_REPO_BLOOM, filename, SAVE_PATH)
-        if result:
-            if filename == "bloom_filter.bin":
-                bloom_ok = True
-            logger.info(f"{E['ok']} Descarregado: {filename}")
-        else:
-            logger.info(f"{E['info']} {filename} não encontrado no HF")
-    if bloom_ok:
-        logger.info("📥 Bloom Filter recuperado do HF")
-    return bloom_ok
 
 
 def _hf_upload_file(
@@ -833,7 +1041,7 @@ def _hf_upload_file(
         return False
     size = local_path.stat().st_size
     if size == 0:
-        logger.warning(f"{E['warn']} Ficheiro vazio: {local_path.name}")
+        logger.warning(f"{E['warn']} Ficheiro vazio: {local_path.name} — skip upload")
         return False
     for attempt in range(1, max_retries + 1):
         try:
@@ -845,8 +1053,7 @@ def _hf_upload_file(
                 token=token,
             )
             logger.info(
-                f"{E['upload']} Upload OK (HTTP sucesso HF API): {repo_path} "
-                f"({human(size)}) → {repo_id}"
+                f"{E['upload']} Upload OK: {repo_path} ({human(size)}) → {repo_id}"
             )
             return True
         except Exception as e:
@@ -860,29 +1067,8 @@ def _hf_upload_file(
     return False
 
 
-def upload_bloom_to_hf(api: HfApi, token: str) -> bool:
-    global bloom_filter, HF_REPO_BLOOM
-    if bloom_filter is None or not HF_REPO_BLOOM:
-        return False
-    if not BLOOM_FILTER_PATH.exists():
-        return False
-    bloom_filter.flush()
-    save_bloom_meta()
-    files = [
-        (BLOOM_FILTER_PATH, "bloom_filter.bin"),
-        (BLOOM_META_PATH, "bloom_meta.json"),
-        (BLOOM_COUNT_PATH, "bloom_count.txt"),
-    ]
-    all_ok = True
-    for local_path, repo_path in files:
-        if local_path.exists():
-            if not _hf_upload_file(api, token, HF_REPO_BLOOM, local_path, repo_path):
-                all_ok = False
-    return all_ok
-
-
 def upload_checkpoint_to_hf(api: HfApi, token: str, checkpoint_repo: str) -> bool:
-    logger.info(f"{E['checkpoint']} A enviar checkpoint para HF ({checkpoint_repo})...")
+    logger.info(f"{E['checkpoint']} Checkpoint → HF ({checkpoint_repo})")
     files = [
         (STATE_PATH, "state.json"),
         (DB_PATH, "emails.duckdb"),
@@ -893,6 +1079,8 @@ def upload_checkpoint_to_hf(api: HfApi, token: str, checkpoint_repo: str) -> boo
     for local_path, repo_path in files:
         if not local_path.exists():
             continue
+        if local_path == DB_PATH and local_path.stat().st_size == 0:
+            continue
         if not _hf_upload_file(api, token, checkpoint_repo, local_path, repo_path):
             all_ok = False
     return all_ok
@@ -900,7 +1088,6 @@ def upload_checkpoint_to_hf(api: HfApi, token: str, checkpoint_repo: str) -> boo
 
 def save_full_checkpoint(api: HfApi, token: str, checkpoint_repo: str):
     try:
-        upload_bloom_to_hf(api, token)
         upload_checkpoint_to_hf(api, token, checkpoint_repo)
     except Exception as e:
         logger.exception(f"{E['error']} save_full_checkpoint: {e}")
@@ -943,415 +1130,147 @@ def stop_periodic_checkpoint():
         _g_periodic_timer = None
 
 
-def init_bloom_filter(api: HfApi, token: str) -> BloomFilterDisk:
-    global bloom_filter, HF_REPO_BLOOM
-    if not HF_REPO_BLOOM:
-        raise RuntimeError("HF_REPO_BLOOM não configurado")
-    try:
-        api.create_repo(
-            repo_id=HF_REPO_BLOOM, token=token, repo_type="dataset", private=True
-        )
-    except Exception as e:
-        msg = str(e).lower()
-        if "already exists" not in msg and "409" not in msg:
-            logger.warning(f"{E['warn']} create_repo bloom: {e}")
-    bloom_filter = BloomFilterDisk(
-        capacity=BLOOM_CAPACITY,
-        error_rate=BLOOM_ERROR_RATE,
-        filename=str(BLOOM_FILTER_PATH),
-    )
-    logger.info(
-        f"{E['bloom']} Bloom mmap: \~{len(bloom_filter):,} entradas | "
-        f"{human(BLOOM_FILTER_PATH.stat().st_size if BLOOM_FILTER_PATH.exists() else 0)}"
-    )
-    return bloom_filter
-
-
-def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(db_path))
-    conn.execute("PRAGMA threads=8;")
-    conn.execute("PRAGMA memory_limit='8GB';")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS emails_raw (
-            email   VARCHAR PRIMARY KEY,
-            nome    VARCHAR,
-            origem  VARCHAR,
-            data    VARCHAR
-        );
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS emails (
-            email   VARCHAR PRIMARY KEY,
-            nome    VARCHAR,
-            origem  VARCHAR,
-            data    VARCHAR
-        );
-    """)
-    conn.commit()
-    return conn
-
-
-def table_exists(conn: duckdb.DuckDBPyConnection, name: str) -> bool:
-    try:
-        r = conn.execute(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
-            [name],
-        ).fetchone()
-        return bool(r and r[0] > 0)
-    except Exception:
+# =====================================================================
+# ETAPA 1 — EXTRAÇÃO BRUTA (sem dedup)
+# =====================================================================
+def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List[Tuple]:
+    results = []
+    data_iso = datetime.now(timezone.utc).isoformat()
+    for match in EMAIL_REGEX.finditer(chunk_data):
         try:
-            conn.execute(f"SELECT 1 FROM {name} LIMIT 1")
-            return True
-        except Exception:
-            return False
-
-
-def count_emails_table(conn: duckdb.DuckDBPyConnection) -> int:
-    try:
-        if table_exists(conn, "emails"):
-            return int(conn.execute("SELECT COUNT(*) FROM emails;").fetchone()[0])
-    except Exception as e:
-        logger.warning(f"{E['warn']} COUNT emails falhou: {e}")
-    return 0
-
-
-def count_emails_raw_table(conn: duckdb.DuckDBPyConnection) -> int:
-    try:
-        if table_exists(conn, "emails_raw"):
-            return int(conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0])
-    except Exception as e:
-        logger.warning(f"{E['warn']} COUNT emails_raw falhou: {e}")
-    return 0
-
-
-def get_pending_email_count(conn: duckdb.DuckDBPyConnection) -> int:
-    """
-    CORREÇÃO CRÍTICA: Retorna a SOMA de emails em AMBAS as tabelas.
-    Antes retornava apenas o máximo, o que fazia com que dados em emails_raw
-    fossem ignorados se a tabela emails existisse mas estivesse vazia.
-    """
-    raw_count = 0
-    clean_count = 0
-    
-    try:
-        if table_exists(conn, "emails_raw"):
-            raw_count = int(conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0])
-    except Exception as e:
-        logger.warning(f"{E['warn']} Falha ao contar emails_raw: {e}")
-    
-    try:
-        if table_exists(conn, "emails"):
-            clean_count = int(conn.execute("SELECT COUNT(*) FROM emails;").fetchone()[0])
-    except Exception as e:
-        logger.warning(f"{E['warn']} Falha ao contar emails: {e}")
-    
-    total = raw_count + clean_count
-    return total
-
-
-def count_pending_export(conn: duckdb.DuckDBPyConnection) -> int:
-    return get_pending_email_count(conn)
-
-
-def prepare_emails_table_sql_dedup(conn: duckdb.DuckDBPyConnection) -> int:
-    logger.info(f"{E['clean']} Deduplicação SQL (DISTINCT) → tabela emails")
-    conn.execute("DROP TABLE IF EXISTS emails_new;")
-    has_emails = table_exists(conn, "emails")
-    has_raw = table_exists(conn, "emails_raw")
-    n_old = count_emails_table(conn) if has_emails else 0
-    n_raw = count_emails_raw_table(conn) if has_raw else 0
-    
-    logger.info(f"{E['db']} Preparando dedup: emails={n_old:,}, emails_raw={n_raw:,}")
-    
-    if has_emails and n_old > 0 and has_raw and n_raw > 0:
-        # Ambas as tabelas têm dados - fazer UNION ALL
-        conn.execute("""
-            CREATE TABLE emails_new AS
-            SELECT DISTINCT email, nome, origem, data
-            FROM (
-                SELECT email, nome, origem, data FROM emails_raw
-                UNION ALL
-                SELECT email, nome, origem, data FROM emails
-            ) AS u
-            WHERE email IS NOT NULL AND email <> '';
-        """)
-    elif has_raw and n_raw > 0:
-        # Só emails_raw tem dados
-        conn.execute("""
-            CREATE TABLE emails_new AS
-            SELECT DISTINCT email, nome, origem, data
-            FROM emails_raw
-            WHERE email IS NOT NULL AND email <> '';
-        """)
-    elif has_emails and n_old > 0:
-        # Só emails tem dados (caso raro, mas possível)
-        conn.execute("""
-            CREATE TABLE emails_new AS
-            SELECT DISTINCT email, nome, origem, data
-            FROM emails
-            WHERE email IS NOT NULL AND email <> '';
-        """)
-    else:
-        # Nenhuma tabela tem dados - criar vazia
-        conn.execute("""
-            CREATE TABLE emails_new (
-                email   VARCHAR PRIMARY KEY,
-                nome    VARCHAR,
-                origem  VARCHAR,
-                data    VARCHAR
-            );
-        """)
-    
-    conn.execute("DROP TABLE IF EXISTS emails;")
-    conn.execute("ALTER TABLE emails_new RENAME TO emails;")
-    conn.commit()
-    count = int(conn.execute("SELECT COUNT(*) FROM emails;").fetchone()[0])
-    logger.info(f"{E['stats']} emails após DISTINCT: {count:,}")
-    return count
-
-
-def bloom_filter_dedup_emails_table(conn: duckdb.DuckDBPyConnection) -> Tuple[int, int]:
-    global bloom_filter
-    if bloom_filter is None:
-        logger.warning(f"{E['warn']} Bloom não inicializado — export sem filtro Bloom")
-        return count_emails_table(conn), 0
-
-    logger.info(f"{E['bloom']} Deduplicação final via Bloom Filter (size: {len(bloom_filter):,})")
-    total = count_emails_table(conn)
-    if total == 0:
-        return 0, 0
-
-    offset = 0
-    batch = 250_000
-    kept_rows: List[Tuple] = []
-    skipped = 0
-    kept = 0
-
-    while offset < total and not stop_event.is_set():
-        df = conn.execute(
-            f"""
-            SELECT email, nome, origem, data FROM emails
-            ORDER BY email
-            LIMIT {batch} OFFSET {offset};
-            """
-        ).fetchdf()
-        if df.empty:
-            break
-        for row in df.itertuples(index=False, name=None):
-            email = str(row[0]).strip().lower()
-            if not email:
+            email_b = match.group()
+            email = email_b.decode("utf8", "ignore").strip().lower()
+            if not email or "@" not in email or is_disposable_email(email):
                 continue
-            with bloom_lock:
-                if email in bloom_filter:
-                    skipped += 1
-                    continue
-                bloom_filter.add(email)
-            kept_rows.append((email, row[1], row[2], row[3]))
-            kept += 1
-        offset += batch
-
-    conn.execute("DROP TABLE IF EXISTS emails;")
-    conn.execute("""
-        CREATE TABLE emails (
-            email   VARCHAR PRIMARY KEY,
-            nome    VARCHAR,
-            origem  VARCHAR,
-            data    VARCHAR
-        );
-    """)
-    if kept_rows:
-        for i in range(0, len(kept_rows), BATCH_INSERT_DDB):
-            chunk = kept_rows[i : i + BATCH_INSERT_DDB]
-            for rec in chunk:
-                try:
-                    conn.execute(
-                        "INSERT INTO emails VALUES (?, ?, ?, ?)", list(rec)
-                    )
-                except Exception:
-                    pass
-            conn.commit()
-
-    logger.info(
-        f"{E['bloom']} Bloom dedup: {kept:,} únicos para export | "
-        f"{E['skip']} {skipped:,} já conhecidos"
-    )
-    bloom_filter.flush()
-    save_bloom_meta()
-    return kept, skipped
+            local_part = email.split("@")[0]
+            local_part = re.sub(r"\d+", "", local_part)
+            local_part = re.sub(r"[_.\\-]+", " ", local_part).strip()
+            nome = " ".join(p.capitalize() for p in local_part.split()) if local_part else ""
+            results.append((email, nome, origin, data_iso))
+        except Exception:
+            continue
+    return results
 
 
-def drop_emails_after_confirmed_upload(conn: duckdb.DuckDBPyConnection):
-    logger.info(f"{E['clean']} DROP TABLE emails (todos batches uploaded + ledger persistido)")
-    conn.execute("DROP TABLE IF EXISTS emails;")
-    conn.execute("DROP TABLE IF EXISTS emails_raw;")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS emails_raw (
-            email   VARCHAR PRIMARY KEY,
-            nome    VARCHAR,
-            origem  VARCHAR,
-            data    VARCHAR
-        );
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS emails (
-            email   VARCHAR PRIMARY KEY,
-            nome    VARCHAR,
-            origem  VARCHAR,
-            data    VARCHAR
-        );
-    """)
-    conn.commit()
-
-
-def process_pending_duckdb_export(
-    conn: duckdb.DuckDBPyConnection,
+def process_tar_with_mmap(
+    tar_path: Path,
+    origin: str,
     api: HfApi,
     token: str,
-    emails_repo: str,
     checkpoint_repo: str,
     state: Dict[str, Any],
-    label: str = "ciclo",
-) -> bool:
-    global _cycle_exported_parquet, _cycle_ledger_complete
-
-    # DIAGNÓSTICO: Mostrar contagem exata de ambas as tabelas
-    raw_count = count_emails_raw_table(conn)
-    clean_count = count_emails_table(conn)
-    pending = raw_count + clean_count
-    
-    logger.info(f"{E['db']} [{label}] DIAGNÓSTICO: emails_raw={raw_count:,}, emails={clean_count:,}, total={pending:,}")
-    
-    if bloom_filter is not None:
-        logger.info(f"{E['bloom']} [{label}] Bloom filter size: {len(bloom_filter):,}")
-
-    if pending == 0:
-        plan = state.get(EXPORT_ACTIVE_PLAN_KEY)
-        if isinstance(plan, dict) and not active_plan_all_uploaded(plan):
-            logger.error(
-                f"{E['error']} [{label}] export_active_plan incompleto sem dados no DuckDB — "
-                f"retomar na próxima execução"
-            )
-            _cycle_had_pending_at_check = True
-        else:
-            logger.info(f"{E['info']} [{label}] NO NEW DATA TO EXPORT")
-        return False
-
-    logger.warning(
-        f"{E['export']} [{label}] EXISTE DADOS PENDENTES PARA EXPORTAÇÃO ({pending:,})"
-    )
-
-    # CORREÇÃO CRÍTICA: Sempre garantir que dados em emails_raw sejam movidos para emails
-    if raw_count > 0:
-        logger.info(f"{E['clean']} [{label}] Movendo {raw_count:,} registos de emails_raw → emails")
-        prepare_emails_table_sql_dedup(conn)
-    elif clean_count == 0:
-        # Se não há dados em nenhuma tabela, não há nada para exportar
-        logger.info(f"{E['info']} [{label}] Tabela emails vazia após preparação")
-        return False
-
-    # Verificar novamente após dedup
-    final_count = count_emails_table(conn)
-    logger.info(f"{E['db']} [{label}] Pronto para export: {final_count:,} emails na tabela 'emails'")
-
-    if final_count == 0:
-        logger.info(f"{E['info']} [{label}] Tabela emails vazia após deduplicação")
-        return False
-
-    kept, _ = bloom_filter_dedup_emails_table(conn)
-    if kept == 0:
-        logger.info(
-            f"{E['info']} [{label}] Todos os emails já estão no Bloom filter — limpar DuckDB sem exportar Parquet"
-        )
-        drop_emails_after_confirmed_upload(conn)
-        clear_export_active_plan(state)
-        state["last_export"] = datetime.now(timezone.utc).isoformat()
-        state["last_export_rows"] = 0
-        persist_export_ledger(state)
-        save_processed_chunks(state)
-        save_full_checkpoint(api, token, checkpoint_repo)
-        return False
-
-    all_uploaded, n_up, ledger_complete = run_ledger_export_pipeline(
-        conn, api, token, emails_repo, state, kept, label
-    )
-
-    if not ledger_complete:
-        logger.error(
-            f"{E['error']} [{label}] Export ledger INCOMPLETO — "
-            f"NÃO executar DROP TABLE emails"
-        )
-        _cycle_had_pending_at_check = True
-        save_full_checkpoint(api, token, checkpoint_repo)
-        return False
-
-    drop_emails_after_confirmed_upload(conn)
-    clear_export_active_plan(state)
-
-    state["last_export"] = datetime.now(timezone.utc).isoformat()
-    state["last_export_rows"] = kept
-    state["last_export_files"] = n_up
-    persist_export_ledger(state)
-    save_processed_chunks(state)
-    save_torrent_state(state)
-    save_full_checkpoint(api, token, checkpoint_repo)
-
-    _cycle_ledger_complete = True
-    _cycle_exported_parquet = True
-    logger.info(
-        f"{E['ok']} [{label}] Exactly-once OK: todos batches uploaded no ledger "
-        f"({n_up} nesta execução)"
-    )
-    return True
-
-
-def validate_cycle_export_guarantee(
-    conn: duckdb.DuckDBPyConnection,
-    state: Dict[str, Any],
-) -> int:
-    global _cycle_exported_parquet, _cycle_ledger_complete
-
-    pending = get_pending_email_count(conn)
-    plan = state.get(EXPORT_ACTIVE_PLAN_KEY)
-
-    if pending > 0:
-        logger.error(
-            f"{E['error']} ERRO LÓGICO: COUNT > 0 ({pending:,}) após ciclo — "
-            f"dados não exportados ou DROP prematuro"
-        )
-        return 3
-
-    if isinstance(plan, dict) and not active_plan_all_uploaded(plan):
-        logger.error(
-            f"{E['error']} ERRO LÓGICO: export_active_plan com batches não uploaded"
-        )
-        return 3
-
-    if _cycle_exported_parquet or _cycle_ledger_complete:
-        logger.info(f"{E['ok']} GARANTIA CICLO: batches no export_ledger (exactly-once)")
-        return 0
-
-    logger.info(f"{E['info']} NO NEW DATA TO EXPORT")
-    return 0
-
-
-def batch_insert_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tuple]) -> int:
-    if not records:
-        return 0
+) -> List[Path]:
+    cpu_count = min(2, os.cpu_count() or 2)
+    chunk_files: List[Path] = []
+    logger.info(f"{E['extract']} ETAPA 1: {tar_path.name} (sem dedup)")
     try:
-        for email, nome, origem, data in records:
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO emails_raw VALUES (?, ?, ?, ?)",
-                    [email, nome, origem, data],
-                )
-            except Exception:
-                pass
-        conn.commit()
-        return len(records)
-    except Exception:
-        conn.rollback()
-        return 0
+        with tarfile.open(tar_path, "r:*") as tar:
+            for member in tar:
+                if stop_event.is_set():
+                    break
+                if not member.isfile() or not (
+                    member.name.endswith(".txt") or member.name.endswith(".csv")
+                ):
+                    continue
+                fobj = tar.extractfile(member)
+                if fobj is None:
+                    continue
+                gc.collect()
+                writer: Optional[pq.ParquetWriter] = None
+                current_chunk_file = None
+                row_count = 0
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+                with ProcessPoolExecutor(max_workers=cpu_count) as executor:
+                    MAX_INFLIGHT = 4
+                    inflight: set = set()
+                    chunk_idx = 0
+
+                    def drain_futures(inf):
+                        for f in list(inf):
+                            if f.done():
+                                inf.discard(f)
+                                try:
+                                    r = f.result()
+                                    if r:
+                                        yield_or_write(r)
+                                except Exception:
+                                    pass
+
+                    def yield_or_write(records):
+                        nonlocal writer, current_chunk_file, row_count
+                        if not records:
+                            return
+                        safe = [r for r in records if isinstance(r, tuple) and len(r) == 4]
+                        if not safe:
+                            return
+                        if writer is None:
+                            current_chunk_file = (
+                                RAW_CHUNKS_DIR
+                                / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
+                            )
+                            schema = pa.schema([
+                                ("email", pa.string()),
+                                ("nome", pa.string()),
+                                ("origem", pa.string()),
+                                ("data", pa.string()),
+                            ])
+                            writer = pq.ParquetWriter(
+                                str(current_chunk_file), schema, compression="snappy"
+                            )
+                        table = pa.Table.from_arrays(
+                            [[r[0] for r in safe], [r[1] for r in safe],
+                             [r[2] for r in safe], [r[3] for r in safe]],
+                            names=["email", "nome", "origem", "data"],
+                        )
+                        writer.write_table(table)
+                        row_count += len(safe)
+                        del table
+                        gc.collect()
+
+                    while True:
+                        chunk_data = fobj.read(CHUNK_SIZE)
+                        if not chunk_data:
+                            break
+                        if stop_event.is_set():
+                            break
+                        while len(inflight) >= MAX_INFLIGHT:
+                            drain_futures(inflight)
+                            time.sleep(0.05)
+                        inflight.add(
+                            executor.submit(
+                                process_chunk_worker, chunk_data, chunk_idx, member.name
+                            )
+                        )
+                        chunk_idx += 1
+                        drain_futures(inflight)
+
+                    for f in list(inflight):
+                        try:
+                            r = f.result()
+                            if r:
+                                yield_or_write(r)
+                        except Exception:
+                            pass
+
+                if writer is not None:
+                    writer.close()
+                    chunk_files.append(current_chunk_file)
+                    logger.info(
+                        f"{E['ok']} raw_chunk: {current_chunk_file.name} ({row_count:,})"
+                    )
+                    state[STAGE_KEY] = "raw"
+                    save_processed_chunks(state)
+                    save_torrent_state(state)
+                    save_full_checkpoint(api, token, checkpoint_repo)
+
+        try:
+            tar_path.unlink()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception(f"{E['error']} process_tar: {e}")
+    return chunk_files
 
 
 def create_libtorrent_session() -> lt.session:
@@ -1463,160 +1382,7 @@ def wait_for_file_complete(
         time.sleep(POLL_INTERVAL)
 
 
-def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List[Tuple]:
-    results = []
-    data_iso = datetime.now(timezone.utc).isoformat()
-    for match in EMAIL_REGEX.finditer(chunk_data):
-        try:
-            email_b = match.group()
-            email = email_b.decode("utf8", "ignore").strip().lower()
-            if not email or "@" not in email or is_disposable_email(email):
-                continue
-            local_part = email.split("@")[0]
-            local_part = re.sub(r"\d+", "", local_part)
-            local_part = re.sub(r"[_.\\-]+", " ", local_part).strip()
-            nome = " ".join(p.capitalize() for p in local_part.split()) if local_part else ""
-            results.append((email, nome, origin, data_iso))
-        except Exception:
-            continue
-    return results
-
-
-def process_tar_with_mmap(
-    tar_path: Path,
-    origin: str,
-    api: HfApi,
-    token: str,
-    checkpoint_repo: str,
-    state: Dict[str, Any],
-) -> List[Path]:
-    cpu_count = min(2, os.cpu_count() or 2)
-    chunk_files: List[Path] = []
-    logger.info(f"{E['extract']} Processando: {tar_path.name}")
-    try:
-        with tarfile.open(tar_path, "r:*") as tar:
-            for member in tar:
-                if stop_event.is_set():
-                    break
-                if not member.isfile() or not (
-                    member.name.endswith(".txt") or member.name.endswith(".csv")
-                ):
-                    continue
-                fobj = tar.extractfile(member)
-                if fobj is None:
-                    continue
-                gc.collect()
-                writer: Optional[pq.ParquetWriter] = None
-                current_chunk_file = None
-                row_count = 0
-                bloom_skipped = 0
-                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-                with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                    MAX_INFLIGHT = 4
-                    inflight: set = set()
-                    chunk_idx = 0
-
-                    def drain_futures(inf):
-                        for f in list(inf):
-                            if f.done():
-                                inf.discard(f)
-                                try:
-                                    r = f.result()
-                                    if r:
-                                        yield_or_write(r)
-                                except Exception:
-                                    pass
-
-                    def yield_or_write(records):
-                        nonlocal writer, current_chunk_file, row_count, bloom_skipped
-                        if not records:
-                            return
-                        safe = [r for r in records if isinstance(r, tuple) and len(r) == 4]
-                        if not safe:
-                            return
-                        if bloom_filter is not None:
-                            filtered = []
-                            with bloom_lock:
-                                for r in safe:
-                                    if r[0] not in bloom_filter:
-                                        bloom_filter.add(r[0])
-                                        filtered.append(r)
-                                    else:
-                                        bloom_skipped += 1
-                            safe = filtered
-                        if not safe:
-                            return
-                        if writer is None:
-                            current_chunk_file = (
-                                RAW_CHUNKS_DIR
-                                / f"raw_chunk_{len(chunk_files):06d}_{ts}.parquet"
-                            )
-                            schema = pa.schema([
-                                ("email", pa.string()),
-                                ("nome", pa.string()),
-                                ("origem", pa.string()),
-                                ("data", pa.string()),
-                            ])
-                            writer = pq.ParquetWriter(
-                                str(current_chunk_file), schema, compression="snappy"
-                            )
-                        table = pa.Table.from_arrays(
-                            [[r[0] for r in safe], [r[1] for r in safe],
-                             [r[2] for r in safe], [r[3] for r in safe]],
-                            names=["email", "nome", "origem", "data"],
-                        )
-                        writer.write_table(table)
-                        row_count += len(safe)
-                        del table
-                        gc.collect()
-
-                    while True:
-                        chunk_data = fobj.read(CHUNK_SIZE)
-                        if not chunk_data:
-                            break
-                        if stop_event.is_set():
-                            break
-                        while len(inflight) >= MAX_INFLIGHT:
-                            drain_futures(inflight)
-                            time.sleep(0.05)
-                        inflight.add(
-                            executor.submit(
-                                process_chunk_worker, chunk_data, chunk_idx, member.name
-                            )
-                        )
-                        chunk_idx += 1
-                        drain_futures(inflight)
-
-                    for f in list(inflight):
-                        try:
-                            r = f.result()
-                            if r:
-                                yield_or_write(r)
-                        except Exception:
-                            pass
-
-                if writer is not None:
-                    writer.close()
-                    chunk_files.append(current_chunk_file)
-                    logger.info(
-                        f"{E['ok']} Chunk: {current_chunk_file.name} ({row_count:,})"
-                    )
-                    save_processed_chunks(state)
-                    save_torrent_state(state)
-                    save_full_checkpoint(api, token, checkpoint_repo)
-
-        try:
-            tar_path.unlink()
-        except Exception:
-            pass
-    except Exception as e:
-        logger.exception(f"{E['error']} process_tar: {e}")
-    return chunk_files
-
-
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
-    global HF_REPO_BLOOM
     if not token:
         raise RuntimeError("HF_TOKEN não definido")
     api = HfApi()
@@ -1626,8 +1392,7 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
         raise RuntimeError("Utilizador HF inválido")
     emails_repo = f"{user}/{HF_REPO_EMAILS}"
     checkpoint_repo = f"{user}/{HF_REPO_CHECKPOINT}"
-    HF_REPO_BLOOM = f"{user}/{HF_REPO_BLOOM_SUFFIX}"
-    for repo_id in [emails_repo, checkpoint_repo, HF_REPO_BLOOM]:
+    for repo_id in [emails_repo, checkpoint_repo]:
         try:
             api.create_repo(
                 repo_id=repo_id, token=token, repo_type="dataset", private=True
@@ -1639,7 +1404,7 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
 
 
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
-    logger.info(f"{E['download']} FASE 1: {len(magnets)} torrents")
+    logger.info(f"{E['download']} Download: {len(magnets)} torrents")
     completed = {}
 
     def download_single(item):
@@ -1678,7 +1443,7 @@ def phase2_wait_downloads(
     token: str,
     checkpoint_repo: str,
 ) -> List[Tuple]:
-    logger.info(f"{E['download']} FASE 2: downloads")
+    logger.info(f"{E['download']} Aguardar ficheiros...")
     all_files = []
     processed_key = state.get("downloaded_files", {})
     processed_tars = state.get("processed_tars", [])
@@ -1718,7 +1483,7 @@ def phase3_process_tars(
     token: str,
     checkpoint_repo: str,
 ) -> List[Path]:
-    logger.info(f"{E['extract']} FASE 3: {len(tars)} tars")
+    logger.info(f"{E['extract']} Processar {len(tars)} tars")
     all_chunks = []
     processed_tars = state.get("processed_tars", [])
     for tname, tar_path, info in tars:
@@ -1738,58 +1503,17 @@ def phase3_process_tars(
     return all_chunks
 
 
-def phase4_load_to_duckdb(
-    chunks: List[Path],
-    conn: duckdb.DuckDBPyConnection,
-    state: Dict,
-    api: HfApi,
-    token: str,
-    checkpoint_repo: str,
-) -> int:
-    logger.info(f"{E['db']} FASE 4: {len(chunks)} chunks → DuckDB")
-    total = 0
-    loaded = state.get("loaded_chunks", [])
-    for chunk_file in chunks:
-        if stop_event.is_set():
-            break
-        if str(chunk_file) in loaded:
-            continue
-        try:
-            conn.execute(f"""
-                INSERT OR IGNORE INTO emails_raw
-                SELECT * FROM read_parquet('{chunk_file}');
-            """)
-            conn.commit()
-            loaded.append(str(chunk_file))
-            state["loaded_chunks"] = loaded
-            save_state(state)
-            save_processed_chunks(state)
-            save_full_checkpoint(api, token, checkpoint_repo)
-            total += 1
-            logger.info(f"{E['db']} Carregado: {chunk_file.name}")
-        except Exception:
-            try:
-                df = pd.read_parquet(chunk_file)
-                records = [tuple(r) for r in df.itertuples(index=False, name=None)]
-                batch_insert_duckdb(conn, records)
-                loaded.append(str(chunk_file))
-                state["loaded_chunks"] = loaded
-                save_state(state)
-                save_processed_chunks(state)
-                save_full_checkpoint(api, token, checkpoint_repo)
-                total += len(records)
-            except Exception as ex:
-                logger.exception(f"{E['error']} phase4 {chunk_file.name}: {ex}")
-    return total
-
-
 def main():
-    global bloom_filter, _cycle_exported_parquet, _cycle_had_pending_at_check, _cycle_ledger_complete
+    global _cycle_exported_batch, _cycle_had_pending_at_check, _cycle_ledger_complete
 
-    logger.info(f"{E['start']} Minerador Production v5 (Export Ledger exactly-once)")
+    logger.info(f"{E['start']} Minerador Production v6 (DuckDB disk dedup, sem Bloom)")
     if not HF_TOKEN:
         logger.error(f"{E['error']} HF_TOKEN não definido")
         sys.exit(2)
+
+    free = disk_usage()["free"]
+    if free < MIN_FREE_BYTES:
+        logger.warning(f"{E['space']} Pouco espaço livre: {human(free)}")
 
     exit_code = 0
     conn = None
@@ -1797,10 +1521,12 @@ def main():
     try:
         api, emails_repo, checkpoint_repo = hf_setup_datasets(HF_TOKEN)
         logger.info(f"{E['info']} emails_repo = {emails_repo}")
+        logger.info(
+            f"{E['info']} EXPORT_BATCH_SIZE={EXPORT_BATCH_SIZE:,} "
+            f"FORMAT={batch_file_extension()}"
+        )
 
         load_checkpoint_from_hf(api, HF_TOKEN, checkpoint_repo)
-        load_bloom_from_hf(api, HF_TOKEN)
-        bloom_filter = init_bloom_filter(api, HF_TOKEN)
 
         state = merge_checkpoint_into_state(load_state())
         ensure_export_ledger(state)
@@ -1808,7 +1534,7 @@ def main():
 
         start_periodic_checkpoint(api, HF_TOKEN, checkpoint_repo)
 
-        process_pending_duckdb_export(
+        process_pending_export_pipeline(
             conn, api, HF_TOKEN, emails_repo, checkpoint_repo, state, label="arranque"
         )
 
@@ -1821,16 +1547,10 @@ def main():
                 completed, state, api, HF_TOKEN, checkpoint_repo
             )
             if tars and not stop_event.is_set():
-                chunks = phase3_process_tars(
-                    tars, state, api, HF_TOKEN, checkpoint_repo
-                )
-                if chunks and not stop_event.is_set():
-                    phase4_load_to_duckdb(
-                        chunks, conn, state, api, HF_TOKEN, checkpoint_repo
-                    )
+                phase3_process_tars(tars, state, api, HF_TOKEN, checkpoint_repo)
 
         if not stop_event.is_set():
-            process_pending_duckdb_export(
+            process_pending_export_pipeline(
                 conn, api, HF_TOKEN, emails_repo, checkpoint_repo, state, label="final"
             )
 
@@ -1840,7 +1560,7 @@ def main():
         if exit_code == 0:
             logger.info(f"{E['ok']} Ciclo concluído")
         else:
-            logger.error(f"{E['error']} Ciclo terminou com ERRO LÓGICO (export/ledger)")
+            logger.error(f"{E['error']} Ciclo terminou com ERRO LÓGICO")
 
     except KeyboardInterrupt:
         logger.warning(f"{E['signal']} Interrupção")
@@ -1851,7 +1571,7 @@ def main():
     finally:
         stop_periodic_checkpoint()
         try:
-            state_current = load_state()
+            state_current = merge_checkpoint_into_state(load_state())
             ensure_export_ledger(state_current)
             save_processed_chunks(state_current)
             save_torrent_state(state_current)
@@ -1861,11 +1581,6 @@ def main():
                 save_full_checkpoint(api_f, HF_TOKEN, cp)
         except Exception as e:
             logger.error(f"{E['error']} Checkpoint final: {e}")
-        if bloom_filter is not None:
-            try:
-                bloom_filter.close()
-            except Exception:
-                pass
         if conn is not None:
             try:
                 conn.close()
