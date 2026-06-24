@@ -1016,17 +1016,38 @@ def count_emails_table(conn: duckdb.DuckDBPyConnection) -> int:
     return 0
 
 
-def get_pending_email_count(conn: duckdb.DuckDBPyConnection) -> int:
-    """Verificação obrigatória: COUNT em emails (e fallback emails_raw)."""
-    n = count_emails_table(conn)
-    if n > 0:
-        return n
+def count_emails_raw_table(conn: duckdb.DuckDBPyConnection) -> int:
     try:
         if table_exists(conn, "emails_raw"):
             return int(conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"{E['warn']} COUNT emails_raw falhou: {e}")
     return 0
+
+
+def get_pending_email_count(conn: duckdb.DuckDBPyConnection) -> int:
+    """
+    CORREÇÃO CRÍTICA: Retorna a SOMA de emails em AMBAS as tabelas.
+    Antes retornava apenas o máximo, o que fazia com que dados em emails_raw
+    fossem ignorados se a tabela emails existisse mas estivesse vazia.
+    """
+    raw_count = 0
+    clean_count = 0
+    
+    try:
+        if table_exists(conn, "emails_raw"):
+            raw_count = int(conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0])
+    except Exception as e:
+        logger.warning(f"{E['warn']} Falha ao contar emails_raw: {e}")
+    
+    try:
+        if table_exists(conn, "emails"):
+            clean_count = int(conn.execute("SELECT COUNT(*) FROM emails;").fetchone()[0])
+    except Exception as e:
+        logger.warning(f"{E['warn']} Falha ao contar emails: {e}")
+    
+    total = raw_count + clean_count
+    return total
 
 
 def count_pending_export(conn: duckdb.DuckDBPyConnection) -> int:
@@ -1037,8 +1058,14 @@ def prepare_emails_table_sql_dedup(conn: duckdb.DuckDBPyConnection) -> int:
     logger.info(f"{E['clean']} Deduplicação SQL (DISTINCT) → tabela emails")
     conn.execute("DROP TABLE IF EXISTS emails_new;")
     has_emails = table_exists(conn, "emails")
+    has_raw = table_exists(conn, "emails_raw")
     n_old = count_emails_table(conn) if has_emails else 0
-    if has_emails and n_old > 0:
+    n_raw = count_emails_raw_table(conn) if has_raw else 0
+    
+    logger.info(f"{E['db']} Preparando dedup: emails={n_old:,}, emails_raw={n_raw:,}")
+    
+    if has_emails and n_old > 0 and has_raw and n_raw > 0:
+        # Ambas as tabelas têm dados - fazer UNION ALL
         conn.execute("""
             CREATE TABLE emails_new AS
             SELECT DISTINCT email, nome, origem, data
@@ -1049,13 +1076,33 @@ def prepare_emails_table_sql_dedup(conn: duckdb.DuckDBPyConnection) -> int:
             ) AS u
             WHERE email IS NOT NULL AND email <> '';
         """)
-    else:
+    elif has_raw and n_raw > 0:
+        # Só emails_raw tem dados
         conn.execute("""
             CREATE TABLE emails_new AS
             SELECT DISTINCT email, nome, origem, data
             FROM emails_raw
             WHERE email IS NOT NULL AND email <> '';
         """)
+    elif has_emails and n_old > 0:
+        # Só emails tem dados (caso raro, mas possível)
+        conn.execute("""
+            CREATE TABLE emails_new AS
+            SELECT DISTINCT email, nome, origem, data
+            FROM emails
+            WHERE email IS NOT NULL AND email <> '';
+        """)
+    else:
+        # Nenhuma tabela tem dados - criar vazia
+        conn.execute("""
+            CREATE TABLE emails_new (
+                email   VARCHAR PRIMARY KEY,
+                nome    VARCHAR,
+                origem  VARCHAR,
+                data    VARCHAR
+            );
+        """)
+    
     conn.execute("DROP TABLE IF EXISTS emails;")
     conn.execute("ALTER TABLE emails_new RENAME TO emails;")
     conn.commit()
@@ -1070,7 +1117,7 @@ def bloom_filter_dedup_emails_table(conn: duckdb.DuckDBPyConnection) -> Tuple[in
         logger.warning(f"{E['warn']} Bloom não inicializado — export sem filtro Bloom")
         return count_emails_table(conn), 0
 
-    logger.info(f"{E['bloom']} Deduplicação final via Bloom Filter")
+    logger.info(f"{E['bloom']} Deduplicação final via Bloom Filter (size: {len(bloom_filter):,})")
     total = count_emails_table(conn)
     if total == 0:
         return 0, 0
@@ -1168,11 +1215,15 @@ def process_pending_duckdb_export(
 ) -> bool:
     global _cycle_exported_parquet, _cycle_ledger_complete
 
-    pending = get_pending_email_count(conn)
-    logger.info(
-        f"{E['db']} [{label}] SELECT COUNT(*) FROM emails = "
-        f"{count_emails_table(conn):,} | pendente total = {pending:,}"
-    )
+    # DIAGNÓSTICO: Mostrar contagem exata de ambas as tabelas
+    raw_count = count_emails_raw_table(conn)
+    clean_count = count_emails_table(conn)
+    pending = raw_count + clean_count
+    
+    logger.info(f"{E['db']} [{label}] DIAGNÓSTICO: emails_raw={raw_count:,}, emails={clean_count:,}, total={pending:,}")
+    
+    if bloom_filter is not None:
+        logger.info(f"{E['bloom']} [{label}] Bloom filter size: {len(bloom_filter):,}")
 
     if pending == 0:
         plan = state.get(EXPORT_ACTIVE_PLAN_KEY)
@@ -1190,20 +1241,27 @@ def process_pending_duckdb_export(
         f"{E['export']} [{label}] EXISTE DADOS PENDENTES PARA EXPORTAÇÃO ({pending:,})"
     )
 
-    if count_emails_table(conn) == 0 and table_exists(conn, "emails_raw"):
-        if conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0] > 0:
-            prepare_emails_table_sql_dedup(conn)
-    elif count_emails_table(conn) == 0:
+    # CORREÇÃO CRÍTICA: Sempre garantir que dados em emails_raw sejam movidos para emails
+    if raw_count > 0:
+        logger.info(f"{E['clean']} [{label}] Movendo {raw_count:,} registos de emails_raw → emails")
         prepare_emails_table_sql_dedup(conn)
-
-    if count_emails_table(conn) == 0:
+    elif clean_count == 0:
+        # Se não há dados em nenhuma tabela, não há nada para exportar
         logger.info(f"{E['info']} [{label}] Tabela emails vazia após preparação")
+        return False
+
+    # Verificar novamente após dedup
+    final_count = count_emails_table(conn)
+    logger.info(f"{E['db']} [{label}] Pronto para export: {final_count:,} emails na tabela 'emails'")
+
+    if final_count == 0:
+        logger.info(f"{E['info']} [{label}] Tabela emails vazia após deduplicação")
         return False
 
     kept, _ = bloom_filter_dedup_emails_table(conn)
     if kept == 0:
         logger.info(
-            f"{E['info']} [{label}] Todos no Bloom — limpar DuckDB sem Parquet"
+            f"{E['info']} [{label}] Todos os emails já estão no Bloom filter — limpar DuckDB sem exportar Parquet"
         )
         drop_emails_after_confirmed_upload(conn)
         clear_export_active_plan(state)
@@ -1755,67 +1813,3 @@ def main():
         )
 
         session = create_libtorrent_session()
-        t0 = time.time()
-
-        completed = phase1_download_torrents(session, MAGNETS)
-        if completed and not stop_event.is_set():
-            tars = phase2_wait_downloads(
-                completed, state, api, HF_TOKEN, checkpoint_repo
-            )
-            if tars and not stop_event.is_set():
-                chunks = phase3_process_tars(
-                    tars, state, api, HF_TOKEN, checkpoint_repo
-                )
-                if chunks and not stop_event.is_set():
-                    phase4_load_to_duckdb(
-                        chunks, conn, state, api, HF_TOKEN, checkpoint_repo
-                    )
-
-        if not stop_event.is_set():
-            process_pending_duckdb_export(
-                conn, api, HF_TOKEN, emails_repo, checkpoint_repo, state, label="final"
-            )
-
-        exit_code = validate_cycle_export_guarantee(conn, state)
-
-        logger.info(f"{E['stats']} Tempo: {(time.time() - t0) / 60:.2f} min")
-        if exit_code == 0:
-            logger.info(f"{E['ok']} Ciclo concluído")
-        else:
-            logger.error(f"{E['error']} Ciclo terminou com ERRO LÓGICO (export/ledger)")
-
-    except KeyboardInterrupt:
-        logger.warning(f"{E['signal']} Interrupção")
-        exit_code = 130
-    except Exception as e:
-        logger.exception(f"{E['error']} Fatal: {e}")
-        exit_code = 1
-    finally:
-        stop_periodic_checkpoint()
-        try:
-            state_current = load_state()
-            ensure_export_ledger(state_current)
-            save_processed_chunks(state_current)
-            save_torrent_state(state_current)
-            if HF_TOKEN:
-                api_f = HfApi()
-                _, _, cp = hf_setup_datasets(HF_TOKEN)
-                save_full_checkpoint(api_f, HF_TOKEN, cp)
-        except Exception as e:
-            logger.error(f"{E['error']} Checkpoint final: {e}")
-        if bloom_filter is not None:
-            try:
-                bloom_filter.close()
-            except Exception:
-                pass
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    sys.exit(exit_code)
-
-
-if __name__ == "__main__":
-    main()
