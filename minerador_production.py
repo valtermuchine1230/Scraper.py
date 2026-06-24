@@ -1460,8 +1460,9 @@ def phase2_wait_downloads(
 ) -> List[Tuple]:
     logger.info(f"{E['download']} FASE 2: A aguardar conclusão de todos os ficheiros")
 
-    all_files    = []
-    processed_key = state.get("downloaded_files", {})
+    all_files      = []
+    processed_key  = state.get("downloaded_files", {})
+    processed_tars = state.get("processed_tars", [])
 
     for tname, (handle, info, indices) in completed_torrents.items():
         if stop_event.is_set():
@@ -1471,14 +1472,45 @@ def phase2_wait_downloads(
             if stop_event.is_set():
                 break
 
-            file_key = f"{tname}_{idx}"
-            if file_key in processed_key:
-                logger.info(f"{E['skip']} Ignorado (já processado): {file_key}")
-                continue
-
+            file_key      = f"{tname}_{idx}"
             expected_size = info.files().at(idx).size
+
+            if file_key in processed_key:
+                local_path = local_path_for_index_robust(SAVE_PATH, info, idx)
+
+                tar_already_processed = False
+                if local_path is not None:
+                    tar_already_processed = str(local_path) in processed_tars
+                else:
+                    raw_name = info.files().at(idx).path
+                    tar_already_processed = any(
+                        raw_name in pt for pt in processed_tars
+                    )
+
+                if tar_already_processed:
+                    logger.info(
+                        f"{E['skip']} Tar já processado em emails, a ignorar: {file_key}"
+                    )
+                    continue
+
+                if local_path is not None and local_path.exists():
+                    logger.info(
+                        f"{E['ok']} Download já feito, ficheiro em disco: "
+                        f"{local_path.name} ({human(local_path.stat().st_size)})"
+                    )
+                    all_files.append((tname, local_path, info))
+                    continue
+
+                logger.warning(
+                    f"{E['warn']} Download marcado como feito mas ficheiro "
+                    f"não encontrado em disco (runner novo?). "
+                    f"A re-descarregar: {file_key}"
+                )
+                del processed_key[file_key]
+                state["downloaded_files"] = processed_key
+
             logger.info(
-                f"{E['download']} A aguardar: {tname} index {idx} "
+                f"{E['download']} A descarregar: {tname} index {idx} "
                 f"({human(expected_size)})"
             )
 
@@ -1487,7 +1519,10 @@ def phase2_wait_downloads(
                 local_path = local_path_for_index_robust(SAVE_PATH, info, idx)
 
                 if local_path is None:
-                    logger.error(f"{E['error']} Ficheiro não encontrado em disco (index {idx})")
+                    logger.error(
+                        f"{E['error']} Ficheiro não encontrado em disco "
+                        f"após download (index {idx})"
+                    )
                     continue
 
                 all_files.append((tname, local_path, info))
@@ -1497,7 +1532,6 @@ def phase2_wait_downloads(
                 save_state(state)
                 save_torrent_state(state)
 
-                # Checkpoint após cada ficheiro descarregado
                 save_full_checkpoint(api, token, checkpoint_repo)
 
             except Exception as e:
@@ -1507,6 +1541,14 @@ def phase2_wait_downloads(
                 )
 
     logger.info(f"{E['ok']} FASE 2 concluída: {len(all_files)} ficheiros prontos")
+
+    if len(all_files) == 0:
+        logger.warning(
+            f"{E['warn']} FASE 2 retornou 0 ficheiros. "
+            f"Todos já processados em emails OU erro no download. "
+            f"Verificar processed_tars no estado."
+        )
+
     return all_files
 
 
@@ -1545,7 +1587,6 @@ def phase3_process_tars(
         save_state(state)
         save_processed_chunks(state)
 
-        # Checkpoint após cada tar
         save_full_checkpoint(api, token, checkpoint_repo)
 
     logger.info(
@@ -1592,13 +1633,11 @@ def phase4_load_to_duckdb(
             save_state(state)
             save_processed_chunks(state)
 
-            # Checkpoint após cada chunk carregado no DuckDB
             save_full_checkpoint(api, token, checkpoint_repo)
 
             logger.info(f"{E['db']} Carregado: {chunk_file.name} (+{inserted:,})")
 
         except Exception:
-            # Fallback: pandas
             logger.warning(
                 f"{E['warn']} read_parquet nativo falhou, a usar pandas..."
             )
@@ -1718,7 +1757,7 @@ def phase7_upload_hf(
                 pass
 
     # Upload checkpoint e Bloom Filter finais
-    state["last_execution"]      = datetime.now(timezone.utc).isoformat()
+    state["last_execution"]       = datetime.now(timezone.utc).isoformat()
     state["final_files_uploaded"] = len(final_files)
     save_state(state)
     save_processed_chunks(state)
@@ -1806,44 +1845,72 @@ def main():
         # FASE 1
         completed_torrents = phase1_download_torrents(session, MAGNETS)
         if not completed_torrents:
-            logger.error(f"{E['error']} Nenhum torrent concluído com sucesso")
-            return
+            logger.warning(f"{E['warn']} Nenhum torrent concluído na FASE 1, mas a verificar processamento pendente...")
 
         if stop_event.is_set():
             logger.warning(f"{E['warn']} Parado durante FASE 1")
             return
 
-        # FASE 2
-        tars = phase2_wait_downloads(
-            completed_torrents, state, api, HF_TOKEN, checkpoint_repo
-        )
+        tars = []
+        if completed_torrents and not stop_event.is_set():
+            # FASE 2
+            tars = phase2_wait_downloads(
+                completed_torrents, state, api, HF_TOKEN, checkpoint_repo
+            )
 
+        chunks = []
         if tars and not stop_event.is_set():
             # FASE 3
             chunks = phase3_process_tars(
                 tars, state, api, HF_TOKEN, checkpoint_repo
             )
 
-            if chunks and not stop_event.is_set():
-                # FASE 4
-                phase4_load_to_duckdb(
-                    chunks, conn, state, api, HF_TOKEN, checkpoint_repo
-                )
+        if chunks and not stop_event.is_set():
+            # FASE 4
+            phase4_load_to_duckdb(
+                chunks, conn, state, api, HF_TOKEN, checkpoint_repo
+            )
 
-                if not stop_event.is_set():
-                    # FASE 5
-                    total_emails = phase5_deduplicate_duckdb(conn)
+        # FASE 5, 6 e 7 (Totalmente desacopladas: verificam diretamente os dados existentes no DuckDB)
+        if not stop_event.is_set():
+            try:
+                count_db = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
+            except Exception:
+                count_db = 0
 
-                    if not stop_event.is_set():
-                        # FASE 6
-                        final_files = phase6_export_final_files(conn)
+            if count_db > 0:
+                logger.info(f"{E['info']} DuckDB contém {count_db:,} registos pendentes. A iniciar deduplicação e exportação...")
+                
+                # FASE 5
+                total_emails = phase5_deduplicate_duckdb(conn)
 
-                        if not stop_event.is_set():
-                            # FASE 7
-                            phase7_upload_hf(
-                                api, HF_TOKEN, emails_repo, checkpoint_repo,
-                                final_files, DB_PATH, state,
-                            )
+                if not stop_event.is_set() and total_emails > 0:
+                    # FASE 6
+                    final_files = phase6_export_final_files(conn)
+
+                    if not stop_event.is_set() and final_files:
+                        # FASE 7
+                        phase7_upload_hf(
+                            api, HF_TOKEN, emails_repo, checkpoint_repo,
+                            final_files, DB_PATH, state,
+                        )
+
+                        # Limpeza pós-upload (Para evitar re-envios repetitivos)
+                        try:
+                            conn.execute("DROP TABLE IF EXISTS emails_raw;")
+                            conn.execute("""
+                                CREATE TABLE IF NOT EXISTS emails_raw (
+                                    email   VARCHAR PRIMARY KEY,
+                                    nome    VARCHAR,
+                                    origem  VARCHAR,
+                                    data    VARCHAR
+                                );
+                            """)
+                            logger.info(f"{E['clean']} Tabela DuckDB limpa para evitar duplicar envios no futuro.")
+                        except Exception as e:
+                            logger.warning(f"{E['warn']} Erro ao limpar tabela DuckDB: {e}")
+            else:
+                logger.info(f"{E['info']} Sem dados pendentes no DuckDB. Fases 5, 6 e 7 ignoradas.")
 
         total_time = time.time() - overall_start
         logger.info(f"{E['stats']} Tempo total: {total_time / 60:.2f} minutos")
