@@ -1813,3 +1813,67 @@ def main():
         )
 
         session = create_libtorrent_session()
+        t0 = time.time()
+
+        completed = phase1_download_torrents(session, MAGNETS)
+        if completed and not stop_event.is_set():
+            tars = phase2_wait_downloads(
+                completed, state, api, HF_TOKEN, checkpoint_repo
+            )
+            if tars and not stop_event.is_set():
+                chunks = phase3_process_tars(
+                    tars, state, api, HF_TOKEN, checkpoint_repo
+                )
+                if chunks and not stop_event.is_set():
+                    phase4_load_to_duckdb(
+                        chunks, conn, state, api, HF_TOKEN, checkpoint_repo
+                    )
+
+        if not stop_event.is_set():
+            process_pending_duckdb_export(
+                conn, api, HF_TOKEN, emails_repo, checkpoint_repo, state, label="final"
+            )
+
+        exit_code = validate_cycle_export_guarantee(conn, state)
+
+        logger.info(f"{E['stats']} Tempo: {(time.time() - t0) / 60:.2f} min")
+        if exit_code == 0:
+            logger.info(f"{E['ok']} Ciclo concluído")
+        else:
+            logger.error(f"{E['error']} Ciclo terminou com ERRO LÓGICO (export/ledger)")
+
+    except KeyboardInterrupt:
+        logger.warning(f"{E['signal']} Interrupção")
+        exit_code = 130
+    except Exception as e:
+        logger.exception(f"{E['error']} Fatal: {e}")
+        exit_code = 1
+    finally:
+        stop_periodic_checkpoint()
+        try:
+            state_current = load_state()
+            ensure_export_ledger(state_current)
+            save_processed_chunks(state_current)
+            save_torrent_state(state_current)
+            if HF_TOKEN:
+                api_f = HfApi()
+                _, _, cp = hf_setup_datasets(HF_TOKEN)
+                save_full_checkpoint(api_f, HF_TOKEN, cp)
+        except Exception as e:
+            logger.error(f"{E['error']} Checkpoint final: {e}")
+        if bloom_filter is not None:
+            try:
+                bloom_filter.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
