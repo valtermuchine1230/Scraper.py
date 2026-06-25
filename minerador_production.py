@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-minerador_production_v2.py — Escalável a bilhões de emails (100% Disco, Logs Bonitos, Erros Detalhados)
+minerador_production_v3.py — VERSÃO INTELIGENTE COM BUSCA FUZZY
 
-ARQUITETURA OTIMIZADA:
-  ✓ ZERO uso de RAM para dados grandes (tudo em disco)
-  ✓ Processamento em streaming com chunks pequenos
-  ✓ DuckDB com cache em disco (não RAM)
-  ✓ Logs estruturados e cores
-  ✓ Erros com stack trace completo + dicas de resolução
-
-PERSISTÊNCIA: Hugging Face → recuperação completa após timeout
+MELHORIAS:
+  ✓ Busca FUZZY/REGEX ao invés de correspondência exata
+  ✓ Lista TODOS os arquivos do torrent para debug
+  ✓ Permite múltiplos padrões de busca (fallback automático)
+  ✓ Suporta variações de nome (maiúsculas, espaços, underscores, etc)
+  ✓ Logs detalhados mostrando exatamente qual arquivo foi encontrado
 """
 
 from __future__ import annotations
@@ -54,22 +52,16 @@ class ColoredFormatter(logging.Formatter):
     def format(self, record):
         levelname = record.levelname
         color = self.COLORS.get(levelname, self.RESET)
-        
-        # Formatar mensagem com cores
         record.levelname = f"{color}{self.BOLD}{levelname:8s}{self.RESET}"
         record.msg = str(record.msg)
-        
         return super().format(record)
 
 def setup_logging(log_path: Path, log_level: str = "INFO") -> logging.Logger:
     """Setup logging com console + arquivo."""
-    logger = logging.getLogger("minerador_v2")
+    logger = logging.getLogger("minerador_v3")
     logger.setLevel(log_level)
-    
-    # Limpar handlers antigos
     logger.handlers = []
     
-    # Console handler (colorido)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
     console_formatter = ColoredFormatter(
@@ -78,7 +70,6 @@ def setup_logging(log_path: Path, log_level: str = "INFO") -> logging.Logger:
     )
     console_handler.setFormatter(console_formatter)
     
-    # File handler (completo)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(str(log_path), encoding='utf-8')
     file_handler.setLevel(log_level)
@@ -119,15 +110,15 @@ ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "10000000"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 
-# Setup logging
 logger = setup_logging(LOG_PATH, LOG_LEVEL)
 
-# ===== EMOJIS E SÍMBOLOS =====
+# ===== EMOJIS =====
 E = {
     "start": "🚀", "download": "📥", "extract": "📦", "stats": "📊",
     "space": "💾", "email": "📧", "upload": "📤", "clean": "🧹",
     "warn": "⚠️", "error": "❌", "ok": "✅", "info": "ℹ️",
     "cpu": "⚙️", "db": "🗄️", "clock": "⏱️", "arrow": "→",
+    "list": "📋", "search": "🔍",
 }
 
 EMAIL_REGEX = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
@@ -142,24 +133,28 @@ def handle_signal(signum, frame):
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
-# ===== MAGNET LINKS =====
+# ===== MAGNET LINKS (COM PADRÕES DE BUSCA INTELIGENTES) =====
 MAGNETS = [
     {
         "name": "Collection #2-#5",
         "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
-        "targets": [
-            "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
-            "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
-        ],
+        # Múltiplos padrões de busca para ser flexível
+        "patterns": [
+            r"collection\s*#?2.*tar\.gz$",
+            r"collection\s*#?4.*tar\.gz$",
+            r"trading.*collection.*tar\.gz$",
+            r"btc.*combo.*tar\.gz$",
+        ]
     },
     {
         "name": "Collection #1",
-        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
-        "targets": [
-            "Collection #1/Collection #1_BTC combos.tar.gz",
-            "Collection #1/Collection #1_OLD CLOUD_Trading combos.tar.gz",
-            "Collection #1/Collection #1_OLD CLOUD_BTC combos.tar.gz",
-        ],
+        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
+        "patterns": [
+            r"collection\s*#?1.*tar\.gz$",
+            r"btc.*combo.*tar\.gz$",
+            r"trading.*combo.*tar\.gz$",
+            r"cloud.*combo.*tar\.gz$",
+        ]
     },
 ]
 
@@ -236,7 +231,6 @@ def log_error_detailed(exception: Exception, context: str = "", suggestions: Lis
     
     logger.error(error_msg)
     
-    # Salvar em arquivo de erros
     try:
         with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"\n{datetime.now().isoformat()}\n{error_msg}\n")
@@ -249,7 +243,6 @@ def save_state(state: Dict[str, Any]):
         try:
             with open(STATE_PATH, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, default=str, ensure_ascii=False)
-            logger.debug(f"{E['ok']} Estado salvo: {len(state)} entradas")
         except Exception as e:
             log_error_detailed(e, "Salvando estado", [
                 f"Verifique permissões de escrita em {STATE_PATH}",
@@ -278,7 +271,54 @@ def is_disposable_email(email: str) -> bool:
     except Exception:
         return False
 
-# ===== DUCKDB (OTIMIZADO PARA DISCO) =====
+# ===== BUSCA FUZZY PARA ARQUIVOS =====
+def find_files_by_patterns(torrent_info: lt.torrent_info, patterns: List[str]) -> Tuple[List[int], List[str]]:
+    """
+    Busca INTELIGENTE por arquivos usando regex patterns.
+    Retorna índices dos arquivos encontrados e lista de todos os arquivos.
+    """
+    n = torrent_info.num_files()
+    
+    # Listar TODOS os arquivos do torrent
+    all_files = []
+    for i in range(n):
+        try:
+            file_path = torrent_info.files().at(i).path
+            file_size = torrent_info.files().at(i).size
+            all_files.append((i, file_path, file_size))
+        except Exception:
+            pass
+    
+    logger.info(f"\n{E['list']} ARQUIVOS NO TORRENT:")
+    logger.info(f"{'─' * 70}")
+    for i, path, size in all_files:
+        logger.info(f"  [{i:3d}] {path:<50s} ({human(size)})")
+    logger.info(f"{'─' * 70}\n")
+    
+    # Buscar usando patterns regex
+    found_indices = []
+    found_files = []
+    
+    logger.info(f"{E['search']} Buscando arquivos com padrões...")
+    
+    for i, file_path, size in all_files:
+        file_lower = file_path.lower()
+        
+        for pattern in patterns:
+            try:
+                if re.search(pattern, file_lower):
+                    found_indices.append(i)
+                    found_files.append((i, file_path, size))
+                    logger.info(f"{E['ok']} ENCONTRADO: [{i:3d}] {file_path}")
+                    logger.info(f"         Padrão: {pattern}")
+                    logger.info(f"         Tamanho: {human(size)}\n")
+                    break
+            except re.error as e:
+                logger.warning(f"{E['warn']} Padrão regex inválido: {pattern} - {e}")
+    
+    return sorted(set(found_indices)), all_files
+
+# ===== DUCKDB =====
 def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
     """Inicializar DuckDB com settings otimizados para DISCO."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,11 +326,9 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
     try:
         conn = duckdb.connect(str(db_path))
         
-        # ✓ SETTINGS OTIMIZADOS PARA DISCO (não RAM)
         conn.execute("SET threads=8;")
         conn.execute("SET memory_limit='2GB';")
         conn.execute("SET max_memory='2GB';")
-        # REMOVIDO: buffer_pool_size (não existe em todas versões do DuckDB)
         conn.execute(f"SET temp_directory='{str(TEMP_DIR)}';")
         
         logger.info(f"{E['db']} DuckDB: Temporary dir = {TEMP_DIR}")
@@ -318,14 +356,11 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
 
 def batch_insert_duckdb_streaming(conn: duckdb.DuckDBPyConnection, 
                                    records: List[Tuple]) -> int:
-    """
-    Inserir dados em batch direto (otimizado para DuckDB).
-    """
+    """Inserir dados em batch direto."""
     if not records:
         return 0
     
     try:
-        # Usar INSERT com VALUES lista para melhor performance
         for email, nome, origem, data in records:
             try:
                 conn.execute(
@@ -333,7 +368,6 @@ def batch_insert_duckdb_streaming(conn: duckdb.DuckDBPyConnection,
                     [email, nome, origem, data],
                 )
             except duckdb.CatalogException:
-                # Duplicate, skip
                 pass
         
         conn.commit()
@@ -343,7 +377,6 @@ def batch_insert_duckdb_streaming(conn: duckdb.DuckDBPyConnection,
         log_error_detailed(e, "Inserindo batch DuckDB", [
             f"Verifique espaço em disco disponível",
             "Tente deletar e reprocessar o chunk",
-            "Ou reduza BATCH_INSERT_DDB"
         ])
         conn.rollback()
         return 0
@@ -384,29 +417,6 @@ def create_libtorrent_session() -> lt.session:
             "Verifique se a porta está disponível (6881-6889)"
         ])
         raise
-
-def find_target_indices(torrent_info: lt.torrent_info, 
-                       targets: List[str]) -> Tuple[List[int], List[str]]:
-    """Encontrar índices de arquivos alvo no torrent."""
-    n = torrent_info.num_files()
-    idx_to_path = {i: torrent_info.files().at(i).path for i in range(n)}
-    
-    found = []
-    missing = []
-    
-    for t in targets:
-        matched = False
-        for i, p in idx_to_path.items():
-            if p == t or p.lower() == t.lower():
-                found.append(i)
-                matched = True
-                logger.debug(f"{E['ok']} Alvo encontrado: {t} (index {i})")
-                break
-        if not matched:
-            missing.append(t)
-            logger.warning(f"{E['warn']} Alvo não encontrado: {t}")
-    
-    return sorted(set(found)), missing
 
 def local_path_for_index(save_path: Path, 
                          torrent_info: lt.torrent_info, 
@@ -454,13 +464,8 @@ def wait_for_file_complete(handle: lt.torrent_handle,
             time.sleep(POLL_INTERVAL)
 
 # ===== PROCESSAMENTO =====
-def process_chunk_worker(chunk_data: bytes, 
-                        chunk_idx: int, 
-                        origin: str) -> List[Tuple]:
-    """
-    Worker process: extrair emails de chunk usando regex em BYTES.
-    ZERO conversão intermediária em RAM.
-    """
+def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List[Tuple]:
+    """Worker process: extrair emails de chunk usando regex."""
     results = []
     data_iso = datetime.now(timezone.utc).isoformat()
     
@@ -476,7 +481,6 @@ def process_chunk_worker(chunk_data: bytes,
                 if not email or "@" not in email or is_disposable_email(email):
                     continue
                 
-                # Extrair nome do email
                 local_part = email.split("@")[0]
                 local_part = re.sub(r"\d+", "", local_part)
                 local_part = re.sub(r"[_.\-]+", " ", local_part).strip()
@@ -493,10 +497,7 @@ def process_chunk_worker(chunk_data: bytes,
     return results
 
 def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
-    """
-    Extrair TAR.GZ em STREAMING com chunks pequenos (zero RAM).
-    Salvar chunks em Parquet imediatamente.
-    """
+    """Extrair TAR.GZ em STREAMING (zero RAM)."""
     cpu_count = os.cpu_count() or 4
     chunk_files = []
     total_records = 0
@@ -526,11 +527,9 @@ def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
                 chunk_idx = 0
                 bytes_processed = 0
                 
-                # Processar em chunks PEQUENOS (256MB)
                 with ProcessPoolExecutor(max_workers=cpu_count) as executor:
                     futures = {}
                     
-                    # Ler e submeter chunks
                     while True:
                         chunk_data = fobj.read(CHUNK_SIZE)
                         if not chunk_data:
@@ -548,12 +547,7 @@ def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
                         futures[future] = chunk_idx
                         bytes_processed += len(chunk_data)
                         chunk_idx += 1
-                        
-                        logger.debug(
-                            f"{E['cpu']} Chunk {chunk_idx}: {human(bytes_processed)}/{human(member.size)} processados"
-                        )
                     
-                    # Coletar resultados
                     for future in as_completed(futures):
                         try:
                             records = future.result()
@@ -562,16 +556,13 @@ def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
                             worker_idx = futures[future]
                             logger.error(f"{E['error']} Worker {worker_idx} falhou: {e}")
                 
-                # Salvar como Parquet (DISK, não RAM)
                 if all_records:
                     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                     chunk_file = RAW_CHUNKS_DIR / f"raw_{len(chunk_files):06d}_{ts}.parquet"
                     
                     try:
-                        # Criar dataframe e salvar
                         import pandas as pd
                         df = pd.DataFrame(all_records, columns=["email", "nome", "origem", "data"])
-                        
                         table = pa.Table.from_pandas(df)
                         pq.write_table(table, str(chunk_file), compression="snappy")
                         
@@ -583,10 +574,8 @@ def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
                     except Exception as e:
                         log_error_detailed(e, f"Salvando chunk Parquet {chunk_file}", [
                             f"Verifique espaço em disco: {disk_usage()}",
-                            "Arquivo pode estar muito grande"
                         ])
         
-        # Deletar arquivo TAR original
         try:
             tar_path.unlink()
             logger.info(f"{E['clean']} TAR deletado: {tar_path.name}")
@@ -597,7 +586,6 @@ def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
         log_error_detailed(e, f"Processando TAR {tar_path}", [
             "Arquivo TAR pode estar corrompido",
             f"Tente extrair manualmente: tar -tzf {tar_path}",
-            "Verifique espaço em disco e permissões"
         ])
     
     logger.info(f"{E['ok']} TAR processado: {len(chunk_files)} chunks, {total_records:,} emails")
@@ -638,7 +626,6 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
         log_error_detailed(e, "Setup Hugging Face", [
             "Verifique se HF_TOKEN está correto",
             "Gere token em: https://huggingface.co/settings/tokens",
-            "Certifique-se de que tem conta HF Pro/Enterprise"
         ])
         raise
 
@@ -677,11 +664,7 @@ def hf_upload_file(api: HfApi, token: str, repo_id: str,
     log_error_detailed(
         Exception(f"Upload falhou após {max_retries} tentativas"),
         f"Upload HF: {repo_path}",
-        [
-            "Arquivo pode estar muito grande",
-            "Verifique quota em Hugging Face",
-            "Tente fazer upload manual via interface web"
-        ]
+        ["Arquivo pode estar muito grande", "Verifique quota em Hugging Face"]
     )
     return False
 
@@ -729,12 +712,9 @@ def hf_download_duckdb(api: HfApi, token: str,
 
 # ===== FASES PRINCIPAIS =====
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
-    """
-    FASE 1: Download de torrents (simultâneo).
-    RETORNA: dict {name: (handle, info, indices)}
-    """
+    """FASE 1: Download de torrents (simultâneo) com busca FUZZY."""
     logger.info(f"\n{'='*70}")
-    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents simultâneos")
+    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents simultâneos (com busca fuzzy)")
     logger.info(f"{'='*70}\n")
     
     completed = {}
@@ -742,7 +722,7 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
     def download_single(item):
         name = item["name"]
         magnet = item["magnet"]
-        targets = item.get("targets", [])
+        patterns = item.get("patterns", [])
         
         try:
             logger.info(f"{E['download']} Iniciando: {name}")
@@ -761,26 +741,29 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
             if stop_event.is_set():
                 raise KeyboardInterrupt()
             
-            info = handle.get_torrent_info()
-            found, missing = find_target_indices(info, targets)
+            info = handle.torrent_info() if hasattr(handle, 'torrent_info') else handle.get_torrent_info()
             
-            if missing:
-                logger.error(f"{E['error']} Alvo(s) não encontrado(s) em {name}: {missing}")
-                raise RuntimeError(f"Targets ausentes no metadata")
+            # ✓ BUSCA FUZZY ao invés de exata
+            found, all_files = find_files_by_patterns(info, patterns)
+            
+            if not found:
+                logger.error(f"{E['error']} Nenhum arquivo encontrado em {name} com padrões: {patterns}")
+                logger.error(f"{E['info']} Você pode precisar atualizar os padrões em MAGNETS")
+                raise RuntimeError(f"Nenhum arquivo correspondente encontrado")
             
             # Definir prioridades
             nfiles = info.num_files()
             for i in range(nfiles):
                 handle.file_priority(i, 7 if i in found else 0)
             
-            logger.info(f"{E['ok']} {name} pronto | Alvo(s): {found}")
+            logger.info(f"{E['ok']} {name} pronto | {len(found)} arquivo(s) selecionado(s): {found}")
             return (name, (handle, info, found))
         
         except Exception as e:
             log_error_detailed(e, f"Download torrent {name}", [
                 "Verifique conectividade com trackers",
                 "Magnet link pode estar inválido",
-                "Tente nova execução depois"
+                "Atualize os padrões em MAGNETS",
             ])
             return None
     
@@ -799,10 +782,7 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
     return completed
 
 def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
-    """
-    FASE 2: Aguardar conclusão dos downloads.
-    RETORNA: list [(name, local_path, info), ...]
-    """
+    """FASE 2: Aguardar conclusão dos downloads."""
     logger.info(f"\n{'='*70}")
     logger.info(f"{E['download']} FASE 2: Aguardando conclusão dos downloads")
     logger.info(f"{'='*70}\n")
@@ -844,17 +824,13 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
                 log_error_detailed(e, f"Aguardando download {file_key}", [
                     "Conexão pode ter sido perdida",
                     "Tente retomar a execução",
-                    "Se persistir, considere reiniciar torrent"
                 ])
     
     logger.info(f"\n{E['ok']} FASE 2 concluída: {len(all_files)} arquivos prontos\n")
     return all_files
 
 def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
-    """
-    FASE 3: Processar TAR.GZ em STREAMING (zero RAM para dados).
-    RETORNA: list [Path(chunk1.parquet), Path(chunk2.parquet), ...]
-    """
+    """FASE 3: Processar TAR.GZ em STREAMING."""
     logger.info(f"\n{'='*70}")
     logger.info(f"{E['extract']} FASE 3: Processar {len(tars)} arquivos TAR")
     logger.info(f"{'='*70}\n")
@@ -883,10 +859,7 @@ def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
 def phase4_load_to_duckdb(chunks: List[Path], 
                           conn: duckdb.DuckDBPyConnection, 
                           state: Dict) -> int:
-    """
-    FASE 4: Carregar chunks em DuckDB (disco, não RAM).
-    RETORNA: total de registros inseridos
-    """
+    """FASE 4: Carregar chunks em DuckDB."""
     logger.info(f"\n{'='*70}")
     logger.info(f"{E['db']} FASE 4: Carregar {len(chunks)} chunks em DuckDB")
     logger.info(f"{'='*70}\n")
@@ -921,18 +894,13 @@ def phase4_load_to_duckdb(chunks: List[Path],
         except Exception as e:
             log_error_detailed(e, f"Carregando chunk {chunk_file}", [
                 "Arquivo Parquet pode estar corrompido",
-                f"Tente deletar: rm {chunk_file}",
-                "O chunk será regenerado na próxima execução"
             ])
     
     logger.info(f"\n{E['ok']} FASE 4 concluída: {total_inserted:,} records inseridos\n")
     return total_inserted
 
 def phase5_deduplicate_duckdb(conn: duckdb.DuckDBPyConnection) -> int:
-    """
-    FASE 5: Deduplicação global (SELECT DISTINCT em disco).
-    RETORNA: total de emails únicos após dedup
-    """
+    """FASE 5: Deduplicação global."""
     logger.info(f"\n{'='*70}")
     logger.info(f"{E['db']} FASE 5: Deduplicação global (SELECT DISTINCT)")
     logger.info(f"{'='*70}\n")
@@ -944,7 +912,6 @@ def phase5_deduplicate_duckdb(conn: duckdb.DuckDBPyConnection) -> int:
         
         logger.info(f"{E['stats']} Records antes de dedup: {count_before:,}")
         
-        # Deduplicação via SELECT DISTINCT
         logger.info(f"{E['db']} Executando SELECT DISTINCT (em disco)...")
         conn.execute("""
             CREATE TABLE emails_dedup AS 
@@ -971,16 +938,11 @@ def phase5_deduplicate_duckdb(conn: duckdb.DuckDBPyConnection) -> int:
     except Exception as e:
         log_error_detailed(e, "Deduplicação DuckDB", [
             "Verifique espaço em disco (precisa de 2x do tamanho original)",
-            "Reduzir BATCH_INSERT_DDB se RAM estiver limitada",
-            "Tente manualmente: DELETE FROM emails_raw WHERE rowid NOT IN (SELECT MIN(rowid) FROM emails_raw GROUP BY email)"
         ])
         return 0
 
 def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
-    """
-    FASE 6: Exportar datasets finais (10M linhas cada em Parquet).
-    RETORNA: list [Trader_Emails_001.parquet, ...]
-    """
+    """FASE 6: Exportar datasets finais."""
     logger.info(f"\n{'='*70}")
     logger.info(f"{E['email']} FASE 6: Gerar datasets finais ({ROWS_PER_FINAL_FILE:,} rows cada)")
     logger.info(f"{'='*70}\n")
@@ -1006,7 +968,6 @@ def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             final_file = EXPORT_DIR / f"Trader_Emails_{file_num:03d}_{ts}.parquet"
             
-            # Exportar para Parquet (comprimido)
             table = pa.Table.from_pandas(rows_df)
             pq.write_table(table, str(final_file), compression="snappy")
             
@@ -1023,7 +984,6 @@ def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
             log_error_detailed(e, f"Exportando arquivo final {file_num}", [
                 "Verifique espaço em disco suficiente",
                 f"Espaço disponível: {disk_usage()['free']}",
-                "Reduza ROWS_PER_FINAL_FILE se necessário"
             ])
             break
     
@@ -1033,14 +993,11 @@ def phase6_export_final_files(conn: duckdb.DuckDBPyConnection) -> List[Path]:
 def phase7_upload_hf(api: HfApi, token: str, emails_repo: str, 
                      checkpoint_repo: str, final_files: List[Path], 
                      db_path: Path, state: Dict):
-    """
-    FASE 7: Upload para HF + atualizar checkpoint.
-    """
+    """FASE 7: Upload para HF + checkpoint."""
     logger.info(f"\n{'='*70}")
     logger.info(f"{E['upload']} FASE 7: Upload Hugging Face + Checkpoint")
     logger.info(f"{'='*70}\n")
     
-    # Upload final datasets
     for i, final_file in enumerate(final_files, 1):
         if stop_event.is_set():
             break
@@ -1055,7 +1012,6 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str,
             except Exception:
                 pass
     
-    # Upload checkpoint
     logger.info(f"{E['upload']} Uploading checkpoint...")
     hf_upload_file(api, token, checkpoint_repo, STATE_PATH, "state.json")
     
@@ -1073,7 +1029,7 @@ def phase7_upload_hf(api: HfApi, token: str, emails_repo: str,
 def main():
     """Orquestração principal."""
     logger.info(f"\n{'#'*70}")
-    logger.info(f"# {E['start']} MINERADOR PRODUCTION V2 - Otimizado para Disco")
+    logger.info(f"# {E['start']} MINERADOR PRODUCTION V3 - Busca Fuzzy + Logs Detalhados")
     logger.info(f"{'#'*70}\n")
     
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
@@ -1083,19 +1039,16 @@ def main():
     logger.info(f"{E['info']} Logs: {LOG_PATH}")
     logger.info(f"{E['error']} Erros detalhados: {ERROR_LOG_PATH}\n")
     
-    # Verificar HF_TOKEN
     if not HF_TOKEN:
         logger.error(f"{E['error']} HF_TOKEN não definido")
         sys.exit(2)
     
-    # Setup HF
     try:
         api, emails_repo, checkpoint_repo = hf_setup_datasets(HF_TOKEN)
     except Exception as e:
         logger.error(f"{E['error']} Setup HF falhou")
         sys.exit(1)
     
-    # Download checkpoint
     logger.info(f"{E['download']} Baixando checkpoint anterior...")
     hf_download_checkpoint(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
     hf_download_duckdb(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
@@ -1103,14 +1056,12 @@ def main():
     state = load_state()
     logger.info(f"{E['ok']} Estado carregado: {len(state)} entradas\n")
     
-    # Inicializar DuckDB
     try:
         conn = init_duckdb(DB_PATH)
     except Exception as e:
         logger.error(f"{E['error']} DuckDB init falhou")
         sys.exit(1)
     
-    # Inicializar libtorrent
     try:
         session = create_libtorrent_session()
     except Exception as e:
@@ -1122,7 +1073,6 @@ def main():
     try:
         overall_start = time.time()
         
-        # FASES
         completed_torrents = phase1_download_torrents(session, MAGNETS)
         
         if not completed_torrents:
