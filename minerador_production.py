@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-minerador_production_v5_final.py — VERSÃO FINAL COM DIAGNÓSTICO AUTOMÁTICO
+minerador_production_v5.py — VERSÃO FINAL COMPLETA
 
-ESTRATÉGIA:
-  ✓ Lista TODOS os arquivos antes de tentar fazer match
-  ✓ Se não encontrar targets exatos, procura fuzzy automático
-  ✓ Seleciona TODOS os .tar.gz que fizerem match com padrões inteligentes
-  ✓ Logs 100% detalhados mostrando cada passo
-  ✓ SEM DEPRECATION WARNINGS (usando alternativas modernas)
+✅ Lista TODOS os arquivos do torrent com índices
+✅ Se targets não encontrados → lista tudo e para para debug
+✅ Busca por correspondência exata de path ou basename
+✅ Mostra exatamente qual arquivo vai baixar
+✅ SEM DeprecationWarnings tratadas
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import tarfile
 import signal
 import logging
 import shutil
-import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any
@@ -36,8 +34,6 @@ import duckdb
 
 # ===== LOGGING =====
 class ColoredFormatter(logging.Formatter):
-    """Formatter com cores."""
-    
     COLORS = {
         'DEBUG': '\033[36m',
         'INFO': '\033[32m',
@@ -56,7 +52,6 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 def setup_logging(log_path: Path, log_level: str = "INFO") -> logging.Logger:
-    """Setup logging."""
     logger = logging.getLogger("minerador_v5")
     logger.setLevel(log_level)
     logger.handlers = []
@@ -70,7 +65,7 @@ def setup_logging(log_path: Path, log_level: str = "INFO") -> logging.Logger:
     console_handler.setFormatter(console_formatter)
     
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(str(log_path), encoding='utf-8', mode='w')
+    file_handler = logging.FileHandler(str(log_path), encoding='utf-8')
     file_handler.setLevel(log_level)
     file_formatter = logging.Formatter(
         fmt='%(asctime)s │ %(levelname)s │ %(funcName)s:%(lineno)d │ %(message)s',
@@ -83,7 +78,7 @@ def setup_logging(log_path: Path, log_level: str = "INFO") -> logging.Logger:
     
     return logger
 
-# ===== CONFIGURAÇÃO =====
+# ===== CONFIG =====
 SAVE_PATH = Path(os.environ.get("SAVE_PATH", "./data"))
 SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -114,7 +109,7 @@ E = {
     "start": "🚀", "download": "📥", "extract": "📦", "stats": "📊",
     "space": "💾", "email": "📧", "upload": "📤", "clean": "🧹",
     "warn": "⚠️", "error": "❌", "ok": "✅", "info": "ℹ️",
-    "cpu": "⚙️", "db": "🗄️", "clock": "⏱️", "list": "📋", "search": "🔍",
+    "cpu": "⚙️", "db": "🗄️", "clock": "⏱️", "list": "📋",
 }
 
 EMAIL_REGEX = re.compile(rb'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', re.IGNORECASE)
@@ -123,23 +118,30 @@ stop_event = Event()
 state_lock = Lock()
 
 def handle_signal(signum, frame):
-    logger.warning(f"{E['warn']} Signal {signum}; encerrando...")
+    logger.warning(f"{E['warn']} Signal {signum}")
     stop_event.set()
 
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
-# ===== MAGNETS =====
+# ===== MAGNET LINKS =====
 MAGNETS = [
     {
         "name": "Collection #2-#5",
         "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
-        "search_keywords": ["collection", "#2", "trading", "collection", "btc", "combo"],
+        "targets": [
+            "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
+            "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
+        ],
     },
     {
         "name": "Collection #1",
         "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
-        "search_keywords": ["collection", "#1", "btc", "combo", "trading", "cloud"],
+        "targets": [
+            "Collection 1/Collection #1_BTC combos.tar.gz",
+            "Collection 1/Collection #1_OLD CLOUD_Trading combos.tar.gz",
+            "Collection 1/Collection #1_OLD CLOUD_BTC combos.tar.gz",
+        ],
     },
 ]
 
@@ -167,7 +169,6 @@ DISPOSABLE_DOMAINS = {
 
 # ===== UTILITIES =====
 def human(n: int) -> str:
-    """Converter bytes."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
             return f"{n:.2f}{unit}"
@@ -175,7 +176,6 @@ def human(n: int) -> str:
     return f"{n:.2f}PB"
 
 def disk_usage(path: Path = SAVE_PATH) -> Dict[str, str]:
-    """Disco."""
     try:
         du = shutil.disk_usage(str(path))
         return {
@@ -184,41 +184,28 @@ def disk_usage(path: Path = SAVE_PATH) -> Dict[str, str]:
             "free": human(du.free),
             "percent": f"{(du.used / du.total * 100):.1f}%"
         }
-    except Exception:
-        return {"error": "N/A"}
-
-def log_error_detailed(exception: Exception, context: str = ""):
-    """Log erro."""
-    error_msg = f"""
-╔════════════════════════════════════════════════════════════════╗
-║ {E['error']} ERRO: {context}
-║ Tipo: {type(exception).__name__}
-║ Msg: {str(exception)[:60]}
-╚════════════════════════════════════════════════════════════════╝
-"""
-    logger.error(error_msg)
+    except Exception as e:
+        return {"error": str(e)}
 
 def save_state(state: Dict[str, Any]):
-    """Salvar estado."""
     with state_lock:
         try:
             with open(STATE_PATH, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, default=str, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"{E['error']} Falha ao salvar estado: {e}")
+            logger.error(f"Erro salvando state: {e}")
 
 def load_state() -> Dict[str, Any]:
-    """Carregar estado."""
     try:
         if STATE_PATH.exists():
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         return {}
-    except Exception:
+    except Exception as e:
+        logger.error(f"Erro carregando state: {e}")
         return {}
 
 def is_disposable_email(email: str) -> bool:
-    """Verificar email."""
     try:
         domain = email.split("@")[-1].lower()
         return domain in DISPOSABLE_DOMAINS
@@ -227,7 +214,6 @@ def is_disposable_email(email: str) -> bool:
 
 # ===== DUCKDB =====
 def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
-    """Init DuckDB."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
     try:
@@ -247,15 +233,14 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
         """)
         conn.commit()
         
-        logger.info(f"{E['ok']} DuckDB OK")
+        logger.info(f"{E['ok']} DuckDB inicializado")
         return conn
     
     except Exception as e:
-        log_error_detailed(e, "Init DuckDB")
+        logger.error(f"{E['error']} DuckDB init falhou: {e}")
         raise
 
 def batch_insert_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tuple]) -> int:
-    """Insert."""
     if not records:
         return 0
     
@@ -266,20 +251,19 @@ def batch_insert_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tuple]) -
                     "INSERT INTO emails_raw (email, nome, origem, data) VALUES (?, ?, ?, ?)",
                     [email, nome, origem, data],
                 )
-            except:
+            except duckdb.CatalogException:
                 pass
         
         conn.commit()
         return len(records)
     
     except Exception as e:
-        log_error_detailed(e, "Insert DuckDB")
+        logger.error(f"{E['error']} Insert falhou: {e}")
         conn.rollback()
         return 0
 
 # ===== LIBTORRENT =====
 def create_libtorrent_session() -> lt.session:
-    """Session."""
     try:
         session = lt.session()
         
@@ -297,136 +281,127 @@ def create_libtorrent_session() -> lt.session:
             settings.set_bool("enable_pex", True)
             
             session.apply_settings(settings)
-        except:
+        
+        except AttributeError:
             pass
         
-        logger.info(f"{E['ok']} Libtorrent OK")
+        logger.info(f"{E['ok']} Libtorrent inicializado")
         return session
     
     except Exception as e:
-        log_error_detailed(e, "Libtorrent")
+        logger.error(f"{E['error']} Libtorrent init falhou: {e}")
         raise
 
-def get_all_torrent_files(torrent_info: lt.torrent_info) -> Dict[int, Dict]:
-    """Obter TODOS os arquivos do torrent com diagnóstico completo."""
-    files_dict = {}
+def list_all_torrent_files(torrent_info) -> Dict[int, Dict]:
+    """Lista TODOS os arquivos do torrent com índices e detalhes."""
+    files_map = {}
     
     try:
-        # Usar file_storage ao invés de at() para evitar deprecation
-        file_storage = torrent_info.files()
-        n = file_storage.num_files()
-        
-        for i in range(n):
-            try:
-                # Alternativa moderna ao at()
-                file_entry = file_storage[i]
+        n = len(torrent_info.files())
+    except Exception:
+        try:
+            n = torrent_info.num_files()
+        except Exception:
+            logger.error(f"{E['error']} Não consegui obter número de arquivos")
+            return files_map
+    
+    for i in range(n):
+        try:
+            file_entry = torrent_info.files()[i] if hasattr(torrent_info.files(), '__getitem__') else None
+            
+            if file_entry is None:
+                try:
+                    file_path = torrent_info.files().at(i).path
+                    file_size = torrent_info.files().at(i).size
+                except Exception:
+                    continue
+            else:
                 file_path = file_entry.path
                 file_size = file_entry.size
-                
-                files_dict[i] = {
-                    "path": file_path,
-                    "size": file_size,
-                    "basename": Path(file_path).name,
-                    "name_lower": file_path.lower(),
-                }
-            except Exception:
-                # Fallback se file_storage[i] não funcionar
-                try:
-                    file_path = file_storage.at(i).path
-                    file_size = file_storage.at(i).size
-                    
-                    files_dict[i] = {
-                        "path": file_path,
-                        "size": file_size,
-                        "basename": Path(file_path).name,
-                        "name_lower": file_path.lower(),
-                    }
-                except Exception as inner_e:
-                    logger.debug(f"Erro ao obter arquivo {i}: {inner_e}")
-                    continue
+            
+            files_map[i] = {
+                "path": file_path,
+                "size": file_size,
+                "basename": Path(file_path).name
+            }
+        except Exception as e:
+            logger.debug(f"Erro lendo arquivo {i}: {e}")
+            continue
     
-    except Exception as e:
-        logger.error(f"{E['error']} Falha ao obter files: {e}")
-    
-    return files_dict
+    return files_map
 
-def find_target_indices_smart(torrent_info: lt.torrent_info, keywords: List[str]) -> List[int]:
+def find_targets_exact(torrent_info, targets: List[str]) -> Tuple[List[int], Dict[int, Dict]]:
     """
-    Busca INTELIGENTE:
-    1. Lista TODOS os arquivos
-    2. Procura por .tar.gz files
-    3. Faz matching fuzzy com keywords
-    4. Retorna TODOS que darem match
+    Busca EXATA por targets.
+    Se não encontrar → lista todos os arquivos para debug.
     """
-    all_files = get_all_torrent_files(torrent_info)
+    files_map = list_all_torrent_files(torrent_info)
     
-    # Log de diagnóstico
-    logger.info(f"\n{E['list']} DIAGNÓSTICO DO TORRENT:")
-    logger.info(f"{'─' * 70}")
-    logger.info(f"Total de arquivos: {len(all_files)}")
-    logger.info(f"Procurando por keywords: {keywords}")
-    logger.info(f"{'─' * 70}\n")
+    if not files_map:
+        logger.error(f"{E['error']} Nenhum arquivo foi lido do torrent!")
+        return [], {}
     
-    # Listar TODOS os arquivos tar.gz
-    logger.info(f"{E['info']} ARQUIVOS .tar.gz DISPONÍVEIS:")
-    tar_files = {}
+    # Log de TODOS os arquivos
+    logger.info(f"\n{E['list']} ═══ TODOS OS ARQUIVOS NO TORRENT ({len(files_map)} total) ═══")
+    for idx in sorted(files_map.keys()):
+        info = files_map[idx]
+        logger.info(f"  [{idx:3d}] {info['path']:60s} | {human(info['size']):>12s}")
+    logger.info(f"{'═' * 100}\n")
     
-    for idx, file_info in sorted(all_files.items()):
-        path_lower = file_info["name_lower"]
+    found = []
+    
+    # BUSCA 1: Exato por path completo
+    logger.info(f"{E['info']} BUSCANDO TARGETS (Correspondência Exata):")
+    for target in targets:
+        logger.info(f"\n  Procurando: '{target}'")
+        matched = False
         
-        if path_lower.endswith(".tar.gz"):
-            tar_files[idx] = file_info
-            logger.info(f"  [{idx:3d}] {file_info['path']} ({human(file_info['size'])})")
-    
-    logger.info(f"\n{E['search']} PROCURANDO MATCHES COM KEYWORDS:")
-    logger.info(f"Keywords: {' + '.join(keywords)}\n")
-    
-    # Busca fuzzy: procura por TODOS os keywords
-    found_indices = []
-    
-    for idx, file_info in tar_files.items():
-        name_lower = file_info["name_lower"]
+        for idx, file_info in files_map.items():
+            if file_info["path"] == target:
+                logger.info(f"    {E['ok']} ✅ ENCONTRADO no índice [{idx}]")
+                logger.info(f"       Path: {file_info['path']}")
+                logger.info(f"       Size: {human(file_info['size'])}")
+                found.append(idx)
+                matched = True
+                break
         
-        # Contar quantos keywords estão presentes
-        matches = sum(1 for kw in keywords if kw.lower() in name_lower)
-        match_pct = (matches / len(keywords)) * 100 if keywords else 0
-        
-        # Se >50% dos keywords coincidem, incluir
-        if match_pct >= 50:
-            logger.info(f"  {E['ok']} ✅ MATCH ({match_pct:.0f}%): {file_info['path']}")
-            found_indices.append(idx)
-        else:
-            logger.info(f"  ⭕ Nope ({match_pct:.0f}%): {file_info['basename']}")
+        if not matched:
+            logger.info(f"    {E['warn']} ❌ NÃO ENCONTRADO (exato)")
+            
+            # BUSCA 2: Pelo basename
+            target_basename = Path(target).name
+            logger.info(f"    Tentando por basename: '{target_basename}'")
+            
+            for idx, file_info in files_map.items():
+                if file_info["basename"] == target_basename:
+                    logger.info(f"      {E['ok']} ✅ ENCONTRADO no índice [{idx}] (basename)")
+                    logger.info(f"         Path: {file_info['path']}")
+                    logger.info(f"         Size: {human(file_info['size'])}")
+                    found.append(idx)
+                    matched = True
+                    break
+            
+            if not matched:
+                logger.warning(f"      {E['warn']} ❌ NÃO ENCONTRADO (basename)")
     
-    if not found_indices:
-        logger.warning(f"\n{E['warn']} NENHUM MATCH ENCONTRADO COM {len(keywords)} KEYWORDS")
-        logger.warning(f"Procurando fallback: apenas .tar.gz files que contenham 'combo' ou 'collection'...\n")
-        
-        # Fallback: pegar TODOS os tar.gz que contenham "combo" ou "collection"
-        for idx, file_info in tar_files.items():
-            name_lower = file_info["name_lower"]
-            if ("combo" in name_lower or "collection" in name_lower) and "tar.gz" in name_lower:
-                logger.info(f"  {E['ok']} FALLBACK: {file_info['path']}")
-                found_indices.append(idx)
+    logger.info(f"\n{E['list']} RESUMO: {len(found)} target(s) encontrado(s) nos índices: {found}\n")
     
-    logger.info(f"\n{E['ok']} TOTAL ENCONTRADO: {len(found_indices)} arquivo(s)\n")
-    
-    return sorted(set(found_indices))
+    return sorted(set(found)), files_map
 
-def local_path_for_index(save_path: Path, torrent_info: lt.torrent_info, index: int) -> Path:
-    """Caminho local."""
+def local_path_for_index(save_path: Path, torrent_info, index: int) -> Path:
     torrent_name = torrent_info.name()
-    
     try:
-        file_entry = torrent_info.files()[index]
-        file_path = file_entry.path
-    except:
         file_path = torrent_info.files().at(index).path
+    except Exception:
+        try:
+            file_path = torrent_info.files()[index].path
+        except Exception:
+            logger.error(f"{E['error']} Não consegui obter path do arquivo {index}")
+            return None
     
     return save_path / torrent_name / file_path
 
 def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_size: int) -> bool:
-    """Aguardar."""
     last_log = 0
     start_time = time.time()
     
@@ -442,7 +417,9 @@ def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_
             now = time.time()
             if now - last_log >= 5:
                 speed = got / (now - start_time) if (now - start_time) > 0 else 0
-                logger.info(f"{E['download']} [{file_index}] {human(got)}/{human(expected_size)} ({pct:.1f}%)")
+                logger.info(
+                    f"{E['download']} File[{file_index}]: {human(got)}/{human(expected_size)} ({pct:.1f}%)"
+                )
                 last_log = now
             
             if expected_size and got >= expected_size:
@@ -451,12 +428,12 @@ def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_
             
             time.sleep(POLL_INTERVAL)
         
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Erro monitorando: {e}")
             time.sleep(POLL_INTERVAL)
 
 # ===== PROCESSAMENTO =====
 def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List[Tuple]:
-    """Worker."""
     results = []
     data_iso = datetime.now(timezone.utc).isoformat()
     
@@ -466,7 +443,7 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
                 email_b = match.group()
                 try:
                     email = email_b.decode("utf8", "ignore").strip().lower()
-                except:
+                except Exception:
                     email = email_b.decode("latin1", "ignore").strip().lower()
                 
                 if not email or "@" not in email or is_disposable_email(email):
@@ -479,16 +456,15 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
                 
                 results.append((email, nome, origin, data_iso))
             
-            except:
+            except Exception:
                 continue
     
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"{E['error']} Worker error: {e}")
     
     return results
 
 def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
-    """Processar TAR."""
     cpu_count = os.cpu_count() or 4
     chunk_files = []
     total_records = 0
@@ -507,7 +483,7 @@ def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
                     continue
                 
                 member_count += 1
-                logger.info(f"{E['extract']} [{member_count}] {member.name}")
+                logger.info(f"{E['extract']} [{member_count}] {member.name} ({human(member.size)})")
                 
                 fobj = tar.extractfile(member)
                 if fobj is None:
@@ -535,8 +511,8 @@ def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
                         try:
                             records = future.result()
                             all_records.extend(records)
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.error(f"{E['error']} Worker: {e}")
                 
                 if all_records:
                     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -551,25 +527,24 @@ def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
                         chunk_files.append(chunk_file)
                         total_records += len(all_records)
                         
-                        logger.info(f"{E['ok']} Chunk: {len(all_records):,} emails")
+                        logger.info(f"{E['ok']} Chunk: {chunk_file.name} ({len(all_records):,})")
                     
                     except Exception as e:
-                        log_error_detailed(e, "Salvar chunk")
+                        logger.error(f"{E['error']} Chunk save: {e}")
         
         try:
             tar_path.unlink()
-        except:
+        except Exception:
             pass
     
     except Exception as e:
-        log_error_detailed(e, "Processar TAR")
+        logger.error(f"{E['error']} TAR process: {e}")
     
-    logger.info(f"{E['ok']} TAR: {len(chunk_files)} chunks, {total_records:,} emails")
+    logger.info(f"{E['ok']} TAR: {len(chunk_files)} chunks, {total_records:,}")
     return chunk_files
 
 # ===== HUGGING FACE =====
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
-    """Setup HF."""
     if not token:
         raise RuntimeError("HF_TOKEN não definido")
     
@@ -579,7 +554,7 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
         user = who.get("name") or who.get("user")
         
         if not user:
-            raise RuntimeError("Usuário HF não determinado")
+            raise RuntimeError("Usuário HF não encontrado")
         
         emails_repo = f"{user}/{HF_REPO_EMAILS}"
         checkpoint_repo = f"{user}/{HF_REPO_CHECKPOINT}"
@@ -597,18 +572,17 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
         return api, emails_repo, checkpoint_repo
     
     except Exception as e:
-        log_error_detailed(e, "Setup HF")
+        logger.error(f"{E['error']} HF setup: {e}")
         raise
 
 def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_path: str) -> bool:
-    """Upload."""
     if not local_path.exists():
         return False
     
     file_size = local_path.stat().st_size
     max_retries = 3
     
-    logger.info(f"{E['upload']} Upload: {repo_path} ({human(file_size)})")
+    logger.info(f"{E['upload']} Upload: {repo_path}")
     
     for attempt in range(max_retries):
         try:
@@ -622,7 +596,7 @@ def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_
             logger.info(f"{E['ok']} Upload OK")
             return True
         
-        except Exception:
+        except Exception as e:
             logger.warning(f"{E['warn']} Tentativa {attempt + 1}/{max_retries}")
             if attempt < max_retries - 1:
                 time.sleep((attempt + 1) * 10)
@@ -630,7 +604,6 @@ def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_
     return False
 
 def hf_download_checkpoint(api: HfApi, token: str, checkpoint_repo: str, local_path: Path) -> bool:
-    """Download checkpoint."""
     try:
         logger.info(f"{E['download']} Baixando checkpoint...")
         api.hf_hub_download(
@@ -647,7 +620,6 @@ def hf_download_checkpoint(api: HfApi, token: str, checkpoint_repo: str, local_p
         return False
 
 def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path: Path) -> bool:
-    """Download DuckDB."""
     try:
         logger.info(f"{E['download']} Baixando DuckDB...")
         api.hf_hub_download(
@@ -665,17 +637,17 @@ def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path:
 
 # ===== FASES =====
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
-    """FASE 1: Download torrents com busca inteligente."""
-    logger.info(f"\n{'='*70}")
-    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents (busca inteligente com diagnóstico)")
-    logger.info(f"{'='*70}\n")
+    """FASE 1: Download torrents com listagem COMPLETA de arquivos."""
+    logger.info(f"\n{'='*100}")
+    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents (com debug completo)")
+    logger.info(f"{'='*100}\n")
     
     completed = {}
     
     def download_single(item):
         name = item["name"]
         magnet = item["magnet"]
-        keywords = item.get("search_keywords", [])
+        targets = item.get("targets", [])
         
         try:
             logger.info(f"{E['download']} Iniciando: {name}")
@@ -684,55 +656,74 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
             handle = session.add_torrent(params)
             
             metadata_wait = 0
-            while True:
+            max_wait = 600
+            while metadata_wait < max_wait and not stop_event.is_set():
                 try:
-                    has_meta = handle.torrent_info() is not None
-                except:
-                    has_meta = handle.has_metadata() if hasattr(handle, 'has_metadata') else False
+                    has_metadata = handle.has_metadata()
+                except Exception:
+                    has_metadata = False
                 
-                if has_meta or stop_event.is_set():
+                if has_metadata:
                     break
                 
                 metadata_wait += 1
-                if metadata_wait % 10 == 0:
-                    logger.debug(f"{E['clock']} Aguardando metadata {name}...")
-                time.sleep(POLL_INTERVAL)
+                if metadata_wait % 30 == 0:
+                    logger.debug(f"{E['clock']} Aguardando metadata {name}... ({metadata_wait}s)")
+                time.sleep(1)
+            
+            if metadata_wait >= max_wait:
+                logger.error(f"{E['error']} Timeout aguardando metadata")
+                return None
             
             if stop_event.is_set():
                 raise KeyboardInterrupt()
             
-            # Usar torrent_info() se disponível, fallback para get_torrent_info()
+            # Obter info do torrent
             try:
                 info = handle.torrent_info()
-            except:
-                info = handle.get_torrent_info()
+            except Exception:
+                try:
+                    info = handle.get_torrent_info()
+                except Exception as e:
+                    logger.error(f"{E['error']} Não consegui obter torrent_info: {e}")
+                    return None
             
-            # Busca inteligente com diagnóstico completo
-            found = find_target_indices_smart(info, keywords)
+            # BUSCA EXATA
+            found, all_files = find_targets_exact(info, targets)
             
             if not found:
-                logger.error(f"{E['error']} Nenhum arquivo encontrado em {name}")
-                logger.error(f"    Keywords procurados: {keywords}")
-                logger.error(f"    Verifique os logs acima para diagnóstico completo")
-                raise RuntimeError(f"Nenhum arquivo encontrado")
+                logger.error(f"\n{E['error']} ❌ NENHUM TARGET ENCONTRADO em {name}!")
+                logger.error(f"    Targets procurados:")
+                for t in targets:
+                    logger.error(f"      - {t}")
+                logger.error(f"\n    Arquivos disponíveis:")
+                for idx in sorted(all_files.keys()):
+                    f = all_files[idx]
+                    logger.error(f"      [{idx:3d}] {f['path']}")
+                
+                logger.error(f"\n    💡 DICA: Atualize os 'targets' em MAGNETS com os nomes exatos acima!")
+                return None
             
             # Definir prioridades
             try:
-                n_files = info.files().num_files()
-            except:
-                n_files = len(list(get_all_torrent_files(info).keys()))
+                nfiles = len(info.files())
+            except Exception:
+                try:
+                    nfiles = info.num_files()
+                except Exception:
+                    nfiles = max(all_files.keys()) + 1
             
-            for i in range(n_files):
+            for i in range(nfiles):
                 try:
                     handle.file_priority(i, 7 if i in found else 0)
-                except:
+                except Exception:
                     pass
             
-            logger.info(f"{E['ok']} {name} PRONTO | {len(found)} arquivo(s): {found}")
-            return (name, (handle, info, found))
+            logger.info(f"{E['ok']} {name} pronto | {len(found)} arquivo(s): {found}")
+            return (name, (handle, info, found, all_files))
         
         except Exception as e:
-            log_error_detailed(e, f"Torrent {name}")
+            logger.error(f"{E['error']} Torrent {name}: {e}")
             return None
     
     with ThreadPoolExecutor(max_workers=min(len(magnets), 5)) as executor:
@@ -743,22 +734,22 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
                 if result:
                     name, data = result
                     completed[name] = data
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"{E['error']} Future error: {e}")
     
     logger.info(f"\n{E['ok']} FASE 1: {len(completed)}/{len(magnets)} torrents prontos\n")
     return completed
 
 def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
     """FASE 2: Aguardar downloads."""
-    logger.info(f"\n{'='*70}")
+    logger.info(f"\n{'='*100}")
     logger.info(f"{E['download']} FASE 2: Aguardando downloads")
-    logger.info(f"{'='*70}\n")
+    logger.info(f"{'='*100}\n")
     
     all_files = []
     processed_key = state.get("downloaded_files", {})
     
-    for tname, (handle, info, indices) in completed_torrents.items():
+    for tname, (handle, info, indices, all_files_map) in completed_torrents.items():
         if stop_event.is_set():
             break
         
@@ -769,19 +760,25 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
                 continue
             
             try:
-                file_entry = info.files()[idx]
-                expected_size = file_entry.size
-            except:
-                expected_size = info.files().at(idx).size
+                expected_size = all_files_map[idx]["size"]
+            except Exception:
+                try:
+                    expected_size = info.files().at(idx).size
+                except Exception:
+                    expected_size = 0
             
-            logger.info(f"{E['download']} Esperando: {tname} idx:{idx} ({human(expected_size)})")
+            logger.info(f"{E['download']} Esperando: {tname} [idx:{idx}] ({human(expected_size)})")
             
             try:
                 wait_for_file_complete(handle, idx, expected_size)
                 local_path = local_path_for_index(SAVE_PATH, info, idx)
                 
+                if local_path is None:
+                    logger.error(f"{E['error']} Local path é None")
+                    continue
+                
                 if not local_path.exists():
-                    logger.error(f"{E['error']} Arquivo não encontrado: {local_path}")
+                    logger.error(f"{E['error']} Arquivo não existe: {local_path}")
                     continue
                 
                 all_files.append((tname, local_path, info))
@@ -791,16 +788,16 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
                 save_state(state)
             
             except Exception as e:
-                log_error_detailed(e, f"Download {file_key}")
+                logger.error(f"{E['error']} Download {file_key}: {e}")
     
     logger.info(f"\n{E['ok']} FASE 2: {len(all_files)} arquivos prontos\n")
     return all_files
 
 def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
     """FASE 3: Processar TARs."""
-    logger.info(f"\n{'='*70}")
+    logger.info(f"\n{'='*100}")
     logger.info(f"{E['extract']} FASE 3: Processar {len(tars)} TARs")
-    logger.info(f"{'='*70}\n")
+    logger.info(f"{'='*100}\n")
     
     all_chunks = []
     processed_tars = state.get("processed_tars", [])
@@ -824,10 +821,10 @@ def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
     return all_chunks
 
 def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, state: Dict) -> int:
-    """FASE 4: Carregar."""
-    logger.info(f"\n{'='*70}")
+    """FASE 4: Carregar em DuckDB."""
+    logger.info(f"\n{'='*100}")
     logger.info(f"{E['db']} FASE 4: Carregar {len(chunks)} chunks")
-    logger.info(f"{'='*70}\n")
+    logger.info(f"{'='*100}\n")
     
     import pandas as pd
     
@@ -854,19 +851,19 @@ def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, s
             state["loaded_chunks"] = loaded_chunks
             save_state(state)
             
-            logger.info(f"{E['ok']} [{i}/{len(chunks)}] +{inserted:,} records")
+            logger.info(f"{E['ok']} [{i}/{len(chunks)}] +{inserted:,}")
         
         except Exception as e:
-            log_error_detailed(e, f"Carregando chunk {i}")
+            logger.error(f"{E['error']} Load chunk: {e}")
     
-    logger.info(f"\n{E['ok']} FASE 4: {total_inserted:,} records\n")
+    logger.info(f"\n{E['ok']} FASE 4: {total_inserted:,} total\n")
     return total_inserted
 
 def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
-    """FASE 5: Dedup."""
-    logger.info(f"\n{'='*70}")
+    """FASE 5: Deduplicate."""
+    logger.info(f"\n{'='*100}")
     logger.info(f"{E['db']} FASE 5: Deduplicação")
-    logger.info(f"{'='*70}\n")
+    logger.info(f"{'='*100}\n")
     
     try:
         count_before = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
@@ -878,23 +875,22 @@ def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
         conn.commit()
         
         count_after = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
-        duplicates = count_before - count_after
         
         logger.info(f"{E['stats']} Depois: {count_after:,}")
-        logger.info(f"{E['email']} Removidos: {duplicates:,}")
+        logger.info(f"{E['email']} Removidos: {count_before - count_after:,}")
         
-        logger.info(f"\n{E['ok']} FASE 5: {count_after:,} únicos\n")
+        logger.info(f"\n{E['ok']} FASE 5 completa\n")
         return count_after
     
     except Exception as e:
-        log_error_detailed(e, "Dedup")
+        logger.error(f"{E['error']} Dedup: {e}")
         return 0
 
 def phase6_export(conn: duckdb.DuckDBPyConnection) -> List[Path]:
     """FASE 6: Exportar."""
-    logger.info(f"\n{'='*70}")
-    logger.info(f"{E['email']} FASE 6: Exportar datasets")
-    logger.info(f"{'='*70}\n")
+    logger.info(f"\n{'='*100}")
+    logger.info(f"{E['email']} FASE 6: Exportar")
+    logger.info(f"{'='*100}\n")
     
     final_files = []
     file_num = 1
@@ -902,8 +898,6 @@ def phase6_export(conn: duckdb.DuckDBPyConnection) -> List[Path]:
     
     while not stop_event.is_set():
         try:
-            logger.info(f"{E['email']} Exportando file {file_num}...")
-            
             rows_df = conn.execute(f"""
                 SELECT * FROM emails_raw 
                 LIMIT {ROWS_PER_FINAL_FILE} 
@@ -920,13 +914,13 @@ def phase6_export(conn: duckdb.DuckDBPyConnection) -> List[Path]:
             pq.write_table(table, str(final_file), compression="snappy")
             
             final_files.append(final_file)
-            logger.info(f"{E['ok']} [{file_num}] {final_file.name} ({rows_df.shape[0]:,} rows)")
+            logger.info(f"{E['ok']} [{file_num}] {rows_df.shape[0]:,} rows")
             
             file_num += 1
             offset += ROWS_PER_FINAL_FILE
         
         except Exception as e:
-            log_error_detailed(e, f"Export file {file_num}")
+            logger.error(f"{E['error']} Export: {e}")
             break
     
     logger.info(f"\n{E['ok']} FASE 6: {len(final_files)} files\n")
@@ -935,21 +929,18 @@ def phase6_export(conn: duckdb.DuckDBPyConnection) -> List[Path]:
 def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str, 
                   final_files: List[Path], db_path: Path, state: Dict):
     """FASE 7: Upload."""
-    logger.info(f"\n{'='*70}")
-    logger.info(f"{E['upload']} FASE 7: Upload HF")
-    logger.info(f"{'='*70}\n")
+    logger.info(f"\n{'='*100}")
+    logger.info(f"{E['upload']} FASE 7: Upload")
+    logger.info(f"{'='*100}\n")
     
     for i, final_file in enumerate(final_files, 1):
         if stop_event.is_set():
             break
         
-        repo_path = f"Trader_Emails/{final_file.name}"
-        logger.info(f"{E['upload']} [{i}/{len(final_files)}] {repo_path}")
-        
-        if hf_upload_file(api, token, emails_repo, final_file, repo_path):
+        if hf_upload_file(api, token, emails_repo, final_file, f"Trader_Emails/{final_file.name}"):
             try:
                 final_file.unlink()
-            except:
+            except Exception:
                 pass
     
     hf_upload_file(api, token, checkpoint_repo, STATE_PATH, "state.json")
@@ -964,10 +955,9 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
 
 # ===== MAIN =====
 def main():
-    """Main."""
-    logger.info(f"\n{'#'*70}")
-    logger.info(f"# {E['start']} MINERADOR V5 FINAL - Diagnóstico Completo + Busca Inteligente")
-    logger.info(f"{'#'*70}\n")
+    logger.info(f"\n{'#'*100}")
+    logger.info(f"# {E['start']} MINERADOR V5 - VERSÃO FINAL COMPLETA (Debug Total)")
+    logger.info(f"{'#'*100}\n")
     
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['cpu']} CPU: {os.cpu_count()}")
@@ -1031,24 +1021,26 @@ def main():
                                         final_files, DB_PATH, state)
         
         total_time = time.time() - overall_start
-        logger.info(f"\n{'='*70}")
-        logger.info(f"{E['ok']} ✅ SUCESSO TOTAL")
+        logger.info(f"\n{'='*100}")
+        logger.info(f"{E['ok']} ✅ SUCESSO COMPLETO")
         logger.info(f"{E['clock']} Tempo: {total_time / 60:.2f}min")
         logger.info(f"{E['email']} Emails: {total_emails:,}")
-        logger.info(f"{E['stats']} Disco: {disk_usage()}")
-        logger.info(f"{'='*70}\n")
+        logger.info(f"{E['stats']} Disco Final: {disk_usage()}")
+        logger.info(f"{'='*100}\n")
     
     except KeyboardInterrupt:
-        logger.warning(f"\n{E['warn']} Interrupção")
+        logger.warning(f"\n{E['warn']} Interrupção do usuário")
     
     except Exception as e:
-        log_error_detailed(e, "Main")
+        logger.error(f"{E['error']} Erro: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         sys.exit(1)
     
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 if __name__ == "__main__":
