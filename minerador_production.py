@@ -66,6 +66,9 @@ def setup_logging(log_path: Path, log_level: str = "INFO") -> logging.Logger:
     logger = logging.getLogger("minerador_v2")
     logger.setLevel(log_level)
     
+    # Limpar handlers antigos
+    logger.handlers = []
+    
     # Console handler (colorido)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
@@ -111,9 +114,9 @@ HF_REPO_CHECKPOINT = os.environ.get("HF_REPO_CHECKPOINT", "minerador_checkpoints
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "100000"))  # Reduzido para usar menos RAM
-ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "10000000"))  # 10M ao invés de 30M
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))  # 256MB chunks ao invés de 1GB
+BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "100000"))
+ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "10000000"))
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 
 # Setup logging
@@ -285,10 +288,10 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
         
         # ✓ SETTINGS OTIMIZADOS PARA DISCO (não RAM)
         conn.execute("SET threads=8;")
-        conn.execute("SET memory_limit='2GB';")  # Limite BAIXO de RAM
+        conn.execute("SET memory_limit='2GB';")
         conn.execute("SET max_memory='2GB';")
-        conn.execute("SET buffer_pool_size='512MB';")
-        conn.execute("SET temp_directory=?;", [str(TEMP_DIR)])
+        # REMOVIDO: buffer_pool_size (não existe em todas versões do DuckDB)
+        conn.execute(f"SET temp_directory='{str(TEMP_DIR)}';")
         
         logger.info(f"{E['db']} DuckDB: Temporary dir = {TEMP_DIR}")
         
@@ -314,36 +317,33 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
         raise
 
 def batch_insert_duckdb_streaming(conn: duckdb.DuckDBPyConnection, 
-                                   temp_parquet: Path) -> int:
+                                   records: List[Tuple]) -> int:
     """
-    Inserir dados via arquivo Parquet (ZERO RAM para dados brutos).
-    Muito mais eficiente que INSERT individual.
+    Inserir dados em batch direto (otimizado para DuckDB).
     """
-    if not temp_parquet.exists():
+    if not records:
         return 0
     
     try:
-        # Ler do Parquet diretamente para DuckDB (não carrega em RAM)
-        result = conn.execute(f"""
-            INSERT INTO emails_raw 
-            SELECT DISTINCT * FROM read_parquet('{temp_parquet}')
-            ON CONFLICT (email) DO NOTHING;
-        """).fetchall()
+        # Usar INSERT com VALUES lista para melhor performance
+        for email, nome, origem, data in records:
+            try:
+                conn.execute(
+                    "INSERT INTO emails_raw (email, nome, origem, data) VALUES (?, ?, ?, ?)",
+                    [email, nome, origem, data],
+                )
+            except duckdb.CatalogException:
+                # Duplicate, skip
+                pass
         
         conn.commit()
-        
-        # Contar quantos foram inseridos
-        count = conn.execute(
-            "SELECT COUNT(*) FROM emails_raw;"
-        ).fetchone()[0]
-        
-        return count
+        return len(records)
     
     except Exception as e:
         log_error_detailed(e, "Inserindo batch DuckDB", [
-            f"Arquivo Parquet pode estar corrompido: {temp_parquet}",
+            f"Verifique espaço em disco disponível",
             "Tente deletar e reprocessar o chunk",
-            "Verifique espaço em disco disponível"
+            "Ou reduza BATCH_INSERT_DDB"
         ])
         conn.rollback()
         return 0
@@ -568,24 +568,13 @@ def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
                     chunk_file = RAW_CHUNKS_DIR / f"raw_{len(chunk_files):06d}_{ts}.parquet"
                     
                     try:
-                        # Usar DuckDB para converter para Parquet (mais eficiente)
-                        temp_csv = TEMP_DIR / f"temp_{chunk_file.stem}.csv"
+                        # Criar dataframe e salvar
+                        import pandas as pd
+                        df = pd.DataFrame(all_records, columns=["email", "nome", "origem", "data"])
                         
-                        with open(temp_csv, "w", encoding="utf-8") as f:
-                            f.write("email,nome,origem,data\n")
-                            for email, nome, origem, data in all_records:
-                                f.write(f'"{email}","{nome}","{origem}","{data}"\n')
+                        table = pa.Table.from_pandas(df)
+                        pq.write_table(table, str(chunk_file), compression="snappy")
                         
-                        # Converter CSV → Parquet via DuckDB
-                        conn_temp = duckdb.connect(":memory:")
-                        conn_temp.execute(f"""
-                            COPY (SELECT * FROM read_csv('{temp_csv}'))
-                            TO '{chunk_file}'
-                            (FORMAT PARQUET, COMPRESSION 'snappy');
-                        """)
-                        conn_temp.close()
-                        
-                        temp_csv.unlink()
                         chunk_files.append(chunk_file)
                         total_records += len(all_records)
                         
@@ -594,7 +583,7 @@ def process_tar_with_disk_streaming(tar_path: Path, origin: str) -> List[Path]:
                     except Exception as e:
                         log_error_detailed(e, f"Salvando chunk Parquet {chunk_file}", [
                             f"Verifique espaço em disco: {disk_usage()}",
-                            f"Arquivo temporário pode estar corrompido: {temp_csv}"
+                            "Arquivo pode estar muito grande"
                         ])
         
         # Deletar arquivo TAR original
@@ -679,12 +668,6 @@ def hf_upload_file(api: HfApi, token: str, repo_id: str,
         
         except Exception as e:
             logger.warning(f"{E['warn']} Upload tentativa {attempt + 1}/{max_retries} falhou")
-            
-            suggestions = [
-                f"Erro: {str(e)[:80]}",
-                "Verifique conexão de rede",
-                "Tente reduzir tamanho do arquivo"
-            ]
             
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 10
@@ -908,6 +891,8 @@ def phase4_load_to_duckdb(chunks: List[Path],
     logger.info(f"{E['db']} FASE 4: Carregar {len(chunks)} chunks em DuckDB")
     logger.info(f"{'='*70}\n")
     
+    import pandas as pd
+    
     total_inserted = 0
     loaded_chunks = state.get("loaded_chunks", [])
     
@@ -922,7 +907,9 @@ def phase4_load_to_duckdb(chunks: List[Path],
         try:
             logger.info(f"{E['db']} [{i}/{len(chunks)}] Carregando: {chunk_file.name}...")
             
-            inserted = batch_insert_duckdb_streaming(conn, chunk_file)
+            df = pd.read_parquet(chunk_file)
+            records = [tuple(row) for row in df.itertuples(index=False, name=None)]
+            inserted = batch_insert_duckdb_streaming(conn, records)
             total_inserted += inserted
             
             loaded_chunks.append(str(chunk_file))
@@ -1130,6 +1117,8 @@ def main():
         logger.error(f"{E['error']} Libtorrent init falhou")
         sys.exit(1)
     
+    total_emails = 0
+    
     try:
         overall_start = time.time()
         
@@ -1190,4 +1179,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-q4 
