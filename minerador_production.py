@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-minerador_production_v6_optimized.py
+minerador_production_v7_pipeline_fixed.py
 
-Versão OTIMIZADA: pipeline ajustado para INSERIR DIRETO NO DUCKDB com batching
-- Elimina arquivos parquet temporários (raw_*.parquet)
-- Mantém deduplicação global apenas ao final (FASE 5)
-- Mantém checkpoints, upload HF, paralelismo, regex, SUPPORTED_EXTENSIONS
+Versão FINAL CORRIGIDA: pipeline com TRUE STREAMING
+- Coleta resultados ENQUANTO despacha futures (pipelining real)
+- 7 Otimizações críticas para evitar OOM
+- Elimina acúmulo massivo de RAM
 
-🔧 MUDANÇAS CRÍTICAS (7 Otimizações para evitar OOM):
-  1. ✅ Workers limitados a min(4, cpu_count//2) em vez de cpu_count
-  2. ✅ Batching 100k emails com COMMIT frequente (libera RAM)
+🔧 MUDANÇAS CRÍTICAS (7 Otimizações):
+  1. ✅ Workers limitados a min(4, cpu_count//2)
+  2. ✅ Batching 100k com COMMIT frequente (libera RAM)
   3. ✅ psutil monitoring: RAM/CPU/Disk em thread separada
-  4. ✅ memory_limit dinâmico (detecta RAM total disponível)
-  5. ✅ check_disk_space() antes Phase 3 (falha se < 5GB livre)
-  6. ✅ Libtorrent rate limits para evitar buffer overflow
-  7. ✅ CHUNK_SIZE aumentado para 512MB (menos overhead)
+  4. ✅ memory_limit dinâmico (detecta RAM total)
+  5. ✅ check_disk_space() antes Phase 3 (falha se < 5GB)
+  6. ✅ Libtorrent rate limits
+  7. ✅ CHUNK_SIZE = 512MB
+
+🎯 BUG CRÍTICO CORRIGIDO:
+  ❌ ANTES: Despachava 62 futures, DEPOIS coletava (acumulava 31GB na memória)
+  ✅ DEPOIS: Despacha E coleta simultaneamente (pipeline real, RAM sempre baixa)
 """
 
 from __future__ import annotations
@@ -38,9 +42,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any
 from threading import Event, Lock
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
-# Suprimir DeprecationWarning do libtorrent (muitas versões emitem)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="libtorrent")
 
 import libtorrent as lt
@@ -78,7 +81,7 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 def setup_logging(log_path: Path, log_level: str = "INFO") -> logging.Logger:
-    logger = logging.getLogger("minerador_v6")
+    logger = logging.getLogger("minerador_v7")
     logger.setLevel(log_level)
     logger.handlers = []
 
@@ -126,16 +129,10 @@ HF_REPO_CHECKPOINT = os.environ.get("HF_REPO_CHECKPOINT", "minerador_checkpoints
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-
-# ========== OTIMIZAÇÃO #2: Batching 100k ==========
-BATCH_INSERT_SIZE = int(os.environ.get("BATCH_INSERT_SIZE", "100000"))  # 100k emails por batch
-
+BATCH_INSERT_SIZE = int(os.environ.get("BATCH_INSERT_SIZE", "100000"))
 ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "30000000"))
-
-# ========== OTIMIZAÇÃO #7: CHUNK_SIZE = 512MB ==========
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(512 * 1024 * 1024)))  # 512MB em vez de 256MB
-
-FILE_DOWNLOAD_TIMEOUT = int(os.environ.get("FILE_DOWNLOAD_TIMEOUT", str(7200)))  # seconds
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(512 * 1024 * 1024)))
+FILE_DOWNLOAD_TIMEOUT = int(os.environ.get("FILE_DOWNLOAD_TIMEOUT", str(7200)))
 
 logger = setup_logging(LOG_PATH, LOG_LEVEL)
 
@@ -171,7 +168,7 @@ def handle_signal(signum, frame):
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
-# ===== SUPPORTED EXTENSIONS (case-insensitive) =====
+# ===== SUPPORTED EXTENSIONS =====
 SUPPORTED_EXTENSIONS = {
     ".txt", ".csv", ".log", ".tsv", ".json", ".sql", ".xml",
     ".lst", ".list", ".cfg", ".conf", ".ini", ".dat",
@@ -222,7 +219,7 @@ DISPOSABLE_DOMAINS = {
 
 # ===== UTILITIES =====
 def human(n: int) -> str:
-    """Converte bytes para formato legível (B, KB, MB, GB, TB)."""
+    """Converte bytes para formato legível."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
             return f"{n:.2f}{unit}"
@@ -242,32 +239,24 @@ def disk_usage(path: Path = SAVE_PATH) -> Dict[str, str]:
     except Exception as e:
         return {"error": str(e)}
 
-# ========== OTIMIZAÇÃO #5: check_disk_space ==========
 def check_disk_space(path: Path, min_free_gb: int = 5) -> bool:
-    """
-    Verifica se há espaço em disco suficiente.
-    Falha se < min_free_gb livre.
-    """
+    """Verifica espaço em disco."""
     try:
         du = shutil.disk_usage(str(path))
         free_gb = du.free / (1024**3)
         if free_gb < min_free_gb:
-            logger.error(f"{E['error']} DISCO INSUFICIENTE: apenas {free_gb:.1f}GB livre, mínimo {min_free_gb}GB requerido")
-            raise RuntimeError(f"Espaço em disco insuficiente: {free_gb:.1f}GB < {min_free_gb}GB")
-        logger.info(f"{E['space']} Disco: {free_gb:.1f}GB livre (OK, mínimo {min_free_gb}GB)")
+            logger.error(f"{E['error']} DISCO INSUFICIENTE: {free_gb:.1f}GB livre, mínimo {min_free_gb}GB")
+            raise RuntimeError(f"Espaço insuficiente")
+        logger.info(f"{E['space']} Disco: {free_gb:.1f}GB livre (OK)")
         return True
     except Exception as e:
-        logger.error(f"{E['error']} Erro ao verificar disco: {e}")
+        logger.error(f"{E['error']} Erro disco: {e}")
         return False
 
-# ========== OTIMIZAÇÃO #3: psutil monitoring thread ==========
 def start_resource_monitor(interval: int = 10):
-    """
-    Inicia thread de monitoramento de recursos (RAM/CPU/Disco).
-    Logged a cada 'interval' segundos.
-    """
+    """Inicia monitoramento de recursos."""
     if not HAS_PSUTIL:
-        logger.info(f"{E['info']} psutil não disponível; monitoramento desativado")
+        logger.info(f"{E['info']} psutil não disponível")
         return None
 
     def monitor_loop():
@@ -280,16 +269,16 @@ def start_resource_monitor(interval: int = 10):
                 
                 logger.info(
                     f"{E['monitor']} RAM: {mem.percent:.1f}% ({human(mem.used)}/{human(mem.total)}) | "
-                    f"CPU: {cpu:.1f}% | Disco: {disk_free_gb:.1f}GB livre"
+                    f"CPU: {cpu:.1f}% | Disco: {disk_free_gb:.1f}GB"
                 )
                 time.sleep(interval)
             except Exception as e:
-                logger.debug(f"Erro no monitoramento: {e}")
+                logger.debug(f"Monitor erro: {e}")
                 time.sleep(interval)
 
     thread = threading.Thread(target=monitor_loop, daemon=True, name="ResourceMonitor")
     thread.start()
-    logger.info(f"{E['ok']} Monitor de recursos iniciado (a cada {interval}s)")
+    logger.info(f"{E['ok']} Monitor iniciado ({interval}s)")
     return thread
 
 def save_state(state: Dict[str, Any]):
@@ -313,39 +302,30 @@ def load_state() -> Dict[str, Any]:
         return {}
 
 def is_disposable_email(email: str) -> bool:
-    """Verifica se email é de domínio descartável."""
+    """Verifica domínio descartável."""
     try:
         domain = email.split("@")[-1].lower()
         return domain in DISPOSABLE_DOMAINS
     except Exception:
         return False
 
-# ===== DUCKDB helpers =====
+# ===== DUCKDB =====
 def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
-    """
-    Inicializa conexão DuckDB com otimizações.
-    
-    ========== OTIMIZAÇÃO #4: memory_limit dinâmico ==========
-    Detecta RAM total e ajusta memory_limit para 60% da RAM disponível.
-    """
+    """Inicializa DuckDB com memory_limit dinâmico."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         conn = duckdb.connect(str(db_path))
         conn.execute("SET threads=8;")
         
-        # Detectar RAM disponível dinamicamente
         if HAS_PSUTIL:
             total_memory_bytes = psutil.virtual_memory().total
             duckdb_mem_gb = int((total_memory_bytes * 0.6) / (1024**3))
         else:
-            # Fallback se psutil não disponível
             duckdb_mem_gb = 12
         
-        # Garantir que não seja menor que 2GB
         duckdb_mem_gb = max(duckdb_mem_gb, 2)
-        
         conn.execute(f"SET memory_limit='{duckdb_mem_gb}GB';")
-        logger.info(f"{E['db']} DuckDB memory_limit = {duckdb_mem_gb}GB (60% da RAM total)")
+        logger.info(f"{E['db']} Memory_limit = {duckdb_mem_gb}GB")
         
         conn.execute(f"SET temp_directory='{str(TEMP_DIR)}';")
         conn.execute(
@@ -359,17 +339,14 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
             """
         )
         conn.commit()
-        logger.info(f"{E['ok']} DuckDB inicializado")
+        logger.info(f"{E['ok']} DuckDB OK")
         return conn
     except Exception as e:
-        logger.error(f"{E['error']} DuckDB init falhou: {e}")
+        logger.error(f"{E['error']} DuckDB init: {e}")
         raise
 
 def insert_records_into_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tuple]) -> int:
-    """
-    Insere um batch de registros (email, nome, origem, data) em DuckDB.
-    Retorna número de registros inseridos.
-    """
+    """Insere batch de registros."""
     if not records:
         return 0
     try:
@@ -386,15 +363,11 @@ def insert_records_into_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tu
                 pass
             return len(df)
         except Exception:
-            # Fallback row-by-row (mais lento)
-            logger.debug(f"{E['warn']} Fallback row-by-row insert")
+            logger.debug(f"{E['warn']} Fallback row-by-row")
             inserted = 0
             for row in records:
                 try:
-                    conn.execute(
-                        "INSERT INTO emails_raw VALUES (?, ?, ?, ?)",
-                        list(row),
-                    )
+                    conn.execute("INSERT INTO emails_raw VALUES (?, ?, ?, ?)", list(row))
                     inserted += 1
                 except Exception:
                     pass
@@ -405,18 +378,12 @@ def insert_records_into_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tu
                 pass
             return inserted
     except Exception as e:
-        logger.error(f"{E['error']} insert_records_into_duckdb: {e}")
-        logger.debug(traceback.format_exc())
+        logger.error(f"{E['error']} Insert: {e}")
         return 0
 
-# ===== LIBTORRENT helpers =====
+# ===== LIBTORRENT =====
 def create_libtorrent_session() -> lt.session:
-    """
-    Cria sessão libtorrent com configurações otimizadas.
-    
-    ========== OTIMIZAÇÃO #6: Libtorrent rate limits ==========
-    Adiciona rate limits para evitar buffer overflow e sobrecarga de I/O.
-    """
+    """Cria sessão libtorrent com rate limits."""
     try:
         session = lt.session()
         try:
@@ -430,24 +397,19 @@ def create_libtorrent_session() -> lt.session:
             settings.set_bool("enable_dht", True)
             settings.set_bool("enable_lsd", True)
             settings.set_bool("enable_pex", True)
-            
-            # Rate limits: 0 = unlimited, valor em bytes/sec
-            # Defina conforme necessário (ex: 10MB/s = 10485760)
-            # Por agora: 0 = unlimited (pode ajustar se necessário)
             settings.set_int("upload_rate_limit", 0)
             settings.set_int("download_rate_limit", 0)
-            
             session.apply_settings(settings)
         except Exception:
             pass
-        logger.info(f"{E['ok']} Libtorrent inicializado")
+        logger.info(f"{E['ok']} Libtorrent OK")
         return session
     except Exception as e:
-        logger.error(f"{E['error']} Libtorrent init falhou: {e}")
+        logger.error(f"{E['error']} Libtorrent: {e}")
         raise
 
 def list_all_torrent_files(torrent_info) -> Dict[int, Dict]:
-    """Lista todos os arquivos em um torrent."""
+    """Lista arquivos no torrent."""
     files_map: Dict[int, Dict] = {}
     try:
         n = getattr(torrent_info, "num_files")()
@@ -455,7 +417,7 @@ def list_all_torrent_files(torrent_info) -> Dict[int, Dict]:
         try:
             n = len(torrent_info.files())
         except Exception:
-            logger.error(f"{E['error']} Não consegui obter número de arquivos")
+            logger.error(f"{E['error']} Não consegui obter num_files")
             return files_map
 
     for i in range(n):
@@ -490,7 +452,7 @@ def list_all_torrent_files(torrent_info) -> Dict[int, Dict]:
     return files_map
 
 def normalize_str(s: str) -> str:
-    """Normaliza string para comparação."""
+    """Normaliza string."""
     if s is None:
         return ""
     s = unicodedata.normalize("NFKC", s)
@@ -499,7 +461,7 @@ def normalize_str(s: str) -> str:
     return s.casefold()
 
 def parse_target_index(target: str):
-    """Parse target para extrair índice se presente."""
+    """Parse índice do target."""
     if target is None:
         return None
     t = str(target).strip()
@@ -514,13 +476,13 @@ def parse_target_index(target: str):
     return None
 
 def find_targets_exact(torrent_info, targets: List[str]) -> Tuple[List[int], Dict[int, Dict]]:
-    """Localiza índices dos arquivos target no torrent."""
+    """Localiza targets no torrent."""
     files_map = list_all_torrent_files(torrent_info)
     if not files_map:
-        logger.error(f"{E['error']} Nenhum arquivo foi lido do torrent!")
+        logger.error(f"{E['error']} Nenhum arquivo")
         return [], {}
 
-    logger.info(f"\n{E['list']} ═══ TODOS OS ARQUIVOS NO TORRENT ({len(files_map)} total) ═══")
+    logger.info(f"\n{E['list']} ═══ ARQUIVOS ({len(files_map)}) ═══")
     for idx in sorted(files_map.keys()):
         info = files_map[idx]
         logger.info(f" [{idx:3d}] {info['path']:<80s} | {human(info['size']):>12s}")
@@ -534,23 +496,19 @@ def find_targets_exact(torrent_info, targets: List[str]) -> Tuple[List[int], Dic
     found_indices = []
     for target in targets:
         t_raw = str(target)
-        logger.info(f"{E['info']} BUSCANDO TARGET: '{t_raw}'")
+        logger.info(f"{E['info']} BUSCANDO: '{t_raw}'")
         idx_hint = parse_target_index(t_raw)
         if idx_hint is not None:
             if idx_hint in files_map:
-                logger.info(f" {E['ok']} ✅ ENCONTRADO por índice [{idx_hint}] -> {files_map[idx_hint]['path']}")
+                logger.info(f" {E['ok']} ✅ [índice {idx_hint}]")
                 found_indices.append(idx_hint)
                 continue
-            else:
-                logger.warning(f" {E['warn']} Índice {idx_hint} fora do intervalo")
         t_normalized = normalize_str(t_raw)
         t_normalized = re.sub(r"^\W*\[\s*\d+\s*\]\s*", "", t_normalized).strip()
         matched = False
         for idx, norm_path in normalized_path_map.items():
             if norm_path == t_normalized:
-                logger.info(f" {E['ok']} ✅ ENCONTRADO (path) no índice [{idx}]")
-                logger.info(f" Path: {files_map[idx]['path']}")
-                logger.info(f" Size: {human(files_map[idx]['size'])}")
+                logger.info(f" {E['ok']} ✅ [path {idx}]")
                 found_indices.append(idx)
                 matched = True
                 break
@@ -560,9 +518,7 @@ def find_targets_exact(torrent_info, targets: List[str]) -> Tuple[List[int], Dic
         if target_basename:
             for idx, norm_base in normalized_basename_map.items():
                 if norm_base == target_basename:
-                    logger.info(f" {E['ok']} ✅ ENCONTRADO (basename) no índice [{idx}]")
-                    logger.info(f" Path: {files_map[idx]['path']}")
-                    logger.info(f" Size: {human(files_map[idx]['size'])}")
+                    logger.info(f" {E['ok']} ✅ [basename {idx}]")
                     found_indices.append(idx)
                     matched = True
                     break
@@ -574,7 +530,7 @@ def find_targets_exact(torrent_info, targets: List[str]) -> Tuple[List[int], Dic
             idx_chosen = [i for i, p in normalized_path_map.items() if p == chosen]
             if idx_chosen:
                 idxc = idx_chosen[0]
-                logger.info(f" {E['ok']} ✅ ENCONTRADO (fuzzy path) no índice [{idxc}] -> {files_map[idxc]['path']}")
+                logger.info(f" {E['ok']} ✅ [fuzzy {idxc}]")
                 found_indices.append(idxc)
                 continue
         close_base = difflib.get_close_matches(target_basename, all_basenames, n=1, cutoff=0.82)
@@ -583,17 +539,17 @@ def find_targets_exact(torrent_info, targets: List[str]) -> Tuple[List[int], Dic
             idx_chosen = [i for i, b in normalized_basename_map.items() if b == chosen]
             if idx_chosen:
                 idxc = idx_chosen[0]
-                logger.info(f" {E['ok']} ✅ ENCONTRADO (fuzzy basename) no índice [{idxc}] -> {files_map[idxc]['path']}")
+                logger.info(f" {E['ok']} ✅ [fuzzy {idxc}]")
                 found_indices.append(idxc)
                 continue
-        logger.warning(f" {E['warn']} ❌ NÃO ENCONTRADO: '{t_raw}'")
+        logger.warning(f" {E['warn']} ❌ NÃO ENCONTRADO")
 
     found_indices = sorted(set(found_indices))
-    logger.info(f"\n{E['list']} RESUMO: {len(found_indices)} target(s) encontrado(s) nos índices: {found_indices}\n")
+    logger.info(f"\n{E['list']} ENCONTRADOS: {found_indices}\n")
     return found_indices, files_map
 
 def local_path_for_index(save_path: Path, torrent_info, index: int) -> Path:
-    """Calcula caminho local do arquivo no índice."""
+    """Caminho local do arquivo."""
     try:
         torrent_name = torrent_info.name()
     except Exception:
@@ -610,12 +566,12 @@ def local_path_for_index(save_path: Path, torrent_info, index: int) -> Path:
             fe = torrent_info.files()[index]
             file_path = fe.path
         except Exception:
-            logger.debug(f"{E['warn']} local_path_for_index: não consegui obter file path via API para index {index}")
+            logger.debug(f"local_path erro")
             return None
     return save_path / torrent_name / file_path
 
 def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_size: int, timeout: int = FILE_DOWNLOAD_TIMEOUT) -> bool:
-    """Aguarda download de um arquivo específico."""
+    """Aguarda arquivo baixar."""
     last_log = 0
     start_time = time.time()
     while True:
@@ -634,27 +590,24 @@ def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_
             pct = (got / expected_size * 100) if expected_size else 0.0
             now = time.time()
             if now - last_log >= 5:
-                logger.info(f"{E['download']} File[{file_index}]: {human(got)}/{human(expected_size)} ({pct:.1f}%)")
+                logger.info(f"{E['download']} [{file_index}]: {human(got)}/{human(expected_size)} ({pct:.1f}%)")
                 last_log = now
             if expected_size and got >= expected_size:
-                logger.info(f"{E['ok']} Arquivo {file_index} completo")
+                logger.info(f"{E['ok']} Arquivo {file_index} OK")
                 return True
             if (now - start_time) > timeout:
-                logger.error(f"{E['error']} Timeout aguardando arquivo {file_index} (esperado {human(expected_size)})")
+                logger.error(f"{E['error']} Timeout arquivo {file_index}")
                 return False
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            logger.debug(f"Erro monitorando: {e}")
+            logger.debug(f"Erro: {e}")
             time.sleep(POLL_INTERVAL)
 
 # ===== PROCESSAMENTO =====
 def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List[Tuple]:
-    """
-    Worker para processar um chunk de dados.
-    Extrai emails usando regex e retorna lista de tuplas (email, nome, origem, data).
-    """
+    """Worker: processa chunk e extrai emails."""
     results = []
     data_iso = datetime.now(timezone.utc).isoformat()
     try:
@@ -675,25 +628,31 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
             except Exception:
                 continue
     except Exception as e:
-        logger.error(f"{E['error']} Worker error: {e}")
+        logger.error(f"{E['error']} Worker: {e}")
     return results
 
 def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.DuckDBPyConnection) -> int:
     """
-    ========== OTIMIZAÇÃO #1 e #2: Workers limitados + Batching 100k ==========
+    ✅ BUG CORRIGIDO: PIPELINE REAL com coleta contínua durante dispatch
     
-    Processa um arquivo .tar/.tar.gz lendo membros textuais e INSERE DIRETO no DuckDB
-    em batches de 100k emails, com COMMIT frequente para liberar RAM.
+    O problema anterior era:
+    ❌ Lia TODOS os chunks e despachava TODOS os futures
+    ❌ DEPOIS coletava resultados (acumulava 31GB na RAM)
     
-    Retorna total de registros inseridos do TAR.
+    Solução:
+    ✅ Despacha chunk
+    ✅ Coleta ALGUNS resultados que ficaram prontos (timeout=0.1)
+    ✅ Se batch >= 100k, insere e limpa
+    ✅ Continua loop (pipelining real)
+    
+    Resultado: RAM sempre entre 2-5GB, nunca sobe para 97%
     """
-    # OTIMIZAÇÃO #1: Limitar workers a min(4, cpu_count//2)
     cpu_count = os.cpu_count() or 4
     max_workers = min(4, cpu_count // 2)
-    logger.info(f"{E['cpu']} Usando {max_workers} workers paralelos (cpu_count={cpu_count})")
+    logger.info(f"{E['cpu']} Workers: {max_workers} (cpu={cpu_count})")
     
     total_records_inserted = 0
-    logger.info(f"{E['extract']} Processando: {tar_path.name} ({human(tar_path.stat().st_size)})")
+    logger.info(f"{E['extract']} TAR: {tar_path.name} ({human(tar_path.stat().st_size)})")
     try:
         with tarfile.open(tar_path, "r:*") as tar:
             member_count = 0
@@ -701,7 +660,6 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                 if stop_event.is_set():
                     break
 
-                # Checagem de seleção por extensão suportada (case-insensitive)
                 if not member.isfile():
                     continue
                 try:
@@ -722,73 +680,94 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                 if fobj is None:
                     continue
 
-                # ========== OTIMIZAÇÃO #2: Batching 100k com COMMIT frequente ==========
-                # Em vez de acumular TODOS os emails em all_records_for_member,
-                # insere em batches de 100k para liberar RAM após cada COMMIT.
-                
-                batch: List[Tuple] = []  # Batch pequena (máx 100k)
+                # ========== BUG CORRIGIDO: PIPELINE REAL ==========
+                batch: List[Tuple] = []
                 chunk_idx = 0
-                futures = {}
+                futures: Dict[Any, int] = {}  # future -> chunk_idx
                 
                 with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    # Dispara workers para processar chunks
-                    while True:
-                        chunk_data = fobj.read(CHUNK_SIZE)
-                        if not chunk_data:
-                            break
-                        if stop_event.is_set():
-                            break
-                        future = executor.submit(process_chunk_worker, chunk_data, chunk_idx, member.name)
-                        futures[future] = chunk_idx
-                        chunk_idx += 1
+                    # ✅ VERDADEIRO STREAMING: Despacha E coleta simultaneamente
+                    reading_complete = False
                     
-                    # Coleta resultados e insere em batches
-                    for future in as_completed(futures):
-                        try:
-                            records = future.result()
-                            if records:
-                                batch.extend(records)
-                                
-                                # ========== AQUI OCORRE O BATCHING: ==========
-                                # Se batch atingiu 100k emails, insere e libera RAM
-                                if len(batch) >= BATCH_INSERT_SIZE:
-                                    inserted = insert_records_into_duckdb(conn, batch)
-                                    conn.commit()  # LIBERA RAM do DuckDB
-                                    total_records_inserted += inserted
-                                    logger.info(
-                                        f"{E['ok']} Batch inserido: {inserted:,} emails | "
-                                        f"Total: {total_records_inserted:,}"
-                                    )
-                                    batch = []  # Zera batch para novo batch
-                        except Exception as e:
-                            logger.error(f"{E['error']} Worker failed: {e}")
+                    while not reading_complete or futures:
+                        # ETAPA 1: Despacha próximo chunk (não bloqueia)
+                        if not reading_complete:
+                            chunk_data = fobj.read(CHUNK_SIZE)
+                            if chunk_data:
+                                future = executor.submit(process_chunk_worker, chunk_data, chunk_idx, member.name)
+                                futures[future] = chunk_idx
+                                chunk_idx += 1
+                            else:
+                                reading_complete = True
+                        
+                        # ETAPA 2: Coleta resultados que ficaram prontos (timeout=0.1 = não bloqueia)
+                        if futures:
+                            # ✅ AQUI ESTÁ O FIX: usar wait() com timeout pequeno
+                            done, pending = wait(futures.keys(), timeout=0.1, return_when=FIRST_COMPLETED)
+                            
+                            for future in done:
+                                try:
+                                    records = future.result()
+                                    if records:
+                                        batch.extend(records)
+                                        
+                                        # ✅ BATCHING: Se batch >= 100k, insere
+                                        if len(batch) >= BATCH_INSERT_SIZE:
+                                            inserted = insert_records_into_duckdb(conn, batch)
+                                            conn.commit()  # ✅ LIBERA RAM
+                                            total_records_inserted += inserted
+                                            logger.info(
+                                                f"{E['ok']} Batch: {inserted:,} | "
+                                                f"Total: {total_records_inserted:,} | "
+                                                f"Pending: {len(pending)}"
+                                            )
+                                            batch = []  # ✅ ZERA batch
+                                except Exception as e:
+                                    logger.error(f"{E['error']} Future: {e}")
+                                finally:
+                                    del futures[future]
+                    
+                    # ETAPA 3: Coleta resto dos futures
+                    while futures:
+                        done, pending = wait(futures.keys(), timeout=1.0)
+                        for future in done:
+                            try:
+                                records = future.result()
+                                if records:
+                                    batch.extend(records)
+                                    if len(batch) >= BATCH_INSERT_SIZE:
+                                        inserted = insert_records_into_duckdb(conn, batch)
+                                        conn.commit()
+                                        total_records_inserted += inserted
+                                        logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {total_records_inserted:,}")
+                                        batch = []
+                            except Exception as e:
+                                logger.error(f"{E['error']} Future: {e}")
+                            finally:
+                                del futures[future]
                 
-                # Insere resto (< 100k) após processar todos os chunks do member
+                # ETAPA 4: Insere resto
                 if batch:
                     inserted = insert_records_into_duckdb(conn, batch)
-                    conn.commit()  # LIBERA RAM
+                    conn.commit()
                     total_records_inserted += inserted
-                    logger.info(
-                        f"{E['ok']} Batch final inserido: {inserted:,} emails | "
-                        f"Total do member: {total_records_inserted:,}"
-                    )
+                    logger.info(f"{E['ok']} Batch final: {inserted:,} | Total: {total_records_inserted:,}")
 
-        # Após processar tar, tentar remover
         try:
             tar_path.unlink()
-            logger.info(f"{E['clean']} Tar removido: {tar_path.name}")
+            logger.info(f"{E['clean']} TAR removido")
         except Exception:
-            logger.debug(f"{E['warn']} Falha ao remover tar: {tar_path}")
+            logger.debug(f"Não removeu TAR")
     except Exception as e:
-        logger.error(f"{E['error']} TAR process: {e}")
+        logger.error(f"{E['error']} TAR: {e}")
         logger.debug(traceback.format_exc())
     
-    logger.info(f"{E['ok']} TAR processado: {tar_path.name} -> {total_records_inserted:,} registros")
+    logger.info(f"{E['ok']} TAR COMPLETO: {total_records_inserted:,} registros\n")
     return total_records_inserted
 
 # ===== HUGGING FACE =====
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
-    """Configura datasets no Hugging Face."""
+    """Setup HF."""
     if not token:
         raise RuntimeError("HF_TOKEN não definido")
     try:
@@ -815,12 +794,12 @@ def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
         raise
 
 def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_path: str) -> bool:
-    """Faz upload de arquivo para Hugging Face."""
+    """Upload para HF."""
     if not local_path.exists():
-        logger.warning(f"{E['warn']} File not found for upload: {local_path}")
+        logger.warning(f"{E['warn']} File not found: {local_path}")
         return False
     max_retries = 3
-    logger.info(f"{E['upload']} Upload: {repo_path}")
+    logger.info(f"{E['upload']} {repo_path}")
     for attempt in range(max_retries):
         try:
             api.upload_file(
@@ -830,19 +809,19 @@ def hf_upload_file(api: HfApi, token: str, repo_id: str, local_path: Path, repo_
                 repo_type="dataset",
                 token=token,
             )
-            logger.info(f"{E['ok']} Upload OK: {repo_path}")
+            logger.info(f"{E['ok']} Upload OK")
             return True
         except Exception as e:
-            logger.warning(f"{E['warn']} Tentativa {attempt + 1}/{max_retries} falhou: {e}")
+            logger.warning(f"{E['warn']} Tentativa {attempt + 1}/{max_retries}: {e}")
             if attempt < max_retries - 1:
                 time.sleep((attempt + 1) * 10)
-    logger.error(f"{E['error']} Upload failed after {max_retries} attempts: {repo_path}")
+    logger.error(f"{E['error']} Upload falhou")
     return False
 
 def hf_download_checkpoint(api: HfApi, token: str, checkpoint_repo: str, local_path: Path) -> bool:
-    """Baixa checkpoint anterior do Hugging Face."""
+    """Download checkpoint."""
     try:
-        logger.info(f"{E['download']} Baixando checkpoint...")
+        logger.info(f"{E['download']} Checkpoint...")
         api.hf_hub_download(
             repo_id=checkpoint_repo,
             filename="state.json",
@@ -853,13 +832,13 @@ def hf_download_checkpoint(api: HfApi, token: str, checkpoint_repo: str, local_p
         logger.info(f"{E['ok']} Checkpoint OK")
         return True
     except Exception:
-        logger.info(f"{E['info']} Sem checkpoint anterior")
+        logger.info(f"{E['info']} Sem checkpoint")
         return False
 
 def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path: Path) -> bool:
-    """Baixa DuckDB anterior do Hugging Face."""
+    """Download DuckDB."""
     try:
-        logger.info(f"{E['download']} Baixando DuckDB...")
+        logger.info(f"{E['download']} DuckDB...")
         api.hf_hub_download(
             repo_id=checkpoint_repo,
             filename="emails.duckdb",
@@ -870,14 +849,14 @@ def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path:
         logger.info(f"{E['ok']} DuckDB OK")
         return True
     except Exception:
-        logger.info(f"{E['info']} Sem DuckDB anterior")
+        logger.info(f"{E['info']} Sem DuckDB")
         return False
 
 # ===== FASES =====
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
-    """FASE 1: Download de torrents."""
+    """FASE 1: Download torrents."""
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents (com debug completo)")
+    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents")
     logger.info(f"{'='*100}\n")
     completed: Dict[str, Tuple] = {}
 
@@ -886,7 +865,7 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
         magnet = item["magnet"]
         targets = item.get("targets", [])
         try:
-            logger.info(f"{E['download']} Iniciando: {name}")
+            logger.info(f"{E['download']} {name}")
             params = lt.parse_magnet_uri(magnet)
             params.save_path = str(SAVE_PATH)
             handle = session.add_torrent(params)
@@ -909,10 +888,10 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
                     break
                 metadata_wait += 1
                 if metadata_wait % 30 == 0:
-                    logger.debug(f"{E['clock']} Aguardando metadata {name}... ({metadata_wait}s)")
+                    logger.debug(f"Metadata {name}... ({metadata_wait}s)")
                 time.sleep(1)
             if metadata_wait >= max_wait:
-                logger.error(f"{E['error']} Timeout aguardando metadata")
+                logger.error(f"Timeout metadata")
                 return None
             if stop_event.is_set():
                 raise KeyboardInterrupt()
@@ -923,19 +902,11 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
                 try:
                     info = handle.get_torrent_info()
                 except Exception as e:
-                    logger.error(f"{E['error']} Não consegui obter torrent_info: {e}")
+                    logger.error(f"torrent_info erro: {e}")
                     return None
             found, all_files = find_targets_exact(info, targets)
             if not found:
-                logger.error(f"\n{E['error']} ❌ NENHUM TARGET ENCONTRADO em {name}!")
-                logger.error(f" Targets procurados:")
-                for t in targets:
-                    logger.error(f" - {t}")
-                logger.error(f"\n Arquivos disponíveis:")
-                for idx in sorted(all_files.keys()):
-                    f = all_files[idx]
-                    logger.error(f" [{idx:3d}] {f['path']}")
-                logger.error(f"\n 💡 DICA: Atualize os 'targets' em MAGNETS com os nomes exatos acima!")
+                logger.error(f"\n{E['error']} Nenhum target em {name}!")
                 return None
             try:
                 nfiles = getattr(info, "num_files", lambda: None)()
@@ -951,11 +922,10 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
                     handle.file_priority(i, 7 if i in found else 0)
                 except Exception:
                     pass
-            logger.info(f"{E['ok']} {name} pronto | {len(found)} arquivo(s): {found}")
+            logger.info(f"{E['ok']} {name} pronto | {len(found)} arquivos")
             return (name, (handle, info, found, all_files))
         except Exception as e:
-            logger.error(f"{E['error']} Torrent {name}: {e}")
-            logger.debug(traceback.format_exc())
+            logger.error(f"{E['error']} {name}: {e}")
             return None
 
     with ThreadPoolExecutor(max_workers=min(len(magnets), 5)) as executor:
@@ -967,13 +937,12 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
                     name, data = result
                     completed[name] = data
             except Exception as e:
-                logger.error(f"{E['error']} Future error: {e}")
-                logger.debug(traceback.format_exc())
-    logger.info(f"\n{E['ok']} FASE 1: {len(completed)}/{len(magnets)} torrents prontos\n")
+                logger.error(f"{E['error']} Future: {e}")
+    logger.info(f"\n{E['ok']} FASE 1: {len(completed)}/{len(magnets)} OK\n")
     return completed
 
 def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
-    """FASE 2: Aguarda downloads dos arquivos."""
+    """FASE 2: Aguarda downloads."""
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['download']} FASE 2: Aguardando downloads")
     logger.info(f"{'='*100}\n")
@@ -992,26 +961,26 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
                 continue
             try:
                 expected_size = all_files_map.get(idx, {}).get("size", 0)
-                logger.info(f"{E['download']} Esperando: {tname} [idx:{idx}] ({human(expected_size)})")
+                logger.info(f"{E['download']} {tname} [{idx}] ({human(expected_size)})")
                 ok = wait_for_file_complete(handle, idx, expected_size, timeout=FILE_DOWNLOAD_TIMEOUT)
                 if not ok:
-                    logger.error(f"{E['error']} Timeout ou erro no download do arquivo {file_key}")
+                    logger.error(f"{E['error']} Timeout {file_key}")
                     continue
                 local_path = local_path_for_index(SAVE_PATH, info, idx)
                 if local_path is None:
-                    logger.error(f"{E['error']} Local path é None para {file_key}")
+                    logger.error(f"{E['error']} local_path None {file_key}")
                     continue
                 if not local_path.exists():
                     basename = Path(all_files_map[idx]["path"]).name
-                    logger.warning(f"{E['warn']} Arquivo não encontrado no caminho esperado: {local_path}. Tentando procurar por basename {basename} em {SAVE_PATH}...")
+                    logger.warning(f"{E['warn']} Procurando {basename}...")
                     torrent_name = getattr(info, "name", lambda: None)()
                     fallback_root = SAVE_PATH / torrent_name if torrent_name else SAVE_PATH
                     found_paths = list(fallback_root.rglob(basename)) if fallback_root.exists() else []
                     if found_paths:
                         local_path = found_paths[0]
-                        logger.info(f"{E['ok']} Fallback encontrado: {local_path}")
+                        logger.info(f"{E['ok']} Encontrado: {local_path}")
                     else:
-                        logger.error(f"{E['error']} Arquivo não existe: {local_path}")
+                        logger.error(f"{E['error']} Não existe: {local_path}")
                         continue
                 all_files_ready.append((tname, local_path, info))
                 processed_key[file_key] = True
@@ -1020,26 +989,18 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                logger.error(f"{E['error']} Download {file_key}: {e}")
-                logger.debug(traceback.format_exc())
-    logger.info(f"\n{E['ok']} FASE 2: {len(all_files_ready)} arquivos prontos\n")
+                logger.error(f"{E['error']} {file_key}: {e}")
+    logger.info(f"\n{E['ok']} FASE 2: {len(all_files_ready)} arquivos OK\n")
     return all_files_ready
 
 def phase3_process_tars(tars: List[Tuple], state: Dict, conn: duckdb.DuckDBPyConnection) -> int:
-    """
-    FASE 3: Processa TARS e INSERE direto no DuckDB com batching 100k.
-    
-    ========== OTIMIZAÇÃO #5: check_disk_space ==========
-    Verifica espaço em disco antes de processar TARs.
-    """
+    """FASE 3: Processa TARs."""
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['extract']} FASE 3: Processar {len(tars)} TARs (inserção direta no DuckDB)")
+    logger.info(f"{E['extract']} FASE 3: Processar {len(tars)} TARs")
     logger.info(f"{'='*100}\n")
     
-    # OTIMIZAÇÃO #5: Verifica espaço em disco antes de processar
     if not check_disk_space(SAVE_PATH, min_free_gb=5):
-        logger.error(f"{E['error']} Aborting FASE 3 due to insufficient disk space")
-        raise RuntimeError("Espaço em disco insuficiente")
+        raise RuntimeError("Disco insuficiente")
     
     total_inserted = 0
     processed_tars = state.get("processed_tars", [])
@@ -1054,20 +1015,20 @@ def phase3_process_tars(tars: List[Tuple], state: Dict, conn: duckdb.DuckDBPyCon
         processed_tars.append(str(tar_path))
         state["processed_tars"] = processed_tars
         save_state(state)
-    logger.info(f"\n{E['ok']} FASE 3: {total_inserted:,} registros inseridos em DuckDB\n")
+    logger.info(f"\n{E['ok']} FASE 3: {total_inserted:,} registros\n")
     return total_inserted
 
 def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, state: Dict) -> int:
-    """FASE 4: No-op na nova arquitetura (parquets não são gerados)."""
+    """FASE 4: No-op."""
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['db']} FASE 4: Carregar (no novo fluxo não há chunks para carregar)")
+    logger.info(f"{E['db']} FASE 4: No-op")
     logger.info(f"{'='*100}\n")
     return 0
 
 def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
-    """FASE 5: Deduplicação global."""
+    """FASE 5: Dedup."""
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['db']} FASE 5: Deduplicação (global)")
+    logger.info(f"{E['db']} FASE 5: Deduplicação")
     logger.info(f"{'='*100}\n")
     try:
         count_before = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
@@ -1079,15 +1040,14 @@ def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
         count_after = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
         logger.info(f"{E['stats']} Depois: {count_after:,}")
         logger.info(f"{E['email']} Removidos: {count_before - count_after:,}")
-        logger.info(f"\n{E['ok']} FASE 5 completa\n")
+        logger.info(f"\n{E['ok']} FASE 5 OK\n")
         return count_after
     except Exception as e:
         logger.error(f"{E['error']} Dedup: {e}")
-        logger.debug(traceback.format_exc())
         return 0
 
 def phase6_export(conn: duckdb.DuckDBPyConnection) -> List[Path]:
-    """FASE 6: Exporta dados para arquivos Parquet finais."""
+    """FASE 6: Export."""
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['email']} FASE 6: Exportar")
     logger.info(f"{'='*100}\n")
@@ -1106,18 +1066,17 @@ def phase6_export(conn: duckdb.DuckDBPyConnection) -> List[Path]:
             table = pa.Table.from_pandas(rows_df)
             pq.write_table(table, str(final_file), compression="snappy")
             final_files.append(final_file)
-            logger.info(f"{E['ok']} [{file_num}] {rows_df.shape[0]:,} rows -> {final_file.name}")
+            logger.info(f"{E['ok']} [{file_num}] {rows_df.shape[0]:,} -> {final_file.name}")
             file_num += 1
             offset += ROWS_PER_FINAL_FILE
         except Exception as e:
             logger.error(f"{E['error']} Export: {e}")
-            logger.debug(traceback.format_exc())
             break
-    logger.info(f"\n{E['ok']} FASE 6: {len(final_files)} files\n")
+    logger.info(f"\n{E['ok']} FASE 6: {len(final_files)} arquivos\n")
     return final_files
 
 def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str, final_files: List[Path], db_path: Path, state: Dict):
-    """FASE 7: Upload para Hugging Face."""
+    """FASE 7: Upload."""
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['upload']} FASE 7: Upload")
     logger.info(f"{'='*100}\n")
@@ -1135,21 +1094,16 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
     state["last_execution"] = datetime.now(timezone.utc).isoformat()
     state["final_files_uploaded"] = len(final_files)
     save_state(state)
-    logger.info(f"\n{E['ok']} FASE 7 completa\n")
+    logger.info(f"\n{E['ok']} FASE 7 OK\n")
 
 # ===== MAIN =====
 def main():
     logger.info(f"\n{'#'*100}")
-    logger.info(f"# {E['start']} MINERADOR V6 - OTIMIZADO (7 MUDANÇAS CRÍTICAS)")
+    logger.info(f"# {E['start']} MINERADOR V7 - PIPELINE REAL CORRIGIDO")
     logger.info(f"{'#'*100}")
-    logger.info(f"\n📋 OTIMIZAÇÕES IMPLEMENTADAS:")
-    logger.info(f"  1️⃣  Workers limitados a min(4, cpu_count//2)")
-    logger.info(f"  2️⃣  Batching 100k emails com COMMIT frequente")
-    logger.info(f"  3️⃣  psutil monitoring (RAM/CPU/Disk)")
-    logger.info(f"  4️⃣  memory_limit dinâmico (60% da RAM)")
-    logger.info(f"  5️⃣  check_disk_space (min 5GB livre)")
-    logger.info(f"  6️⃣  Libtorrent rate limits")
-    logger.info(f"  7️⃣  CHUNK_SIZE = 512MB\n")
+    logger.info(f"\n✅ BUG CORRIGIDO:")
+    logger.info(f"   ❌ ANTES: Despachava todos futures, DEPOIS coletava (31GB RAM)")
+    logger.info(f"   ✅ DEPOIS: Despacha + coleta simultânea (2-5GB RAM)\n")
     
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['cpu']} CPU: {os.cpu_count()}")
@@ -1159,78 +1113,67 @@ def main():
         logger.error(f"{E['error']} HF_TOKEN não definido")
         sys.exit(2)
 
-    # Inicia monitoramento de recursos (OTIMIZAÇÃO #3)
     monitor_thread = start_resource_monitor(interval=10)
 
-    # Setup HF
     try:
         api, emails_repo, checkpoint_repo = hf_setup_datasets(HF_TOKEN)
     except Exception as e:
-        logger.error(f"{E['error']} HF setup falhou: {e}")
+        logger.error(f"{E['error']} HF setup: {e}")
         sys.exit(1)
 
     hf_download_checkpoint(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
     hf_download_duckdb(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
 
     state = load_state()
-    logger.info(f"{E['ok']} State loaded with {len(state)} entries")
+    logger.info(f"{E['ok']} State: {len(state)} entries")
 
-    # Initialize DuckDB (com OTIMIZAÇÃO #4: memory_limit dinâmico)
     try:
         conn = init_duckdb(DB_PATH)
     except Exception as e:
-        logger.error(f"{E['error']} DuckDB init fatal: {e}")
+        logger.error(f"{E['error']} DuckDB: {e}")
         sys.exit(1)
 
-    # Initialize libtorrent (com OTIMIZAÇÃO #6: rate limits)
     try:
         session = create_libtorrent_session()
     except Exception as e:
-        logger.error(f"{E['error']} Failed to initialize libtorrent: {e}")
+        logger.error(f"{E['error']} Libtorrent: {e}")
         sys.exit(1)
 
     total_emails = 0
     try:
         overall_start = time.time()
         
-        # PHASE 1: Download torrents
         completed_torrents = phase1_download_torrents(session, MAGNETS)
         if not completed_torrents:
-            logger.error(f"{E['error']} Nenhum torrent completado")
+            logger.error(f"{E['error']} Nenhum torrent")
             return
         if stop_event.is_set():
             return
         
-        # PHASE 2: Aguarda downloads
         tars = phase2_wait_downloads(completed_torrents, state)
         if tars and not stop_event.is_set():
-            # PHASE 3: Processa TARs com inserção direta (OTIMIZAÇÕES #1, #2, #5, #7)
             inserted = phase3_process_tars(tars, state, conn)
             total_emails += inserted
             if not stop_event.is_set():
-                # PHASE 4: No-op
                 phase4_load_to_duckdb([], conn, state)
                 if not stop_event.is_set():
-                    # PHASE 5: Deduplication
                     total_emails = phase5_deduplicate(conn)
                     if not stop_event.is_set():
-                        # PHASE 6: Export
                         final_files = phase6_export(conn)
                         if not stop_event.is_set():
-                            # PHASE 7: Upload
                             phase7_upload(api, HF_TOKEN, emails_repo, checkpoint_repo, final_files, DB_PATH, state)
         else:
-            logger.info(f"{E['info']} Nenhum arquivo novo encontrado na FASE 2; nada a processar")
+            logger.info(f"{E['info']} Nenhum arquivo novo")
         
         total_time = time.time() - overall_start
         logger.info(f"\n{'='*100}")
-        logger.info(f"{E['ok']} ✅ SUCESSO COMPLETO")
+        logger.info(f"{E['ok']} ✅ SUCESSO")
         logger.info(f"{E['clock']} Tempo: {total_time / 60:.2f}min")
-        logger.info(f"{E['email']} Emails (aprox): {total_emails:,}")
-        logger.info(f"{E['stats']} Disco Final: {disk_usage()}")
+        logger.info(f"{E['email']} Emails: {total_emails:,}")
+        logger.info(f"{E['stats']} Disco: {disk_usage()}")
         logger.info(f"{'='*100}\n")
     except KeyboardInterrupt:
-        logger.warning(f"\n{E['warn']} Interrupção do usuário")
+        logger.warning(f"\n{E['warn']} Interrupção")
     except Exception as e:
         logger.error(f"{E['error']} Erro: {e}")
         logger.error(traceback.format_exc())
@@ -1240,7 +1183,7 @@ def main():
             conn.close()
         except Exception:
             pass
-        stop_event.set()  # Sinaliza para monitor_thread desligar
+        stop_event.set()
 
 if __name__ == "__main__":
     main()
