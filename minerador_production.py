@@ -184,15 +184,7 @@ MAGNETS = [
             "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
         ],
     },
-    {
-        "name": "Collection #1",
-        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
-        "targets": [
-            "Collection 1/Collection #1_BTC combos.tar.gz",
-            "Collection 1/Collection #1_OLD CLOUD_Trading combos.tar.gz",
-            "Collection 1/Collection #1_OLD CLOUD_BTC combos.tar.gz",
-        ],
-    },
+    
 ]
 
 DISPOSABLE_DOMAINS = {
