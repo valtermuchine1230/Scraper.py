@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-minerador_production_v5_modified_extensions.py
+minerador_production_v5_duckdb_direct.py
 
-Versão: mesmo pipeline completo, com a alteração pedida:
-- DECISÃO DE QUAIS ARQUIVOS DENTRO DO TAR PROCESSAR:
-  usa SUPPORTED_EXTENSIONS e Path(member.name).suffix.lower()
-
-Nenhuma outra mudança funcional foi feita.
+Versão: pipeline ajustado para INSERIR DIRETO NO DUCKDB durante a extração
+- Elimina arquivos parquet temporários (raw_*.parquet)
+- Mantém deduplicação global apenas ao final (FASE 5)
+- Mantém checkpoints, upload HF, paralelismo, regex, SUPPORTED_EXTENSIONS
 """
 
 from __future__ import annotations
@@ -24,12 +23,14 @@ import unicodedata
 import warnings
 import difflib
 import traceback
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any
 from threading import Event, Lock
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
+# Suprimir DeprecationWarning do libtorrent (muitas versões emitem)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="libtorrent")
 
 import libtorrent as lt
@@ -90,13 +91,16 @@ SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
 EXPORT_DIR = SAVE_PATH / "exports"
 TEMP_DIR = SAVE_PATH / "temp"
+# RAW_CHUNKS_DIR kept for compatibility but unused now
 RAW_CHUNKS_DIR = SAVE_PATH / "raw_chunks"
+RAW_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+
 DB_PATH = SAVE_PATH / "emails.duckdb"
 STATE_PATH = SAVE_PATH / "state.json"
 LOG_PATH = SAVE_PATH / "minerador.log"
 ERROR_LOG_PATH = SAVE_PATH / "errors.log"
 
-for d in [EXPORT_DIR, TEMP_DIR, RAW_CHUNKS_DIR]:
+for d in [EXPORT_DIR, TEMP_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -105,8 +109,8 @@ HF_REPO_CHECKPOINT = os.environ.get("HF_REPO_CHECKPOINT", "minerador_checkpoints
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "100000"))
-ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "10000000"))
+BATCH_INSERT_DDB = int(os.environ.get("BATCH_INSERT_DDB", "100000"))  # fallback batch size
+ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "30000000"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(256 * 1024 * 1024)))
 FILE_DOWNLOAD_TIMEOUT = int(os.environ.get("FILE_DOWNLOAD_TIMEOUT", str(7200)))  # seconds
 
@@ -236,25 +240,25 @@ def is_disposable_email(email: str) -> bool:
     except Exception:
         return False
 
-# ===== DUCKDB =====
+# ===== DUCKDB helpers =====
 def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         conn = duckdb.connect(str(db_path))
         conn.execute("SET threads=8;")
-        conn.execute("SET memory_limit='2GB';")
-        conn.execute("SET max_memory='2GB';")
+        conn.execute("SET memory_limit='12GB';")  # tunable
         conn.execute(f"SET temp_directory='{str(TEMP_DIR)}';")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS emails_raw (
-                email VARCHAR PRIMARY KEY,
+                email VARCHAR,
                 nome VARCHAR,
                 origem VARCHAR,
                 data VARCHAR
             );
             """
         )
+        # Create primary index? DuckDB doesn't enforce PRIMARY KEY in same way; keep as is to allow inserts
         conn.commit()
         logger.info(f"{E['ok']} DuckDB inicializado")
         return conn
@@ -262,29 +266,49 @@ def init_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
         logger.error(f"{E['error']} DuckDB init falhou: {e}")
         raise
 
-def batch_insert_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tuple]) -> int:
+def insert_records_into_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tuple]) -> int:
+    """Insere um batch de registros (email, nome, origem, data) em DuckDB eficientemente usando pandas + register."""
     if not records:
         return 0
     try:
-        for email, nome, origem, data in records:
+        df = pd.DataFrame(records, columns=["email", "nome", "origem", "data"])
+        # Unique temporary name
+        tmp_name = f"tmp_df_{uuid.uuid4().hex[:8]}"
+        try:
+            conn.register(tmp_name, df)
+            conn.execute("BEGIN TRANSACTION;")
+            conn.execute(f"INSERT INTO emails_raw SELECT * FROM {tmp_name};")
+            conn.execute("COMMIT;")
             try:
-                conn.execute(
-                    "INSERT INTO emails_raw (email, nome, origem, data) VALUES (?, ?, ?, ?)",
-                    [email, nome, origem, data],
-                )
+                conn.unregister(tmp_name)
             except Exception:
                 pass
-        conn.commit()
-        return len(records)
-    except Exception as e:
-        logger.error(f"{E['error']} Insert falhou: {e}")
-        try:
-            conn.rollback()
+            return len(df)
         except Exception:
-            pass
+            # fallback slower: insert row by row
+            logger.debug(f"{E['warn']} Fallback row-by-row insert")
+            inserted = 0
+            for row in records:
+                try:
+                    conn.execute(
+                        "INSERT INTO emails_raw VALUES (?, ?, ?, ?)",
+                        list(row),
+                    )
+                    inserted += 1
+                except Exception:
+                    pass
+            conn.commit()
+            try:
+                conn.unregister(tmp_name)
+            except Exception:
+                pass
+            return inserted
+    except Exception as e:
+        logger.error(f"{E['error']} insert_records_into_duckdb: {e}")
+        logger.debug(traceback.format_exc())
         return 0
 
-# ===== LIBTORRENT =====
+# ===== LIBTORRENT helpers =====
 def create_libtorrent_session() -> lt.session:
     try:
         session = lt.session()
@@ -300,7 +324,7 @@ def create_libtorrent_session() -> lt.session:
             settings.set_bool("enable_lsd", True)
             settings.set_bool("enable_pex", True)
             session.apply_settings(settings)
-        except AttributeError:
+        except Exception:
             pass
         logger.info(f"{E['ok']} Libtorrent inicializado")
         return session
@@ -505,7 +529,7 @@ def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_
             logger.debug(f"Erro monitorando: {e}")
             time.sleep(POLL_INTERVAL)
 
-# ===== PROCESSAMENTO =====
+# ===== PROCESSAMENTO (sem parquets intermediários) =====
 def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List[Tuple]:
     results = []
     data_iso = datetime.now(timezone.utc).isoformat()
@@ -530,16 +554,13 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
         logger.error(f"{E['error']} Worker error: {e}")
     return results
 
-def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
+def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.DuckDBPyConnection) -> int:
     """
-    Processa um arquivo .tar/.tar.gz lendo membros textuais.
-
-    Alteração chave: decides quais membros processar com base em SUPPORTED_EXTENSIONS,
-    usando Path(member.name).suffix.lower() (case-insensitive).
+    Processa um arquivo .tar/.tar.gz lendo membros textuais e INSERE DIRETO no DuckDB.
+    Retorna total de registros inseridos do TAR.
     """
     cpu_count = os.cpu_count() or 4
-    chunk_files: List[Path] = []
-    total_records = 0
+    total_records_inserted = 0
     logger.info(f"{E['extract']} Processando: {tar_path.name} ({human(tar_path.stat().st_size)})")
     try:
         with tarfile.open(tar_path, "r:*") as tar:
@@ -548,22 +569,16 @@ def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
                 if stop_event.is_set():
                     break
 
-                # --- NOVA LÓGICA DE SELEÇÃO DE MEMBER (APLICADA AQUI) ---
-                # 1) verificar se é arquivo regular
+                # Checagem de seleção por extensão suportada (case-insensitive)
                 if not member.isfile():
                     continue
-
-                # 2) verificar extensão suportada (case-insensitive)
                 try:
                     ext = Path(member.name).suffix.lower()
                 except Exception:
                     ext = ""
                 if not ext or ext not in SUPPORTED_EXTENSIONS:
-                    # caso não pertença ao conjunto suportado, pular
                     continue
-                # ----------------------------------------------------------------
 
-                # A partir daqui, comportamento inalterado:
                 member_count += 1
                 try:
                     member_size = member.size
@@ -574,10 +589,12 @@ def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
                 fobj = tar.extractfile(member)
                 if fobj is None:
                     continue
-                all_records = []
+
+                # Ler em chunks e processar em workers; coleto os resultados e insiro no DB
                 chunk_idx = 0
+                futures = {}
+                all_records_for_member: List[Tuple] = []
                 with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                    futures = {}
                     while True:
                         chunk_data = fobj.read(CHUNK_SIZE)
                         if not chunk_data:
@@ -591,33 +608,27 @@ def process_tar_streaming(tar_path: Path, origin: str) -> List[Path]:
                         try:
                             records = future.result()
                             if records:
-                                all_records.extend(records)
+                                all_records_for_member.extend(records)
                         except Exception as e:
-                            logger.error(f"{E['error']} Worker: {e}")
-                if all_records:
-                    # neste script original, gravávamos parquet intermediário. Mantemos comportamento
-                    # idêntico (sem alterar fluxo) — salvamos chunk como parquet para compatibilidade.
-                    # Se desejar o fluxo sem parquets (escrever direto no DuckDB), isso é alteração adicional.
-                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    chunk_file = RAW_CHUNKS_DIR / f"raw_{len(chunk_files):06d}_{ts}.parquet"
-                    try:
-                        df = pd.DataFrame(all_records, columns=["email", "nome", "origem", "data"])
-                        table = pa.Table.from_pandas(df)
-                        pq.write_table(table, str(chunk_file), compression="snappy")
-                        chunk_files.append(chunk_file)
-                        total_records += len(all_records)
-                        logger.info(f"{E['ok']} Chunk: {chunk_file.name} ({len(all_records):,})")
-                    except Exception as e:
-                        logger.error(f"{E['error']} Chunk save: {e}")
+                            logger.error(f"{E['error']} Worker failed: {e}")
+
+                # Inserir resultados deste member no DuckDB (batch)
+                if all_records_for_member:
+                    inserted = insert_records_into_duckdb(conn, all_records_for_member)
+                    total_records_inserted += inserted
+                    logger.info(f"{E['ok']} Inseridos {inserted:,} registros do member {member.name}")
+
+        # Após processar tar, tentar remover
         try:
             tar_path.unlink()
+            logger.info(f"{E['clean']} Tar removido: {tar_path.name}")
         except Exception:
-            pass
+            logger.debug(f"{E['warn']} Falha ao remover tar: {tar_path}")
     except Exception as e:
         logger.error(f"{E['error']} TAR process: {e}")
         logger.debug(traceback.format_exc())
-    logger.info(f"{E['ok']} TAR: {len(chunk_files)} chunks, {total_records:,}")
-    return chunk_files
+    logger.info(f"{E['ok']} TAR processado: {tar_path.name} -> {total_records_inserted:,} registros")
+    return total_records_inserted
 
 # ===== HUGGING FACE =====
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
@@ -702,7 +713,7 @@ def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path:
         logger.info(f"{E['info']} Sem DuckDB anterior")
         return False
 
-# ===== FASES (inalteradas) =====
+# ===== FASES =====
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents (com debug completo)")
@@ -852,11 +863,15 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
     logger.info(f"\n{E['ok']} FASE 2: {len(all_files_ready)} arquivos prontos\n")
     return all_files_ready
 
-def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
+def phase3_process_tars(tars: List[Tuple], state: Dict, conn: duckdb.DuckDBPyConnection) -> int:
+    """
+    FASE 3: Processa TARS e INSERE direto no DuckDB.
+    Retorna total de registros inseridos nesta fase.
+    """
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['extract']} FASE 3: Processar {len(tars)} TARs")
+    logger.info(f"{E['extract']} FASE 3: Processar {len(tars)} TARs (inserção direta no DuckDB)")
     logger.info(f"{'='*100}\n")
-    all_chunks: List[Path] = []
+    total_inserted = 0
     processed_tars = state.get("processed_tars", [])
     for tname, tar_path, info in tars:
         if stop_event.is_set():
@@ -864,51 +879,31 @@ def phase3_process_tars(tars: List[Tuple], state: Dict) -> List[Path]:
         if str(tar_path) in processed_tars:
             logger.info(f"{E['ok']} Já processado: {tar_path.name}")
             continue
-        chunks = process_tar_streaming(tar_path, tname)
-        all_chunks.extend(chunks)
+        inserted = process_tar_streaming_and_insert(tar_path, tname, conn)
+        total_inserted += inserted
         processed_tars.append(str(tar_path))
         state["processed_tars"] = processed_tars
         save_state(state)
-    logger.info(f"\n{E['ok']} FASE 3: {len(all_chunks)} chunks\n")
-    return all_chunks
+    logger.info(f"\n{E['ok']} FASE 3: {total_inserted:,} registros inseridos em DuckDB\n")
+    return total_inserted
 
+# phase4 kept for compatibility but will be minimal now since no parquet chunks exist
 def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, state: Dict) -> int:
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['db']} FASE 4: Carregar {len(chunks)} chunks")
+    logger.info(f"{E['db']} FASE 4: Carregar (no novo fluxo não há chunks para carregar)")
     logger.info(f"{'='*100}\n")
-    total_inserted = 0
-    loaded_chunks = state.get("loaded_chunks", [])
-    for i, chunk_file in enumerate(chunks, 1):
-        if stop_event.is_set():
-            break
-        if str(chunk_file) in loaded_chunks:
-            logger.info(f"{E['ok']} [{i}/{len(chunks)}] Já carregado")
-            continue
-        try:
-            logger.info(f"{E['db']} [{i}/{len(chunks)}] Carregando... {chunk_file.name}")
-            df = pd.read_parquet(chunk_file)
-            records = [tuple(row) for row in df.itertuples(index=False, name=None)]
-            inserted = batch_insert_duckdb(conn, records)
-            total_inserted += inserted
-            loaded_chunks.append(str(chunk_file))
-            state["loaded_chunks"] = loaded_chunks
-            save_state(state)
-            logger.info(f"{E['ok']} [{i}/{len(chunks)}] +{inserted:,}")
-        except Exception as e:
-            logger.error(f"{E['error']} Load chunk: {e}")
-            logger.debug(traceback.format_exc())
-    logger.info(f"\n{E['ok']} FASE 4: {total_inserted:,} total\n")
-    return total_inserted
+    # No-op in new architecture (parquets are not generated). Return 0.
+    return 0
 
 def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['db']} FASE 5: Deduplicação")
+    logger.info(f"{E['db']} FASE 5: Deduplicação (global)")
     logger.info(f"{'='*100}\n")
     try:
         count_before = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
         logger.info(f"{E['stats']} Antes: {count_before:,}")
-        conn.execute("CREATE TABLE emails_dedup AS SELECT DISTINCT * FROM emails_raw;")
-        conn.execute("DROP TABLE emails_raw;")
+        conn.execute("CREATE TABLE IF NOT EXISTS emails_dedup AS SELECT DISTINCT * FROM emails_raw;")
+        conn.execute("DROP TABLE IF EXISTS emails_raw;")
         conn.execute("ALTER TABLE emails_dedup RENAME TO emails_raw;")
         conn.commit()
         count_after = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
@@ -931,7 +926,7 @@ def phase6_export(conn: duckdb.DuckDBPyConnection) -> List[Path]:
     while not stop_event.is_set():
         try:
             rows_df = conn.execute(
-                f""" SELECT * FROM emails_raw LIMIT {ROWS_PER_FINAL_FILE} OFFSET {offset}; """
+                f"SELECT * FROM emails_raw LIMIT {ROWS_PER_FINAL_FILE} OFFSET {offset};"
             ).fetchdf()
             if rows_df.shape[0] == 0:
                 break
@@ -973,7 +968,7 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
 # ===== MAIN =====
 def main():
     logger.info(f"\n{'#'*100}")
-    logger.info(f"# {E['start']} MINERADOR V5 - VERSÃO FINAL COMPLETA (Debug Total)")
+    logger.info(f"# {E['start']} MINERADOR V5 - INSERÇÃO DIRETA NO DUCKDB")
     logger.info(f"{'#'*100}\n")
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['cpu']} CPU: {os.cpu_count()}")
@@ -983,6 +978,7 @@ def main():
         logger.error(f"{E['error']} HF_TOKEN não definido")
         sys.exit(2)
 
+    # Setup HF
     try:
         api, emails_repo, checkpoint_repo = hf_setup_datasets(HF_TOKEN)
     except Exception as e:
@@ -995,6 +991,7 @@ def main():
     state = load_state()
     logger.info(f"{E['ok']} State loaded with {len(state)} entries")
 
+    # Initialize DuckDB and libtorrent
     try:
         conn = init_duckdb(DB_PATH)
     except Exception as e:
@@ -1010,28 +1007,38 @@ def main():
     total_emails = 0
     try:
         overall_start = time.time()
+        # PHASE 1
         completed_torrents = phase1_download_torrents(session, MAGNETS)
         if not completed_torrents:
             logger.error(f"{E['error']} Nenhum torrent completado")
             return
         if stop_event.is_set():
             return
+        # PHASE 2
         tars = phase2_wait_downloads(completed_torrents, state)
         if tars and not stop_event.is_set():
-            chunks = phase3_process_tars(tars, state)
-            if chunks and not stop_event.is_set():
-                phase4_load_to_duckdb(chunks, conn, state)
+            # PHASE 3 (inserção direta no DuckDB)
+            inserted = phase3_process_tars(tars, state, conn)
+            total_emails += inserted
+            if not stop_event.is_set():
+                # PHASE 4 (no-op)
+                phase4_load_to_duckdb([], conn, state)
                 if not stop_event.is_set():
+                    # PHASE 5 deduplicate
                     total_emails = phase5_deduplicate(conn)
                     if not stop_event.is_set():
+                        # PHASE 6 export
                         final_files = phase6_export(conn)
                         if not stop_event.is_set():
+                            # PHASE 7 upload
                             phase7_upload(api, HF_TOKEN, emails_repo, checkpoint_repo, final_files, DB_PATH, state)
+        else:
+            logger.info(f"{E['info']} Nenhum arquivo novo encontrado na FASE 2; nada a processar")
         total_time = time.time() - overall_start
         logger.info(f"\n{'='*100}")
         logger.info(f"{E['ok']} ✅ SUCESSO COMPLETO")
         logger.info(f"{E['clock']} Tempo: {total_time / 60:.2f}min")
-        logger.info(f"{E['email']} Emails: {total_emails:,}")
+        logger.info(f"{E['email']} Emails (aprox): {total_emails:,}")
         logger.info(f"{E['stats']} Disco Final: {disk_usage()}")
         logger.info(f"{'='*100}\n")
     except KeyboardInterrupt:
