@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-minerador_v8_production_final.py
+minerador_v8_production_final_FIXED.py
 
-Versão v8 FINAL CORRIGIDA: qualidade de emails + uma linha por email (email, nome)
+Versão v8 FINAL CORRIGIDA v2:
+- ✅ BUG FIXO: local_path_for_index não duplica pasta do torrent
+- Qualidade de emails + uma linha por email (email, nome)
 - Limite de 200M emails
-- Validação RIGOROSA de emails (regex + checks extras)
-- Lista de disposable reduzida (só temp-mail reais)
-- Filtra local-parts corporativos (support/info/noreply/...)
-- Deduplicação por email (um registro = um email)
-- Export por COPY (sem pandas/pyarrow) em blocos
-- Mantém streaming, batching e proteções contra OOM
-
-CORREÇÕES DA V8:
-  ✅ Removido PRAGMA disable_verifier (não existe)
-  ✅ Corrigido typo diffllib → difflib
-  ✅ Corrigido regex SQL para DuckDB (REGEXP_MATCHES)
-  ✅ Removido if False que desativava lógica
-  ✅ Import difflib no topo
+- Validação RIGOROSA de emails
+- Lista de disposable reduzida
+- Filtra local-parts corporativos
+- Deduplicação por email
+- Export por COPY em blocos
+- Streaming, batching e proteções contra OOM
 """
 
 from __future__ import annotations
@@ -38,7 +33,7 @@ import threading
 import difflib
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from threading import Event, Lock
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
@@ -151,7 +146,7 @@ E = {
     "start": "🚀", "download": "📥", "extract": "📦", "stats": "📊", "space": "💾",
     "email": "📧", "upload": "📤", "clean": "🧹", "warn": "⚠️", "error": "❌",
     "ok": "✅", "info": "ℹ️", "cpu": "⚙️", "clock": "⏱️", "list": "📋",
-    "db": "🗄️", "monitor": "📡", "limit": "🛑",
+    "db": "🗄️", "monitor": "📡", "limit": "🛑", "debug": "🔍",
 }
 
 EMAIL_REGEX = re.compile(rb"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", re.IGNORECASE)
@@ -177,6 +172,7 @@ MAGNETS = [
         "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2f%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2f%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
         "targets": [
             "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
+            "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
         ],
     },
 ]
@@ -494,7 +490,7 @@ def normalize_str(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s.casefold()
 
-def parse_target_index(target: str):
+def parse_target_index(target: str) -> Optional[int]:
     if target is None:
         return None
     t = str(target).strip()
@@ -580,14 +576,11 @@ def find_targets_exact(torrent_info, targets: List[str]) -> Tuple[List[int], Dic
     logger.info(f"\n{E['list']} ENCONTRADOS: {found_indices}\n")
     return found_indices, files_map
 
-def local_path_for_index(save_path: Path, torrent_info, index: int) -> Path:
-    try:
-        torrent_name = torrent_info.name()
-    except Exception:
-        try:
-            torrent_name = getattr(torrent_info, "name", lambda: "unknown")()
-        except Exception:
-            torrent_name = "unknown"
+def local_path_for_index(save_path: Path, torrent_info, index: int) -> Optional[Path]:
+    """
+    CORRIGIDO: Não duplica o nome da pasta do torrent.
+    file_path já contém o caminho completo relativo à raiz do torrent.
+    """
     file_path = None
     try:
         fe = torrent_info.files().at(index)
@@ -597,9 +590,18 @@ def local_path_for_index(save_path: Path, torrent_info, index: int) -> Path:
             fe = torrent_info.files()[index]
             file_path = fe.path
         except Exception:
-            logger.debug("local_path erro")
+            logger.debug(f"{E['debug']} local_path erro ao obter arquivo {index}")
             return None
-    return save_path / torrent_name / file_path
+    
+    if file_path is None:
+        return None
+    
+    # CORREÇÃO: file_path já contém o caminho completo
+    # Não concatenar novamente com torrent_name
+    full_path = save_path / file_path
+    
+    logger.debug(f"{E['debug']} local_path[{index}]: {full_path}")
+    return full_path
 
 def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_size: int, timeout: int = FILE_DOWNLOAD_TIMEOUT) -> bool:
     last_log = 0
@@ -1208,13 +1210,15 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
 # MAIN
 def main():
     logger.info(f"\n{'#'*100}")
-    logger.info(f"# {E['start']} MINERADOR V8 PRODUCTION - FINAL CORRIGIDO")
+    logger.info(f"# {E['start']} MINERADOR V8 PRODUCTION - FINAL CORRIGIDO V2")
     logger.info(f"{'#'*100}")
-    logger.info(f"\n✅ CORREÇÕES APLICADAS:")
+    logger.info(f"\n✅ CORREÇÕES APLICADAS V2:")
+    logger.info(f"   • FIXO: local_path_for_index() não duplica nome da pasta")
+    logger.info(f"   • file_path já contém caminho completo relativo ao torrent")
     logger.info(f"   • Removido PRAGMA disable_verifier")
     logger.info(f"   • Corrigido typo diffllib → difflib")
     logger.info(f"   • Removido if False que desativava lógica")
-    logger.info(f"   • SQL robusta para DuckDB (SUBSTR não REGEXP)")
+    logger.info(f"   • SQL robusta para DuckDB")
     logger.info(f"   • Email + Nome: um registro por email\n")
     
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
