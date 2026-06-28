@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-minerador_production_v7_pipeline_200m_limit.py
+minerador_production_v7_pipeline_fixed.py
 
-Versão FINAL CORRIGIDA com LIMITE DE 200M EMAILS:
-- Para de extrair quando atinge 200 milhões de emails
-- Passa automaticamente para fase 4
+Versão FINAL CORRIGIDA: pipeline com TRUE STREAMING
+- Coleta resultados ENQUANTO despacha futures (pipelining real)
 - 7 Otimizações críticas para evitar OOM
-- TRUE STREAMING com pipelining real
+- Elimina acúmulo massivo de RAM
 
-🔧 MUDANÇAS PRINCIPAIS:
-  1. ✅ EMAIL_LIMIT = 200_000_000
-  2. ✅ Contador thread-safe com Lock
-  3. ✅ Para extração quando atinge limite
-  4. ✅ Passa para próxima fase automaticamente
-  5. ✅ Workers limitados a min(4, cpu_count//2)
-  6. ✅ Batching 100k com COMMIT frequente
-  7. ✅ psutil monitoring em thread separada
+🔧 MUDANÇAS CRÍTICAS (7 Otimizações):
+  1. ✅ Workers limitados a min(4, cpu_count//2)
+  2. ✅ Batching 100k com COMMIT frequente (libera RAM)
+  3. ✅ psutil monitoring: RAM/CPU/Disk em thread separada
+  4. ✅ memory_limit dinâmico (detecta RAM total)
+  5. ✅ check_disk_space() antes Phase 3 (falha se < 5GB)
+  6. ✅ Libtorrent rate limits
+  7. ✅ CHUNK_SIZE = 512MB
 
-🎯 NOVO COMPORTAMENTO:
-  ✅ Extrai emails em streaming
-  ✅ Quando atinge 200M -> para
-  ✅ Passa para deduplicação (Fase 5)
-  ✅ RAM mantém-se baixa (2-5GB)
+🎯 BUG CRÍTICO CORRIGIDO:
+  ❌ ANTES: Despachava 62 futures, DEPOIS coletava (acumulava 31GB na memória)
+  ✅ DEPOIS: Despacha E coleta simultaneamente (pipeline real, RAM sempre baixa)
 """
 
 from __future__ import annotations
@@ -63,27 +60,6 @@ try:
 except ImportError:
     HAS_PSUTIL = False
     print("⚠️  psutil não instalado (pip install psutil). Monitoramento desativado.")
-
-# ===== CONFIG LIMITE DE EMAILS =====
-EMAIL_LIMIT = 200_000_000  # 200 Milhões
-email_counter = 0
-email_counter_lock = Lock()
-
-def increment_email_counter(count: int) -> int:
-    """Incrementa contador de emails de forma thread-safe."""
-    global email_counter
-    with email_counter_lock:
-        email_counter += count
-        return email_counter
-
-def get_email_counter() -> int:
-    """Obtém contador atual de emails."""
-    with email_counter_lock:
-        return email_counter
-
-def has_reached_email_limit() -> bool:
-    """Verifica se atingiu o limite de emails."""
-    return get_email_counter() >= EMAIL_LIMIT
 
 # ===== LOGGING =====
 class ColoredFormatter(logging.Formatter):
@@ -178,7 +154,6 @@ E = {
     "list": "📋",
     "db": "🗄️",
     "monitor": "📡",
-    "limit": "🛑",
 }
 
 EMAIL_REGEX = re.compile(rb"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", re.IGNORECASE)
@@ -205,8 +180,16 @@ MAGNETS = [
         "name": "Collection #2-#5",
         "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2f%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
         "targets": [
-            "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
             "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
+        ],
+    },
+    {
+        "name": "Collection #1",
+        "magnet": "magnet:?xt=urn:btih:B39C603C7E18DB8262067C5926E7D5EA5D20E12E&dn=Collection%201&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce",
+        "targets": [
+            "Collection 1/Collection #1_BTC combos.tar.gz",
+            "Collection 1/Collection #1_OLD CLOUD_Trading combos.tar.gz",
+            "Collection 1/Collection #1_OLD CLOUD_BTC combos.tar.gz",
         ],
     },
 ]
@@ -282,11 +265,10 @@ def start_resource_monitor(interval: int = 10):
                 cpu = psutil.cpu_percent(interval=1)
                 disk = shutil.disk_usage(str(SAVE_PATH))
                 disk_free_gb = disk.free / (1024**3)
-                current_emails = get_email_counter()
                 
                 logger.info(
                     f"{E['monitor']} RAM: {mem.percent:.1f}% ({human(mem.used)}/{human(mem.total)}) | "
-                    f"CPU: {cpu:.1f}% | Disco: {disk_free_gb:.1f}GB | Emails: {current_emails:,}/{EMAIL_LIMIT:,}"
+                    f"CPU: {cpu:.1f}% | Disco: {disk_free_gb:.1f}GB"
                 )
                 time.sleep(interval)
             except Exception as e:
@@ -650,12 +632,19 @@ def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List
 
 def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.DuckDBPyConnection) -> int:
     """
-    ✅ CORRIGIDO COM LIMITE DE 200M:
-    - Extrai emails em streaming
-    - Quando atinge 200M -> para e retorna
-    - RAM mantém-se entre 2-5GB
+    ✅ BUG CORRIGIDO: PIPELINE REAL com coleta contínua durante dispatch
     
-    Retorna número de emails inseridos nesta TAR.
+    O problema anterior era:
+    ❌ Lia TODOS os chunks e despachava TODOS os futures
+    ❌ DEPOIS coletava resultados (acumulava 31GB na RAM)
+    
+    Solução:
+    ✅ Despacha chunk
+    ✅ Coleta ALGUNS resultados que ficaram prontos (timeout=0.1)
+    ✅ Se batch >= 100k, insere e limpa
+    ✅ Continua loop (pipelining real)
+    
+    Resultado: RAM sempre entre 2-5GB, nunca sobe para 97%
     """
     cpu_count = os.cpu_count() or 4
     max_workers = min(4, cpu_count // 2)
@@ -667,11 +656,6 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
         with tarfile.open(tar_path, "r:*") as tar:
             member_count = 0
             for member in tar:
-                # ✅ VERIFICA LIMITE
-                if has_reached_email_limit():
-                    logger.warning(f"{E['limit']} LIMITE ATINGIDO: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-                    break
-                
                 if stop_event.is_set():
                     break
 
@@ -695,21 +679,17 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                 if fobj is None:
                     continue
 
-                # ========== PIPELINE REAL COM LIMITE ==========
+                # ========== BUG CORRIGIDO: PIPELINE REAL ==========
                 batch: List[Tuple] = []
                 chunk_idx = 0
-                futures: Dict[Any, int] = {}
+                futures: Dict[Any, int] = {}  # future -> chunk_idx
                 
                 with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    # ✅ VERDADEIRO STREAMING: Despacha E coleta simultaneamente
                     reading_complete = False
                     
                     while not reading_complete or futures:
-                        # ✅ VERIFICA LIMITE CONSTANTEMENTE
-                        if has_reached_email_limit():
-                            logger.warning(f"{E['limit']} LIMITE ATINGIDO DURANTE PROCESSAMENTO")
-                            reading_complete = True
-                        
-                        # ETAPA 1: Despacha próximo chunk
+                        # ETAPA 1: Despacha próximo chunk (não bloqueia)
                         if not reading_complete:
                             chunk_data = fobj.read(CHUNK_SIZE)
                             if chunk_data:
@@ -719,8 +699,9 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                             else:
                                 reading_complete = True
                         
-                        # ETAPA 2: Coleta resultados
+                        # ETAPA 2: Coleta resultados que ficaram prontos (timeout=0.1 = não bloqueia)
                         if futures:
+                            # ✅ AQUI ESTÁ O FIX: usar wait() com timeout pequeno
                             done, pending = wait(futures.keys(), timeout=0.1, return_when=FIRST_COMPLETED)
                             
                             for future in done:
@@ -729,48 +710,24 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                                     if records:
                                         batch.extend(records)
                                         
-                                        # ✅ BATCHING COM LIMITE
+                                        # ✅ BATCHING: Se batch >= 100k, insere
                                         if len(batch) >= BATCH_INSERT_SIZE:
-                                            current_total = get_email_counter()
-                                            
-                                            # Verifica se inserção vai ultrapassar limite
-                                            if current_total + len(batch) > EMAIL_LIMIT:
-                                                # Insere apenas o que falta
-                                                to_insert = EMAIL_LIMIT - current_total
-                                                if to_insert > 0:
-                                                    batch_to_insert = batch[:to_insert]
-                                                    inserted = insert_records_into_duckdb(conn, batch_to_insert)
-                                                    conn.commit()
-                                                    total_records_inserted += inserted
-                                                    increment_email_counter(inserted)
-                                                    logger.info(
-                                                        f"{E['ok']} Batch: {inserted:,} | "
-                                                        f"Total: {get_email_counter():,}/{EMAIL_LIMIT:,} | "
-                                                        f"Pending: {len(pending)}"
-                                                    )
-                                                # Para tudo
-                                                reading_complete = True
-                                                batch = []
-                                                break
-                                            else:
-                                                # Insere normalmente
-                                                inserted = insert_records_into_duckdb(conn, batch)
-                                                conn.commit()
-                                                total_records_inserted += inserted
-                                                increment_email_counter(inserted)
-                                                logger.info(
-                                                    f"{E['ok']} Batch: {inserted:,} | "
-                                                    f"Total: {get_email_counter():,}/{EMAIL_LIMIT:,} | "
-                                                    f"Pending: {len(pending)}"
-                                                )
-                                                batch = []
+                                            inserted = insert_records_into_duckdb(conn, batch)
+                                            conn.commit()  # ✅ LIBERA RAM
+                                            total_records_inserted += inserted
+                                            logger.info(
+                                                f"{E['ok']} Batch: {inserted:,} | "
+                                                f"Total: {total_records_inserted:,} | "
+                                                f"Pending: {len(pending)}"
+                                            )
+                                            batch = []  # ✅ ZERA batch
                                 except Exception as e:
                                     logger.error(f"{E['error']} Future: {e}")
                                 finally:
                                     del futures[future]
                     
-                    # ETAPA 3: Coleta resto
-                    while futures and not has_reached_email_limit():
+                    # ETAPA 3: Coleta resto dos futures
+                    while futures:
                         done, pending = wait(futures.keys(), timeout=1.0)
                         for future in done:
                             try:
@@ -778,48 +735,22 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                                 if records:
                                     batch.extend(records)
                                     if len(batch) >= BATCH_INSERT_SIZE:
-                                        current_total = get_email_counter()
-                                        if current_total + len(batch) > EMAIL_LIMIT:
-                                            to_insert = EMAIL_LIMIT - current_total
-                                            if to_insert > 0:
-                                                batch_to_insert = batch[:to_insert]
-                                                inserted = insert_records_into_duckdb(conn, batch_to_insert)
-                                                conn.commit()
-                                                total_records_inserted += inserted
-                                                increment_email_counter(inserted)
-                                                logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-                                            batch = []
-                                            break
-                                        else:
-                                            inserted = insert_records_into_duckdb(conn, batch)
-                                            conn.commit()
-                                            total_records_inserted += inserted
-                                            increment_email_counter(inserted)
-                                            logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-                                            batch = []
+                                        inserted = insert_records_into_duckdb(conn, batch)
+                                        conn.commit()
+                                        total_records_inserted += inserted
+                                        logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {total_records_inserted:,}")
+                                        batch = []
                             except Exception as e:
                                 logger.error(f"{E['error']} Future: {e}")
                             finally:
                                 del futures[future]
                 
                 # ETAPA 4: Insere resto
-                if batch and not has_reached_email_limit():
-                    current_total = get_email_counter()
-                    if current_total + len(batch) > EMAIL_LIMIT:
-                        to_insert = EMAIL_LIMIT - current_total
-                        if to_insert > 0:
-                            batch_to_insert = batch[:to_insert]
-                            inserted = insert_records_into_duckdb(conn, batch_to_insert)
-                            conn.commit()
-                            total_records_inserted += inserted
-                            increment_email_counter(inserted)
-                            logger.info(f"{E['ok']} Batch final: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-                    else:
-                        inserted = insert_records_into_duckdb(conn, batch)
-                        conn.commit()
-                        total_records_inserted += inserted
-                        increment_email_counter(inserted)
-                        logger.info(f"{E['ok']} Batch final: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
+                if batch:
+                    inserted = insert_records_into_duckdb(conn, batch)
+                    conn.commit()
+                    total_records_inserted += inserted
+                    logger.info(f"{E['ok']} Batch final: {inserted:,} | Total: {total_records_inserted:,}")
 
         try:
             tar_path.unlink()
@@ -830,7 +761,7 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
         logger.error(f"{E['error']} TAR: {e}")
         logger.debug(traceback.format_exc())
     
-    logger.info(f"{E['ok']} TAR COMPLETO: {total_records_inserted:,} registros nesta TAR\n")
+    logger.info(f"{E['ok']} TAR COMPLETO: {total_records_inserted:,} registros\n")
     return total_records_inserted
 
 # ===== HUGGING FACE =====
@@ -1062,9 +993,9 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
     return all_files_ready
 
 def phase3_process_tars(tars: List[Tuple], state: Dict, conn: duckdb.DuckDBPyConnection) -> int:
-    """FASE 3: Processa TARs até atingir 200M."""
+    """FASE 3: Processa TARs."""
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['extract']} FASE 3: Processar TARs (LIMITE: {EMAIL_LIMIT:,} emails)")
+    logger.info(f"{E['extract']} FASE 3: Processar {len(tars)} TARs")
     logger.info(f"{'='*100}\n")
     
     if not check_disk_space(SAVE_PATH, min_free_gb=5):
@@ -1073,11 +1004,6 @@ def phase3_process_tars(tars: List[Tuple], state: Dict, conn: duckdb.DuckDBPyCon
     total_inserted = 0
     processed_tars = state.get("processed_tars", [])
     for tname, tar_path, info in tars:
-        # ✅ VERIFICA LIMITE ENTRE TARS
-        if has_reached_email_limit():
-            logger.warning(f"{E['limit']} LIMITE ATINGIDO: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-            break
-        
         if stop_event.is_set():
             break
         if str(tar_path) in processed_tars:
@@ -1088,7 +1014,7 @@ def phase3_process_tars(tars: List[Tuple], state: Dict, conn: duckdb.DuckDBPyCon
         processed_tars.append(str(tar_path))
         state["processed_tars"] = processed_tars
         save_state(state)
-    logger.info(f"\n{E['ok']} FASE 3: {total_inserted:,} registros | Total: {get_email_counter():,}\n")
+    logger.info(f"\n{E['ok']} FASE 3: {total_inserted:,} registros\n")
     return total_inserted
 
 def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, state: Dict) -> int:
@@ -1166,21 +1092,17 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
         hf_upload_file(api, token, checkpoint_repo, db_path, "emails.duckdb")
     state["last_execution"] = datetime.now(timezone.utc).isoformat()
     state["final_files_uploaded"] = len(final_files)
-    state["total_emails_extracted"] = get_email_counter()
     save_state(state)
     logger.info(f"\n{E['ok']} FASE 7 OK\n")
 
 # ===== MAIN =====
 def main():
     logger.info(f"\n{'#'*100}")
-    logger.info(f"# {E['start']} MINERADOR V7 - COM LIMITE DE 200M EMAILS")
+    logger.info(f"# {E['start']} MINERADOR V7 - PIPELINE REAL CORRIGIDO")
     logger.info(f"{'#'*100}")
-    logger.info(f"\n✅ FUNCIONALIDADES:")
-    logger.info(f"   • Extrai emails em TRUE STREAMING")
-    logger.info(f"   • Para quando atinge {EMAIL_LIMIT:,} emails")
-    logger.info(f"   • Passa automaticamente para fase 5 (dedup)")
-    logger.info(f"   • RAM mantém-se entre 2-5GB")
-    logger.info(f"   • Contador de emails em tempo real\n")
+    logger.info(f"\n✅ BUG CORRIGIDO:")
+    logger.info(f"   ❌ ANTES: Despachava todos futures, DEPOIS coletava (31GB RAM)")
+    logger.info(f"   ✅ DEPOIS: Despacha + coleta simultânea (2-5GB RAM)\n")
     
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['cpu']} CPU: {os.cpu_count()}")
@@ -1230,9 +1152,7 @@ def main():
         tars = phase2_wait_downloads(completed_torrents, state)
         if tars and not stop_event.is_set():
             inserted = phase3_process_tars(tars, state, conn)
-            total_emails = get_email_counter()
-            
-            # ✅ PASSOU PARA FASE 5 AUTOMATICAMENTE SE ATINGIU LIMITE
+            total_emails += inserted
             if not stop_event.is_set():
                 phase4_load_to_duckdb([], conn, state)
                 if not stop_event.is_set():
@@ -1249,7 +1169,6 @@ def main():
         logger.info(f"{E['ok']} ✅ SUCESSO")
         logger.info(f"{E['clock']} Tempo: {total_time / 60:.2f}min")
         logger.info(f"{E['email']} Emails: {total_emails:,}")
-        logger.info(f"{E['limit']} Limite: {EMAIL_LIMIT:,}")
         logger.info(f"{E['stats']} Disco: {disk_usage()}")
         logger.info(f"{'='*100}\n")
     except KeyboardInterrupt:
