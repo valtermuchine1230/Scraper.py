@@ -2,18 +2,13 @@
 """
 minerador_v8_production_final_FIXED.py
 
-Versão v8 FINAL CORRIGIDA v2:
-- ✅ BUG FIXO: local_path_for_index não duplica pasta do torrent
-- Qualidade de emails + uma linha por email (email, nome)
-- Limite de 200M emails
-- Validação RIGOROSA de emails
-- Lista de disposable reduzida
-- Filtra local-parts corporativos
-- Deduplicação por email
-- Export por COPY em blocos
-- Streaming, batching e proteções contra OOM
+Versão v8 FINAL CORRIGIDA v2 + diagnósticos detalhados:
+- Corrige possíveis bugs no path local
+- Evita perda por quebra de chunk com overlap de 100 bytes
+- Worker retorna diagnostics (matched, valid, invalid_format, disposable, blocked_local, decode_errors)
+- Principal agrega e loga contadores detalhados
+- Mantém validações, dedup por email e export por COPY
 """
-
 from __future__ import annotations
 
 import os
@@ -138,6 +133,7 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 BATCH_INSERT_SIZE = int(os.environ.get("BATCH_INSERT_SIZE", "100000"))
 ROWS_PER_FINAL_FILE = int(os.environ.get("ROWS_PER_FINAL_FILE", "30000000"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(512 * 1024 * 1024)))
+CHUNK_OVERLAP = 100  # bytes overlap between chunks to avoid splitting emails
 FILE_DOWNLOAD_TIMEOUT = int(os.environ.get("FILE_DOWNLOAD_TIMEOUT", str(7200)))
 
 logger = setup_logging(LOG_PATH, LOG_LEVEL)
@@ -149,7 +145,7 @@ E = {
     "db": "🗄️", "monitor": "📡", "limit": "🛑", "debug": "🔍",
 }
 
-EMAIL_REGEX = re.compile(rb"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", re.IGNORECASE)
+EMAIL_REGEX = re.compile(rb"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.IGNORECASE)
 
 stop_event = Event()
 state_lock = Lock()
@@ -172,7 +168,6 @@ MAGNETS = [
         "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2f%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2f%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
         "targets": [
             "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
-            "Collection #2-#5 & Antipublic/Collection #4_BTC combos.tar.gz",
         ],
     },
 ]
@@ -287,15 +282,12 @@ def is_valid_email(email: str) -> bool:
         return False
     local = m.group("local")
     domain = m.group("domain")
-    # Não permitir local com dois pontos consecutivos
     if ".." in local or local.startswith(".") or local.endswith("."):
         return False
-    # Domain labels não podem ser todos numéricos
     labels = domain.split(".")
     for lab in labels:
         if lab.isdigit():
             return False
-    # TLD length
     if len(labels[-1]) < 2:
         return False
     return True
@@ -311,12 +303,9 @@ def is_block_local(local: str) -> bool:
     if not local:
         return False
     local_norm = local.lower().strip()
-    # strip plus-addressing
     local_norm = local_norm.split("+", 1)[0]
-    # exact match
     if local_norm in BLOCK_LOCAL_PARTS:
         return True
-    # prefix match
     for tok in BLOCK_LOCAL_PARTS:
         if local_norm.startswith(tok):
             rest = local_norm[len(tok):]
@@ -328,23 +317,17 @@ def extract_name_from_local(local: str) -> str:
     """Extrai nome a partir do local-part."""
     if not local:
         return ""
-    # Remove plus addressing
     local = local.split("+", 1)[0]
-    # Replace separators with space
     s = re.sub(r"[._\-]+", " ", local)
-    # Remove digits
     s = re.sub(r"\d+", "", s).strip()
     if not s:
         return ""
     parts = [p for p in s.split() if p and re.search(r"[A-Za-z]", p)]
     if not parts:
         return ""
-    # Single short token → skip
     if len(parts) == 1 and len(parts[0]) <= 2:
         return ""
-    # Capitalize
     name = " ".join([p.capitalize() for p in parts if p])
-    # Se inclui role tokens → empty
     if any(tok in name.lower() for tok in BLOCK_LOCAL_PARTS):
         return ""
     return name
@@ -416,7 +399,7 @@ def insert_records_into_duckdb(conn: duckdb.DuckDBPyConnection, records: List[Tu
         logger.error(f"{E['error']} Insert: {e}")
         return 0
 
-# Libtorrent
+# Libtorrent helpers (unchanged)
 def create_libtorrent_session() -> lt.session:
     try:
         session = lt.session()
@@ -592,14 +575,11 @@ def local_path_for_index(save_path: Path, torrent_info, index: int) -> Optional[
         except Exception:
             logger.debug(f"{E['debug']} local_path erro ao obter arquivo {index}")
             return None
-    
+
     if file_path is None:
         return None
-    
-    # CORREÇÃO: file_path já contém o caminho completo
-    # Não concatenar novamente com torrent_name
+
     full_path = save_path / file_path
-    
     logger.debug(f"{E['debug']} local_path[{index}]: {full_path}")
     return full_path
 
@@ -637,48 +617,79 @@ def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_
             logger.debug(f"Erro: {e}")
             time.sleep(POLL_INTERVAL)
 
-# Processing worker
-def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> List[Tuple]:
-    """Extrai e valida emails antes de retornar."""
-    results = []
+# Processing worker (returns diagnostics)
+def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> Dict[str, Any]:
+    """
+    Retorna:
+      {
+        "records": [ (email, nome, origin, data_iso), ... ],
+        "stats": { matched:int, valid:int, invalid_format:int, disposable:int, blocked_local:int, decode_errors:int }
+      }
+    """
+    stats = {
+        "matched": 0,
+        "valid": 0,
+        "invalid_format": 0,
+        "disposable": 0,
+        "blocked_local": 0,
+        "decode_errors": 0,
+    }
+    results: List[Tuple] = []
     data_iso = datetime.now(timezone.utc).isoformat()
     try:
-        for match in EMAIL_REGEX.finditer(chunk_data):
+        for m in EMAIL_REGEX.finditer(chunk_data):
+            stats["matched"] += 1
             try:
-                email_b = match.group()
+                email_b = m.group()
                 try:
                     email = email_b.decode("utf8", "ignore").strip()
                 except Exception:
-                    email = email_b.decode("latin1", "ignore").strip()
+                    try:
+                        email = email_b.decode("latin1", "ignore").strip()
+                    except Exception:
+                        stats["decode_errors"] += 1
+                        continue
                 if not email or "@" not in email:
+                    stats["invalid_format"] += 1
                     continue
-                email = email.strip()
                 email_lower = email.lower()
-                
-                # Validações
+                # format validation (python)
                 if not is_valid_email(email_lower):
+                    stats["invalid_format"] += 1
                     continue
+                # disposable domain check
                 if is_disposable_email_py(email_lower):
+                    stats["disposable"] += 1
                     continue
                 local_part = email_lower.split("@", 1)[0]
                 if is_block_local(local_part):
+                    stats["blocked_local"] += 1
                     continue
-                
-                # Nome
                 nome = extract_name_from_local(local_part)
+                stats["valid"] += 1
                 results.append((email_lower, nome, origin, data_iso))
             except Exception:
+                # count generic parse failure as invalid_format
+                stats["invalid_format"] += 1
                 continue
     except Exception as e:
-        logger.error(f"{E['error']} Worker: {e}")
-    return results
+        # If the regex scanning itself fails, return error stats
+        return {"records": results, "stats": stats, "error": str(e)}
+    return {"records": results, "stats": stats}
 
 def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.DuckDBPyConnection) -> int:
-    """Processa TAR em streaming."""
     cpu_count = os.cpu_count() or 4
     max_workers = min(4, max(1, cpu_count // 2))
     logger.info(f"{E['cpu']} Workers: {max_workers}")
-    
+
+    agg_stats = {
+        "matched": 0,
+        "valid": 0,
+        "invalid_format": 0,
+        "disposable": 0,
+        "blocked_local": 0,
+        "decode_errors": 0,
+    }
     total_records_inserted = 0
     logger.info(f"{E['extract']} TAR: {tar_path.name} ({human(tar_path.stat().st_size)})")
     try:
@@ -711,35 +722,101 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                 batch: List[Tuple] = []
                 chunk_idx = 0
                 futures: Dict[Any, int] = {}
-                
+
+                prev_tail = b""
                 with ProcessPoolExecutor(max_workers=max_workers) as executor:
                     reading_complete = False
-                    
+
                     while not reading_complete or futures:
                         if has_reached_email_limit():
                             reading_complete = True
-                        
+
                         if not reading_complete:
-                            chunk_data = fobj.read(CHUNK_SIZE)
-                            if chunk_data:
+                            chunk = fobj.read(CHUNK_SIZE)
+                            if chunk:
+                                # prepend tail from previous chunk to avoid splitting emails
+                                chunk_data = prev_tail + chunk
+                                # set new tail
+                                if len(chunk_data) > CHUNK_OVERLAP:
+                                    prev_tail = chunk_data[-CHUNK_OVERLAP:]
+                                else:
+                                    prev_tail = chunk_data
                                 future = executor.submit(process_chunk_worker, chunk_data, chunk_idx, member.name)
                                 futures[future] = chunk_idx
                                 chunk_idx += 1
                             else:
+                                # process remaining tail if any
+                                if prev_tail:
+                                    future = executor.submit(process_chunk_worker, prev_tail, chunk_idx, member.name)
+                                    futures[future] = chunk_idx
+                                    chunk_idx += 1
+                                    prev_tail = b""
                                 reading_complete = True
-                        
+
                         if futures:
-                            done, pending = wait(futures.keys(), timeout=0.1, return_when=FIRST_COMPLETED)
-                            
+                            done, pending = wait(futures.keys(), timeout=0.2, return_when=FIRST_COMPLETED)
+
                             for future in done:
                                 try:
-                                    records = future.result()
-                                    if records:
-                                        batch.extend(records)
-                                        
+                                    res = future.result()
+                                    if isinstance(res, dict):
+                                        recs = res.get("records", [])
+                                        stats = res.get("stats", {})
+                                        # aggregate stats
+                                        for k in agg_stats.keys():
+                                            agg_stats[k] += int(stats.get(k, 0))
+                                        if recs:
+                                            batch.extend(recs)
+                                            logger.debug(f"{E['debug']} chunk returned {len(recs)} valid records")
+                                            # insert in batches
+                                            if len(batch) >= BATCH_INSERT_SIZE:
+                                                current_total = get_email_counter()
+                                                if current_total + len(batch) > EMAIL_LIMIT:
+                                                    to_insert = EMAIL_LIMIT - current_total
+                                                    if to_insert > 0:
+                                                        batch_to_insert = batch[:to_insert]
+                                                        inserted = insert_records_into_duckdb(conn, batch_to_insert)
+                                                        conn.commit()
+                                                        total_records_inserted += inserted
+                                                        increment_email_counter(inserted)
+                                                        logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
+                                                    reading_complete = True
+                                                    batch = []
+                                                    break
+                                                else:
+                                                    inserted = insert_records_into_duckdb(conn, batch)
+                                                    conn.commit()
+                                                    total_records_inserted += inserted
+                                                    increment_email_counter(inserted)
+                                                    logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
+                                                    batch = []
+                                    else:
+                                        logger.warning(f"{E['warn']} Unexpected worker result type: {type(res)}")
+                                except Exception as e:
+                                    # log full traceback for worker exception
+                                    logger.error(f"{E['error']} Worker raised: {e}")
+                                    logger.error(traceback.format_exc())
+                                finally:
+                                    try:
+                                        del futures[future]
+                                    except Exception:
+                                        pass
+
+                    # collect remaining futures
+                    while futures and not has_reached_email_limit():
+                        done, pending = wait(futures.keys(), timeout=1.0)
+                        for future in done:
+                            try:
+                                res = future.result()
+                                if isinstance(res, dict):
+                                    recs = res.get("records", [])
+                                    stats = res.get("stats", {})
+                                    for k in agg_stats.keys():
+                                        agg_stats[k] += int(stats.get(k, 0))
+                                    if recs:
+                                        batch.extend(recs)
                                         if len(batch) >= BATCH_INSERT_SIZE:
                                             current_total = get_email_counter()
-                                            
                                             if current_total + len(batch) > EMAIL_LIMIT:
                                                 to_insert = EMAIL_LIMIT - current_total
                                                 if to_insert > 0:
@@ -749,7 +826,6 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                                                     total_records_inserted += inserted
                                                     increment_email_counter(inserted)
                                                     logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-                                                reading_complete = True
                                                 batch = []
                                                 break
                                             else:
@@ -759,49 +835,18 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
                                                 increment_email_counter(inserted)
                                                 logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
                                                 batch = []
-                                except Exception as e:
-                                    logger.error(f"{E['error']} Future: {e}")
-                                finally:
-                                    try:
-                                        del futures[future]
-                                    except Exception:
-                                        pass
-                    
-                    while futures and not has_reached_email_limit():
-                        done, pending = wait(futures.keys(), timeout=1.0)
-                        for future in done:
-                            try:
-                                records = future.result()
-                                if records:
-                                    batch.extend(records)
-                                    if len(batch) >= BATCH_INSERT_SIZE:
-                                        current_total = get_email_counter()
-                                        if current_total + len(batch) > EMAIL_LIMIT:
-                                            to_insert = EMAIL_LIMIT - current_total
-                                            if to_insert > 0:
-                                                batch_to_insert = batch[:to_insert]
-                                                inserted = insert_records_into_duckdb(conn, batch_to_insert)
-                                                conn.commit()
-                                                total_records_inserted += inserted
-                                                increment_email_counter(inserted)
-                                                logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-                                            batch = []
-                                            break
-                                        else:
-                                            inserted = insert_records_into_duckdb(conn, batch)
-                                            conn.commit()
-                                            total_records_inserted += inserted
-                                            increment_email_counter(inserted)
-                                            logger.info(f"{E['ok']} Batch: {inserted:,} | Total: {get_email_counter():,}/{EMAIL_LIMIT:,}")
-                                            batch = []
+                                else:
+                                    logger.warning(f"{E['warn']} Unexpected worker result type: {type(res)}")
                             except Exception as e:
-                                logger.error(f"{E['error']} Future: {e}")
+                                logger.error(f"{E['error']} Worker raised: {e}")
+                                logger.error(traceback.format_exc())
                             finally:
                                 try:
                                     del futures[future]
                                 except Exception:
                                     pass
-                
+
+                # final batch insert per member
                 if batch and not has_reached_email_limit():
                     current_total = get_email_counter()
                     if current_total + len(batch) > EMAIL_LIMIT:
@@ -828,11 +873,18 @@ def process_tar_streaming_and_insert(tar_path: Path, origin: str, conn: duckdb.D
     except Exception as e:
         logger.error(f"{E['error']} TAR: {e}")
         logger.debug(traceback.format_exc())
-    
+
+    # Log aggregated diagnostics for this TAR
+    logger.info(
+        f"{E['debug']} Diagnostics TAR '{tar_path.name}': matched={agg_stats['matched']:,}, valid={agg_stats['valid']:,}, "
+        f"invalid_format={agg_stats['invalid_format']:,}, disposable={agg_stats['disposable']:,}, "
+        f"blocked_local={agg_stats['blocked_local']:,}, decode_errors={agg_stats['decode_errors']:,}"
+    )
+
     logger.info(f"{E['ok']} TAR COMPLETO: {total_records_inserted:,} registros\n")
     return total_records_inserted
 
-# HF
+# HF helpers (unchanged)
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
     if not token:
         raise RuntimeError("HF_TOKEN não definido")
@@ -901,7 +953,7 @@ def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path:
         logger.info(f"{E['info']} Sem DuckDB")
         return False
 
-# Phases
+# Phases (download/wait/process/dedup/export/upload) - reuse previous implementations (dedup/export unchanged)
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents")
@@ -1032,17 +1084,17 @@ def phase3_process_tars(tars: List[Tuple], state: Dict, conn: duckdb.DuckDBPyCon
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['extract']} FASE 3: Processar TARs (LIMITE: {EMAIL_LIMIT:,} emails)")
     logger.info(f"{'='*100}\n")
-    
+
     if not check_disk_space(SAVE_PATH, min_free_gb=5):
         raise RuntimeError("Disco insuficiente")
-    
+
     total_inserted = 0
     processed_tars = state.get("processed_tars", [])
     for tname, tar_path, info in tars:
         if has_reached_email_limit():
             logger.warning(f"{E['limit']} LIMITE ATINGIDO: {get_email_counter():,}/{EMAIL_LIMIT:,}")
             break
-        
+
         if stop_event.is_set():
             break
         if str(tar_path) in processed_tars:
@@ -1063,7 +1115,6 @@ def phase4_load_to_duckdb(chunks: List[Path], conn: duckdb.DuckDBPyConnection, s
     return 0
 
 def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
-    """Dedup por email usando SQL puro."""
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['db']} FASE 5: Deduplicação por email (qualidade)")
     logger.info(f"{'='*100}\n")
@@ -1071,7 +1122,6 @@ def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
         count_before = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
         logger.info(f"{E['stats']} Antes: {count_before:,}")
 
-        # Criar tabela clean com filtros
         disposable_list_sql = ", ".join([f"'{d}'" for d in DISPOSABLE_DOMAINS])
         block_locals_list_sql = ", ".join([f"'{l}'" for l in BLOCK_LOCAL_PARTS])
 
@@ -1089,7 +1139,6 @@ def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
         ;
         """)
 
-        # Filtrar
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS emails_clean2 AS
             SELECT email,
@@ -1102,7 +1151,6 @@ def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
             );
         """)
 
-        # Agregar por email
         conn.execute("DROP TABLE IF EXISTS emails_final;")
         conn.execute("""
             CREATE TABLE emails_final AS
@@ -1113,7 +1161,6 @@ def phase5_deduplicate(conn: duckdb.DuckDBPyConnection) -> int:
         """)
         conn.commit()
 
-        # Clean
         conn.execute("DROP TABLE IF EXISTS emails_clean;")
         conn.execute("DROP TABLE IF EXISTS emails_clean2;")
         conn.execute("DROP TABLE IF EXISTS emails_raw;")
@@ -1210,17 +1257,13 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
 # MAIN
 def main():
     logger.info(f"\n{'#'*100}")
-    logger.info(f"# {E['start']} MINERADOR V8 PRODUCTION - FINAL CORRIGIDO V2")
+    logger.info(f"# {E['start']} MINERADOR V8 PRODUCTION - FINAL CORRIGIDO V2 (diagnóstico)")
     logger.info(f"{'#'*100}")
-    logger.info(f"\n✅ CORREÇÕES APLICADAS V2:")
-    logger.info(f"   • FIXO: local_path_for_index() não duplica nome da pasta")
-    logger.info(f"   • file_path já contém caminho completo relativo ao torrent")
-    logger.info(f"   • Removido PRAGMA disable_verifier")
-    logger.info(f"   • Corrigido typo diffllib → difflib")
-    logger.info(f"   • Removido if False que desativava lógica")
-    logger.info(f"   • SQL robusta para DuckDB")
-    logger.info(f"   • Email + Nome: um registro por email\n")
-    
+    logger.info(f"\n✅ CORREÇÕES APLICADAS V2 + logging diagnóstico:")
+    logger.info(f"   • Evita perda por chunk boundary (overlap)")
+    logger.info(f"   • Worker retorna diagnostics e são logados agregados por TAR")
+    logger.info(f"   • Se ainda der 0 emails vamos ver matched/invalid/disposable counts\n")
+
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['cpu']} CPU: {os.cpu_count()}")
     logger.info(f"{E['space']} Disco: {disk_usage()}\n")
@@ -1258,14 +1301,14 @@ def main():
     total_emails = 0
     try:
         overall_start = time.time()
-        
+
         completed_torrents = phase1_download_torrents(session, MAGNETS)
         if not completed_torrents:
             logger.error(f"{E['error']} Nenhum torrent")
             return
         if stop_event.is_set():
             return
-        
+
         tars = phase2_wait_downloads(completed_torrents, state)
         if tars and not stop_event.is_set():
             inserted = phase3_process_tars(tars, state, conn)
@@ -1280,7 +1323,7 @@ def main():
                             phase7_upload(api, HF_TOKEN, emails_repo, checkpoint_repo, final_files, DB_PATH, state)
         else:
             logger.info(f"{E['info']} Nenhum arquivo novo")
-        
+
         total_time = time.time() - overall_start
         logger.info(f"\n{'='*100}")
         logger.info(f"{E['ok']} ✅ SUCESSO")
