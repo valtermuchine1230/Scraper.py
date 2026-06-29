@@ -47,7 +47,7 @@ except ImportError:
     print("⚠️  psutil não instalado (pip install psutil). Monitoramento desativado.")
 
 # ===== CONFIG =====
-EMAIL_LIMIT = 200_000_000
+EMAIL_LIMIT = 300_000_000
 email_counter = 0
 email_counter_lock = Lock()
 
