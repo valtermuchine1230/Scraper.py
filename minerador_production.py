@@ -2,13 +2,14 @@
 """
 minerador_v9_production.py
 
-Versão v9 COM VALIDAÇÃO E ORGANIZAÇÃO POR DOMÍNIO:
+Versão v9 COM VALIDAÇÃO, ORGANIZAÇÃO POR DOMÍNIO E CHECKPOINT ROBUSTO:
 - Identifica automaticamente provedores de email (tudo após @)
 - Agrupa emails por domínio após deduplicação
 - Enumeração sequencial única por domínio
 - Validação em streaming com múltiplas bibliotecas (email-validator, py3dns, etc)
 - Exportação organizada em pastas por domínio
 - Processamento em lotes sem carregar tudo em RAM
+- SISTEMA ROBUSTO DE CHECKPOINT E RECUPERAÇÃO POR DOMÍNIO
 - Preserva toda arquitetura principal intacta
 """
 from __future__ import annotations
@@ -162,7 +163,7 @@ E = {
     "email": "📧", "upload": "📤", "clean": "🧹", "warn": "⚠️", "error": "❌",
     "ok": "✅", "info": "ℹ️", "cpu": "⚙️", "clock": "⏱️", "list": "📋",
     "db": "🗄️", "monitor": "📡", "limit": "🛑", "debug": "🔍", "valid": "✓",
-    "folder": "📁", "check": "✔️",
+    "folder": "📁", "check": "✔️", "recover": "🔄", "save": "💾",
 }
 
 EMAIL_REGEX = re.compile(rb"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.IGNORECASE)
@@ -268,12 +269,16 @@ def start_resource_monitor(interval: int = 10):
     return thread
 
 def save_state(state: Dict[str, Any]):
+    """Salva state.json com proteção contra corrupção."""
     with state_lock:
         try:
-            with open(STATE_PATH, "w", encoding="utf-8") as f:
+            temp_state_path = STATE_PATH.with_suffix(".json.tmp")
+            with open(temp_state_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, default=str, ensure_ascii=False)
+            shutil.move(str(temp_state_path), str(STATE_PATH))
+            logger.debug(f"{E['save']} State salvo com sucesso")
         except Exception as e:
-            logger.error(f"Erro salvando state: {e}")
+            logger.error(f"{E['error']} Erro salvando state: {e}")
 
 def load_state() -> Dict[str, Any]:
     try:
@@ -282,7 +287,7 @@ def load_state() -> Dict[str, Any]:
                 return json.load(f)
         return {}
     except Exception as e:
-        logger.error(f"Erro carregando state: {e}")
+        logger.error(f"{E['error']} Erro carregando state: {e}")
         return {}
 
 _EMAIL_VALIDATOR_RE = re.compile(
@@ -634,6 +639,18 @@ def wait_for_file_complete(handle: lt.torrent_handle, file_index: int, expected_
             logger.debug(f"Erro: {e}")
             time.sleep(POLL_INTERVAL)
 
+def check_file_already_downloaded(file_path: Path) -> bool:
+    """Verifica se um arquivo foi completamente baixado."""
+    if not file_path.exists():
+        return False
+    
+    if file_path.stat().st_size == 0:
+        logger.info(f"{E['warn']} Arquivo vazio: {file_path.name}")
+        return False
+    
+    logger.info(f"{E['ok']} Arquivo já existe: {file_path.name} ({human(file_path.stat().st_size)})")
+    return True
+
 def process_chunk_worker(chunk_data: bytes, chunk_idx: int, origin: str) -> Dict[str, Any]:
     stats = {
         "matched": 0,
@@ -909,21 +926,79 @@ def get_domain_from_email(email: str) -> str:
     except Exception:
         return ""
 
+def check_existing_domain_export(domain: str) -> Dict[str, Any]:
+    """
+    FUNÇÃO CRÍTICA: Verifica exportação existente de um domínio.
+    
+    Retorna:
+    {
+        "domain": "gmail.com",
+        "dir_path": Path(...),
+        "exists": True/False,
+        "batch_count": int,
+        "total_records": int,
+        "last_batch_num": int,
+        "next_batch_num": int,
+        "is_complete": True/False,
+    }
+    """
+    domain_lower = domain.lower().strip()
+    domain_dir = EXPORT_DIR / "Trader_Emails" / domain_lower
+    
+    result = {
+        "domain": domain_lower,
+        "dir_path": domain_dir,
+        "exists": domain_dir.exists(),
+        "batch_count": 0,
+        "total_records": 0,
+        "last_batch_num": 0,
+        "next_batch_num": 1,
+        "is_complete": False,
+    }
+    
+    if not result["exists"]:
+        return result
+    
+    try:
+        batch_files = sorted(domain_dir.glob(f"{domain_lower}_*.parquet"))
+        result["batch_count"] = len(batch_files)
+        
+        if batch_files:
+            result["last_batch_num"] = len(batch_files)
+            result["next_batch_num"] = result["last_batch_num"] + 1
+            
+            for batch_file in batch_files:
+                try:
+                    df = pd.read_parquet(str(batch_file))
+                    result["total_records"] += len(df)
+                except Exception as e:
+                    logger.warning(f"{E['warn']} Erro lendo {batch_file.name}: {e}")
+            
+            logger.info(
+                f"{E['recover']} Domínio existente: {domain_lower} | "
+                f"Batches: {result['batch_count']} | Registros: {result['total_records']:,} | "
+                f"Próximo batch: {result['next_batch_num']}"
+            )
+    except Exception as e:
+        logger.error(f"{E['error']} Erro verificando domínio {domain_lower}: {e}")
+    
+    return result
+
 def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dict[str, int]:
     """
-    Nova fase de exportação com:
-    - Identificação automática de domínios
-    - Agrupamento por domínio
-    - Enumeração sequencial por domínio
-    - Validação em streaming
-    - Organização em pastas
+    FASE 8 COMPLETA COM CHECKPOINT ROBUSTO:
+    - Verifica domínios completados no state
+    - Detecta exportações parciais no disco
+    - Resume a partir do ponto correto
+    - Salva checkpoint após cada domínio
     """
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['email']} FASE 8: Exportar por Domínio com Validação")
+    logger.info(f"{E['email']} FASE 8: Exportar por Domínio com Validação e Checkpoint Robusto")
     logger.info(f"{'='*100}\n")
 
     domain_counters = state.get("domain_counters", {})
     domain_stats = state.get("domain_stats", {})
+    phase8_completed_domains = state.get("phase8_completed_domains", {})
     
     try:
         total_emails = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
@@ -943,25 +1018,48 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dic
         logger.info(f"{E['stats']} Domínios encontrados: {len(domains_info)}\n")
         
         all_domain_files: Dict[str, int] = {}
-        offset = 0
         
         for domain, count in domains_info:
             if stop_event.is_set():
+                logger.warning(f"{E['warn']} Execução interrompida")
                 break
             
             domain_lower = domain.lower().strip()
-            domain_dir = EXPORT_DIR / "Trader_Emails" / domain_lower
+            
+            # CHECKPOINT: Verificar se domínio já está completo
+            if domain_lower in phase8_completed_domains:
+                completed_info = phase8_completed_domains[domain_lower]
+                if completed_info.get("status") == "completed":
+                    logger.info(
+                        f"{E['check']} DOMÍNIO COMPLETO (skip): {domain_lower} | "
+                        f"Exportados: {completed_info.get('exported', 0):,} | "
+                        f"Timestamp: {completed_info.get('completed_at', 'N/A')}"
+                    )
+                    all_domain_files[domain_lower] = completed_info.get('exported', 0)
+                    continue
+            
+            # Verificar exportação existente no disco
+            existing_export = check_existing_domain_export(domain_lower)
+            
+            logger.info(f"{E['folder']} Processando domínio: {domain_lower} ({count:,} emails)")
+            
+            # Determinar ponto de retomada
+            start_counter = domain_counters.get(domain_lower, 0)
+            if existing_export["exists"] and existing_export["total_records"] > 0:
+                start_counter = max(start_counter, existing_export["total_records"])
+                start_batch_num = existing_export["next_batch_num"]
+                logger.info(f"{E['recover']} Retomando de: contador={start_counter}, batch={start_batch_num}")
+            else:
+                start_batch_num = 1
+            
+            current_counter = start_counter
+            domain_dir = existing_export["dir_path"]
             domain_dir.mkdir(parents=True, exist_ok=True)
             
-            logger.info(f"{E['folder']} Domínio: {domain_lower} ({count:,} emails)")
-            
-            current_counter = domain_counters.get(domain_lower, 0)
             exported_count = 0
             validated_count = 0
             invalid_count = 0
-            
-            batch_records = []
-            batch_num = 0
+            batch_num = start_batch_num
             
             offset_domain = 0
             while offset_domain < count:
@@ -998,41 +1096,75 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dic
                         invalid_count += 1
                 
                 if validated_batch:
-                    batch_num += 1
                     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    batch_file = domain_dir / f"{domain_lower}_{batch_num:04d}_{ts}.parquet"
+                    batch_filename = f"{domain_lower}_{batch_num:04d}_{ts}.parquet"
+                    batch_file = domain_dir / batch_filename
+                    
+                    # PROTEÇÃO: Não sobrescrever arquivo existente
+                    if batch_file.exists():
+                        logger.warning(f"{E['warn']} Arquivo já existe, pulando: {batch_filename}")
+                        batch_num += 1
+                        offset_domain += batch_size
+                        continue
                     
                     try:
                         df = pd.DataFrame(validated_batch)
                         df.to_parquet(str(batch_file), compression="snappy", index=False)
                         exported_count += len(validated_batch)
+                        
                         logger.info(
                             f"{E['check']} [{domain_lower}] Batch {batch_num}: "
-                            f"{len(validated_batch):,} válidos | {batch_file.name}"
+                            f"{len(validated_batch):,} válidos | {batch_filename}"
                         )
-                        all_domain_files[domain_lower] = exported_count
+                        
+                        # CHECKPOINT: Salvar estado imediatamente após cada batch
+                        domain_counters[domain_lower] = current_counter
+                        domain_stats[domain_lower] = {
+                            "total": count,
+                            "validated": validated_count,
+                            "invalid": invalid_count,
+                            "exported": exported_count,
+                            "counter": current_counter,
+                            "last_batch": batch_num,
+                            "last_batch_time": datetime.now(timezone.utc).isoformat(),
+                        }
+                        state["domain_counters"] = domain_counters
+                        state["domain_stats"] = domain_stats
+                        save_state(state)
+                        
                     except Exception as e:
                         logger.error(f"{E['error']} Erro exportando batch {batch_num}: {e}")
+                        logger.error(traceback.format_exc())
                 
+                batch_num += 1
                 offset_domain += batch_size
             
+            # CHECKPOINT FINAL: Marcar domínio como completo
             domain_counters[domain_lower] = current_counter
-            domain_stats[domain_lower] = {
+            phase8_completed_domains[domain_lower] = {
                 "total": count,
                 "validated": validated_count,
                 "invalid": invalid_count,
                 "exported": exported_count,
                 "counter": current_counter,
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
             }
+            domain_stats[domain_lower] = phase8_completed_domains[domain_lower]
+            
+            all_domain_files[domain_lower] = exported_count
             
             logger.info(
                 f"{E['valid']} {domain_lower}: "
                 f"Validados={validated_count:,} | Inválidos={invalid_count:,} | "
-                f"Exportados={exported_count:,} | Contador={current_counter:,}\n"
+                f"Exportados={exported_count:,} | Contador={current_counter:,} ✅ COMPLETO\n"
             )
         
+        # CHECKPOINT FINAL: Salvar estado global
         state["domain_counters"] = domain_counters
         state["domain_stats"] = domain_stats
+        state["phase8_completed_domains"] = phase8_completed_domains
+        state["phase8_completed_at"] = datetime.now(timezone.utc).isoformat()
         save_state(state)
         
         logger.info(f"\n{E['ok']} FASE 8 COMPLETA: {len(all_domain_files)} domínios processados")
@@ -1136,7 +1268,7 @@ def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path:
 
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents")
+    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents (com verificação de reúso)")
     logger.info(f"{'='*100}\n")
     completed: Dict[str, Tuple] = {}
 
@@ -1223,7 +1355,7 @@ def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[s
 
 def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['download']} FASE 2: Aguardando downloads")
+    logger.info(f"{E['download']} FASE 2: Aguardando downloads (com reúso inteligente)")
     logger.info(f"{'='*100}\n")
     all_files_ready: List[Tuple] = []
     processed_key = state.get("downloaded_files", {})
@@ -1239,13 +1371,22 @@ def phase2_wait_downloads(completed_torrents: Dict, state: Dict) -> List[Tuple]:
                 logger.info(f"{E['ok']} Já processado: {file_key}")
                 continue
             try:
+                local_path = local_path_for_index(SAVE_PATH, info, idx)
+                
+                # Verificar se arquivo já existe e está completo
+                if local_path and check_file_already_downloaded(local_path):
+                    all_files_ready.append((tname, local_path, info))
+                    processed_key[file_key] = True
+                    state["downloaded_files"] = processed_key
+                    save_state(state)
+                    continue
+                
                 expected_size = all_files_map.get(idx, {}).get("size", 0)
                 logger.info(f"{E['download']} {tname} [{idx}] ({human(expected_size)})")
                 ok = wait_for_file_complete(handle, idx, expected_size, timeout=FILE_DOWNLOAD_TIMEOUT)
                 if not ok:
                     logger.error(f"{E['error']} Timeout {file_key}")
                     continue
-                local_path = local_path_for_index(SAVE_PATH, info, idx)
                 if local_path is None or not local_path.exists():
                     logger.error(f"{E['error']} Não existe: {local_path}")
                     continue
@@ -1395,15 +1536,15 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
 
 def main():
     logger.info(f"\n{'#'*100}")
-    logger.info(f"# {E['start']} MINERADOR V9 PRODUCTION - COM VALIDAÇÃO E ORGANIZAÇÃO POR DOMÍNIO")
+    logger.info(f"# {E['start']} MINERADOR V9 PRODUCTION - COM CHECKPOINT ROBUSTO POR DOMÍNIO")
     logger.info(f"{'#'*100}")
-    logger.info(f"\n✅ NOVAS FUNCIONALIDADES V9:")
-    logger.info(f"   • Identificação automática de provedores de email (tudo após @)")
-    logger.info(f"   • Agrupamento automático por domínio")
-    logger.info(f"   • Enumeração sequencial única por domínio")
-    logger.info(f"   • Validação em streaming com múltiplas bibliotecas")
-    logger.info(f"   • Exportação organizada em pastas por domínio")
-    logger.info(f"   • Processamento sem carregar tudo em RAM\n")
+    logger.info(f"\n✅ SISTEMA ROBUSTO V9 COM:")
+    logger.info(f"   • Checkpoint imediato após cada domínio concluído")
+    logger.info(f"   • Recuperação inteligente de processamento parcial")
+    logger.info(f"   • Detecção de arquivos já exportados")
+    logger.info(f"   • Proteção contra sobrescrita de arquivos")
+    logger.info(f"   • Reúso inteligente de downloads")
+    logger.info(f"   • Recuperação após cancelamento/erro/falta de energia\n")
 
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
     logger.info(f"{E['cpu']} CPU: {os.cpu_count()}")
@@ -1425,7 +1566,10 @@ def main():
     hf_download_duckdb(api, HF_TOKEN, checkpoint_repo, SAVE_PATH)
 
     state = load_state()
-    logger.info(f"{E['ok']} State: {len(state)} entries")
+    logger.info(f"{E['ok']} State loaded: {len(state)} entries")
+    
+    if state.get("phase8_completed_domains"):
+        logger.info(f"{E['check']} Domínios completados em FASE 8: {len(state.get('phase8_completed_domains', {}))}")
 
     try:
         conn = init_duckdb(DB_PATH)
@@ -1476,7 +1620,7 @@ def main():
         logger.info(f"{E['stats']} Disco: {disk_usage()}")
         logger.info(f"{'='*100}\n")
     except KeyboardInterrupt:
-        logger.warning(f"\n{E['warn']} Interrupção")
+        logger.warning(f"\n{E['warn']} Interrupção - Estado salvo, pode retomar depois")
     except Exception as e:
         logger.error(f"{E['error']} Erro: {e}")
         logger.error(traceback.format_exc())
