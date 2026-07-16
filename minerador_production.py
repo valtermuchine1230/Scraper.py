@@ -2,15 +2,15 @@
 """
 minerador_v9_production.py
 
-Versão v9 COM VALIDAÇÃO, ORGANIZAÇÃO POR DOMÍNIO E CHECKPOINT ROBUSTO:
-- Identifica automaticamente provedores de email (tudo após @)
-- Agrupa emails por domínio após deduplicação
-- Enumeração sequencial única por domínio
-- Validação em streaming com múltiplas bibliotecas (email-validator, py3dns, etc)
-- Exportação organizada em pastas por domínio
-- Processamento em lotes sem carregar tudo em RAM
-- SISTEMA ROBUSTO DE CHECKPOINT E RECUPERAÇÃO POR DOMÍNIO
-- Preserva toda arquitetura principal intacta
+Versão v9 COM CHECKPOINT ROBUSTO + GESTÃO INTELIGENTE DE DISCO:
+- Checkpoint imediato após cada domínio concluído
+- Recuperação inteligente de processamento parcial
+- Detecção de arquivos já exportados
+- Proteção contra sobrescrita de arquivos
+- Reúso inteligente de downloads
+- Validação+Exportação+Limpeza automática
+- Gestão proativa de espaço em disco
+- Deleção de ficheiros temporários/desnecessários
 """
 from __future__ import annotations
 
@@ -70,6 +70,7 @@ email_counter_lock = Lock()
 VALIDATION_BATCH_SIZE = 10000
 EXPORT_BATCH_SIZE = 100000
 MAX_VALIDATION_WORKERS = 4
+MIN_FREE_DISK_GB = 10  # Mínimo de espaço livre desejado
 
 def increment_email_counter(count: int) -> int:
     global email_counter
@@ -163,7 +164,8 @@ E = {
     "email": "📧", "upload": "📤", "clean": "🧹", "warn": "⚠️", "error": "❌",
     "ok": "✅", "info": "ℹ️", "cpu": "⚙️", "clock": "⏱️", "list": "📋",
     "db": "🗄️", "monitor": "📡", "limit": "🛑", "debug": "🔍", "valid": "✓",
-    "folder": "📁", "check": "✔️", "recover": "🔄", "save": "💾",
+    "folder": "📁", "check": "✔️", "recover": "🔄", "save": "💾", "trash": "🗑️",
+    "optim": "⚡",
 }
 
 EMAIL_REGEX = re.compile(rb"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.IGNORECASE)
@@ -227,6 +229,14 @@ def disk_usage(path: Path = SAVE_PATH) -> Dict[str, str]:
     except Exception as e:
         return {"error": str(e)}
 
+def get_free_disk_gb(path: Path = SAVE_PATH) -> float:
+    """Retorna espaço livre em GB."""
+    try:
+        du = shutil.disk_usage(str(path))
+        return du.free / (1024**3)
+    except Exception:
+        return 0.0
+
 def check_disk_space(path: Path, min_free_gb: int = 5) -> bool:
     try:
         du = shutil.disk_usage(str(path))
@@ -239,6 +249,63 @@ def check_disk_space(path: Path, min_free_gb: int = 5) -> bool:
     except Exception as e:
         logger.error(f"{E['error']} Erro disco: {e}")
         return False
+
+def cleanup_temp_files():
+    """Remove ficheiros temporários e desnecessários."""
+    logger.info(f"\n{E['optim']} Iniciando limpeza de ficheiros temporários...")
+    
+    cleaned_size = 0
+    cleaned_count = 0
+    
+    try:
+        # Limpar TEMP_DIR
+        if TEMP_DIR.exists():
+            for temp_file in TEMP_DIR.glob("*"):
+                try:
+                    if temp_file.is_file():
+                        size = temp_file.stat().st_size
+                        temp_file.unlink()
+                        cleaned_size += size
+                        cleaned_count += 1
+                    elif temp_file.is_dir():
+                        shutil.rmtree(temp_file)
+                        cleaned_count += 1
+                except Exception as e:
+                    logger.warning(f"{E['warn']} Erro removendo {temp_file}: {e}")
+        
+        # Limpar RAW_CHUNKS_DIR
+        if RAW_CHUNKS_DIR.exists():
+            for chunk_file in RAW_CHUNKS_DIR.glob("*"):
+                try:
+                    if chunk_file.is_file():
+                        size = chunk_file.stat().st_size
+                        chunk_file.unlink()
+                        cleaned_size += size
+                        cleaned_count += 1
+                except Exception as e:
+                    logger.warning(f"{E['warn']} Erro removendo {chunk_file}: {e}")
+        
+        logger.info(f"{E['ok']} Limpeza concluída: {cleaned_count} ficheiros | {human(cleaned_size)} liberados")
+        return cleaned_size
+    except Exception as e:
+        logger.error(f"{E['error']} Erro na limpeza: {e}")
+        return 0
+
+def ensure_minimum_disk_space(min_free_gb: int = MIN_FREE_DISK_GB):
+    """Garante espaço mínimo em disco, limpando ficheiros temporários se necessário."""
+    free_gb = get_free_disk_gb()
+    logger.info(f"{E['space']} Espaço livre: {free_gb:.1f}GB | Mínimo requerido: {min_free_gb}GB")
+    
+    if free_gb < min_free_gb:
+        logger.warning(f"{E['warn']} Espaço baixo! Iniciando limpeza urgente...")
+        cleanup_temp_files()
+        
+        free_gb = get_free_disk_gb()
+        if free_gb < min_free_gb:
+            logger.error(f"{E['error']} AINDA INSUFICIENTE: {free_gb:.1f}GB")
+            raise RuntimeError(f"Espaço insuficiente em disco: {free_gb:.1f}GB < {min_free_gb}GB")
+    
+    return free_gb
 
 def start_resource_monitor(interval: int = 10):
     if not HAS_PSUTIL:
@@ -258,6 +325,11 @@ def start_resource_monitor(interval: int = 10):
                     f"{E['monitor']} RAM: {mem.percent:.1f}% ({human(mem.used)}/{human(mem.total)}) | "
                     f"CPU: {cpu:.1f}% | Disco: {disk_free_gb:.1f}GB | Emails: {current_emails:,}/{EMAIL_LIMIT:,}"
                 )
+                
+                # Alerta se espaço baixo
+                if disk_free_gb < MIN_FREE_DISK_GB:
+                    logger.warning(f"{E['warn']} ALERTA: Espaço baixo! {disk_free_gb:.1f}GB")
+                
                 time.sleep(interval)
             except Exception as e:
                 logger.debug(f"Monitor erro: {e}")
@@ -986,15 +1058,23 @@ def check_existing_domain_export(domain: str) -> Dict[str, Any]:
 
 def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dict[str, int]:
     """
-    FASE 8 COMPLETA COM CHECKPOINT ROBUSTO:
+    FASE 8 COMPLETA COM CHECKPOINT ROBUSTO E GESTÃO DE DISCO:
     - Verifica domínios completados no state
     - Detecta exportações parciais no disco
     - Resume a partir do ponto correto
-    - Salva checkpoint após cada domínio
+    - Valida + Exporta + Limpa automaticamente
+    - Garante espaço mínimo em disco
     """
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['email']} FASE 8: Exportar por Domínio com Validação e Checkpoint Robusto")
+    logger.info(f"{E['email']} FASE 8: Exportar por Domínio com Validação, Checkpoint e Gestão de Disco")
     logger.info(f"{'='*100}\n")
+
+    # Garantir espaço mínimo
+    try:
+        ensure_minimum_disk_space(MIN_FREE_DISK_GB)
+    except RuntimeError as e:
+        logger.error(f"{E['error']} {e}")
+        raise
 
     domain_counters = state.get("domain_counters", {})
     domain_stats = state.get("domain_stats", {})
@@ -1023,6 +1103,19 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dic
             if stop_event.is_set():
                 logger.warning(f"{E['warn']} Execução interrompida")
                 break
+            
+            # Verificar espaço em disco antes de processar domínio
+            try:
+                free_gb = ensure_minimum_disk_space(MIN_FREE_DISK_GB)
+                logger.info(f"{E['space']} Espaço disponível: {free_gb:.1f}GB")
+            except RuntimeError:
+                logger.warning(f"{E['warn']} Espaço insuficiente, tentando limpar...")
+                cleanup_temp_files()
+                try:
+                    ensure_minimum_disk_space(MIN_FREE_DISK_GB)
+                except RuntimeError:
+                    logger.error(f"{E['error']} Impossível obter espaço mínimo")
+                    raise
             
             domain_lower = domain.lower().strip()
             
@@ -1160,6 +1253,11 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dic
                 f"Exportados={exported_count:,} | Contador={current_counter:,} ✅ COMPLETO\n"
             )
         
+        # LIMPEZA AUTOMÁTICA: Remover ficheiros desnecessários após exportação completa
+        logger.info(f"\n{E['optim']} Iniciando limpeza automática pós-exportação...")
+        cleanup_size = cleanup_temp_files()
+        logger.info(f"{E['ok']} Limpeza concluída: {human(cleanup_size)} liberados")
+        
         # CHECKPOINT FINAL: Salvar estado global
         state["domain_counters"] = domain_counters
         state["domain_stats"] = domain_stats
@@ -1168,7 +1266,8 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dic
         save_state(state)
         
         logger.info(f"\n{E['ok']} FASE 8 COMPLETA: {len(all_domain_files)} domínios processados")
-        logger.info(f"{E['email']} Total exportado: {sum(all_domain_files.values()):,} emails\n")
+        logger.info(f"{E['email']} Total exportado: {sum(all_domain_files.values()):,} emails")
+        logger.info(f"{E['space']} Espaço final: {get_free_disk_gb():.1f}GB livre\n")
         
         return all_domain_files
     
@@ -1536,7 +1635,7 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
 
 def main():
     logger.info(f"\n{'#'*100}")
-    logger.info(f"# {E['start']} MINERADOR V9 PRODUCTION - COM CHECKPOINT ROBUSTO POR DOMÍNIO")
+    logger.info(f"# {E['start']} MINERADOR V9 PRODUCTION - COM GESTÃO INTELIGENTE DE DISCO")
     logger.info(f"{'#'*100}")
     logger.info(f"\n✅ SISTEMA ROBUSTO V9 COM:")
     logger.info(f"   • Checkpoint imediato após cada domínio concluído")
@@ -1544,6 +1643,9 @@ def main():
     logger.info(f"   • Detecção de arquivos já exportados")
     logger.info(f"   • Proteção contra sobrescrita de arquivos")
     logger.info(f"   • Reúso inteligente de downloads")
+    logger.info(f"   • Validação + Exportação + Limpeza automática")
+    logger.info(f"   • Gestão proativa de espaço em disco")
+    logger.info(f"   • Deleção automática de ficheiros temporários")
     logger.info(f"   • Recuperação após cancelamento/erro/falta de energia\n")
 
     logger.info(f"{E['info']} SAVE_PATH: {SAVE_PATH}")
