@@ -1154,104 +1154,171 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dic
             invalid_count = 0
             batch_num = start_batch_num
             
-            offset_domain = 0
-            while offset_domain < count:
-                if stop_event.is_set():
-                    break
-                
-                batch_size = min(EXPORT_BATCH_SIZE, count - offset_domain)
-                
-                emails_batch = conn.execute(
-                    f"""
-                    SELECT email, nome
-                    FROM emails_raw
-                    WHERE LOWER(SUBSTR(email, POSITION('@' IN email) + 1)) = '{domain_lower}'
-                    LIMIT {batch_size} OFFSET {offset_domain};
-                    """
-                ).fetchall()
-                
-                if not emails_batch:
-                    offset_domain += batch_size
-                    continue
-                
-                validated_batch = []
-                for email, nome in emails_batch:
-                    if validate_email_with_libraries(email):
-                        validated_count += 1
-                        current_counter += 1
-                        validated_batch.append({
-                            "id": current_counter,
-                            "email": email,
-                            "nome": nome or "",
-                            "domain": domain_lower,
-                        })
-                    else:
-                        invalid_count += 1
-                
-                if validated_batch:
-                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    batch_filename = f"{domain_lower}_{batch_num:04d}_{ts}.parquet"
-                    batch_file = domain_dir / batch_filename
-                    
-                    # PROTEÇÃO: Não sobrescrever arquivo existente
-                    if batch_file.exists():
-                        logger.warning(f"{E['warn']} Arquivo já existe, pulando: {batch_filename}")
-                        batch_num += 1
-                        offset_domain += batch_size
-                        continue
-                    
-                    try:
-                        df = pd.DataFrame(validated_batch)
-                        df.to_parquet(str(batch_file), compression="snappy", index=False)
-                        exported_count += len(validated_batch)
-                        
-                        logger.info(
-                            f"{E['check']} [{domain_lower}] Batch {batch_num}: "
-                            f"{len(validated_batch):,} válidos | {batch_filename}"
-                        )
-                        
-                        # CHECKPOINT: Salvar estado imediatamente após cada batch
-                        domain_counters[domain_lower] = current_counter
-                        domain_stats[domain_lower] = {
-                            "total": count,
-                            "validated": validated_count,
-                            "invalid": invalid_count,
-                            "exported": exported_count,
-                            "counter": current_counter,
-                            "last_batch": batch_num,
-                            "last_batch_time": datetime.now(timezone.utc).isoformat(),
-                        }
-                        state["domain_counters"] = domain_counters
-                        state["domain_stats"] = domain_stats
-                        save_state(state)
-                        
-                    except Exception as e:
-                        logger.error(f"{E['error']} Erro exportando batch {batch_num}: {e}")
-                        logger.error(traceback.format_exc())
-                
-                batch_num += 1
-                offset_domain += batch_size
-            
-            # CHECKPOINT FINAL: Marcar domínio como completo
-            domain_counters[domain_lower] = current_counter
-            phase8_completed_domains[domain_lower] = {
-                "total": count,
-                "validated": validated_count,
-                "invalid": invalid_count,
-                "exported": exported_count,
-                "counter": current_counter,
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            }
-            domain_stats[domain_lower] = phase8_completed_domains[domain_lower]
-            
-            all_domain_files[domain_lower] = exported_count
+            # ===== CHECKPOINT ROBUSTO - LÓGICA CORRIGIDA =====
+# Carregar progresso do state.json (fonte oficial)
+domain_progress = state.get("domain_progress", {})
+domain_lower = domain_lower.lower().strip()
+
+# Determinar ponto de retomada a partir do state.json
+if domain_lower in phase8_completed_domains and phase8_completed_domains[domain_lower].get("status") == "completed":
+    # Domínio já completo - não reprocessar
+    logger.info(
+        f"{E['check']} DOMÍNIO COMPLETO (skip): {domain_lower} | "
+        f"Exportados: {phase8_completed_domains[domain_lower].get('exported', 0):,}"
+    )
+    all_domain_files[domain_lower] = phase8_completed_domains[domain_lower].get('exported', 0)
+    continue
+
+# Recuperar checkpoint do domínio (se existir)
+domain_ckpt = domain_progress.get(domain_lower, {})
+offset_domain = domain_ckpt.get("offset", 0)  # ✅ Usar o offset do state, não 0!
+batch_num = domain_ckpt.get("next_batch", 1)
+current_counter = domain_ckpt.get("counter", start_counter)
+exported_count = domain_ckpt.get("exported", 0)
+validated_count = domain_ckpt.get("validated", 0)
+invalid_count = domain_ckpt.get("invalid", 0)
+
+if offset_domain > 0:
+    logger.info(
+        f"{E['recover']} Retomando {domain_lower}: "
+        f"offset={offset_domain}, batch={batch_num}, exportados={exported_count:,}"
+    )
+
+domain_dir = existing_export["dir_path"]
+domain_dir.mkdir(parents=True, exist_ok=True)
+
+# ===== LOOP PRINCIPAL DE BATCHES =====
+while offset_domain < count:
+    if stop_event.is_set():
+        break
+    
+    if has_reached_email_limit():
+        logger.warning(f"{E['limit']} LIMITE ATINGIDO")
+        break
+    
+    batch_size = min(EXPORT_BATCH_SIZE, count - offset_domain)
+    
+    # Buscar emails com o OFFSET correto do checkpoint
+    emails_batch = conn.execute(
+        f"""
+        SELECT email, nome
+        FROM emails_raw
+        WHERE LOWER(SUBSTR(email, POSITION('@' IN email) + 1)) = '{domain_lower}'
+        LIMIT {batch_size} OFFSET {offset_domain};
+        """
+    ).fetchall()
+    
+    if not emails_batch:
+        offset_domain += batch_size
+        continue
+    
+    # Validar e preparar batch
+    validated_batch = []
+    for email, nome in emails_batch:
+        if validate_email_with_libraries(email):
+            validated_count += 1
+            current_counter += 1
+            validated_batch.append({
+                "id": current_counter,
+                "email": email,
+                "nome": nome or "",
+                "domain": domain_lower,
+            })
+        else:
+            invalid_count += 1
+    
+    if validated_batch:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        batch_filename = f"{domain_lower}_{batch_num:04d}_{ts}.parquet"
+        batch_file = domain_dir / batch_filename
+        
+        # Proteção: não sobrescrever
+        if batch_file.exists():
+            logger.warning(f"{E['warn']} Batch já existe: {batch_filename} (pulando)")
+            batch_num += 1
+            offset_domain += batch_size
+            continue
+        
+        try:
+            # Exportar batch para parquet
+            df = pd.DataFrame(validated_batch)
+            df.to_parquet(str(batch_file), compression="snappy", index=False)
+            exported_count += len(validated_batch)
             
             logger.info(
-                f"{E['valid']} {domain_lower}: "
-                f"Validados={validated_count:,} | Inválidos={invalid_count:,} | "
-                f"Exportados={exported_count:,} | Contador={current_counter:,} ✅ COMPLETO\n"
+                f"{E['check']} [{domain_lower}] Batch {batch_num}: "
+                f"{len(validated_batch):,} válidos | {batch_filename}"
             )
+            
+            # ✅ CHECKPOINT CRÍTICO: Salvar estado IMEDIATAMENTE após cada batch
+            # Isto garante que mesmo com morte do processo, o progresso está salvo
+            domain_progress[domain_lower] = {
+                "offset": offset_domain + batch_size,  # Próximo offset a processar
+                "next_batch": batch_num + 1,
+                "counter": current_counter,
+                "exported": exported_count,
+                "validated": validated_count,
+                "invalid": invalid_count,
+                "status": "in_progress",
+                "last_batch_timestamp": ts,
+                "domain_total": count,
+            }
+            state["domain_progress"] = domain_progress
+            state["domain_stats"][domain_lower] = domain_progress[domain_lower]
+            
+            # Salvar com garantia de sincronização
+            save_state(state)
+            logger.debug(f"{E['save']} State checkpoint salvo: {domain_lower} batch {batch_num}")
+            
+        except Exception as e:
+            logger.error(f"{E['error']} Erro exportando batch {batch_num}: {e}")
+            logger.error(traceback.format_exc())
+            # Não incrementar offset em caso de erro - permitir retry
+            batch_num += 1
+            continue
+    
+    # Avançar para próximo batch
+    batch_num += 1
+    offset_domain += batch_size
+
+# ===== FINAL DO DOMÍNIO: Marcar como COMPLETO =====
+if offset_domain >= count and not stop_event.is_set():
+    # Domínio terminado com sucesso
+    phase8_completed_domains[domain_lower] = {
+        "total": count,
+        "validated": validated_count,
+        "invalid": invalid_count,
+        "exported": exported_count,
+        "counter": current_counter,
+        "status": "completed",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    domain_progress[domain_lower] = phase8_completed_domains[domain_lower]
+    domain_stats[domain_lower] = phase8_completed_domains[domain_lower]
+    
+    all_domain_files[domain_lower] = exported_count
+    
+    # ✅ CHECKPOINT FINAL: Marcar domínio como completo
+    state["domain_progress"] = domain_progress
+    state["domain_stats"] = domain_stats
+    state["phase8_completed_domains"] = phase8_completed_domains
+    save_state(state)
+    
+    logger.info(
+        f"{E['valid']} {domain_lower}: "
+        f"Validados={validated_count:,} | Inválidos={invalid_count:,} | "
+        f"Exportados={exported_count:,} ✅ COMPLETO\n"
+    )
+else:
+    # Domínio interrompido - salvar estado para retomada
+    if offset_domain < count:
+        logger.warning(
+            f"{E['warn']} {domain_lower} INTERROMPIDO: "
+            f"processados={offset_domain}/{count} | próximo batch={batch_num}"
+        )
+        # O state já foi salvo no loop, portanto pode retomar daqui
+    
+    all_domain_files[domain_lower] = exported_count
         
         # LIMPEZA AUTOMÁTICA: Remover ficheiros desnecessários após exportação completa
         logger.info(f"\n{E['optim']} Iniciando limpeza automática pós-exportação...")
