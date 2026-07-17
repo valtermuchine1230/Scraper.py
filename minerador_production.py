@@ -71,7 +71,7 @@ VALIDATION_BATCH_SIZE = 10000
 EXPORT_BATCH_SIZE = 100000
 MAX_VALIDATION_WORKERS = 4
 MIN_FREE_DISK_GB = 10  # Mínimo de espaço livre desejado
-
+BATCH_SIZE = 1000
 def increment_email_counter(count: int) -> int:
     global email_counter
     with email_counter_lock:
