@@ -1771,7 +1771,7 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
 
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
     # (duplicate of earlier function name kept intentionally; resolver will use the first)
-    return phase1_download_torrents(session, magnets)
+    return completed
 
 def main():
     logger.info(f"\n{'#'*100}")
