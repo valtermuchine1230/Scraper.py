@@ -1770,8 +1770,115 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
     return all_domain_files
 
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
-    # (duplicate of earlier function name kept intentionally; resolver will use the first)
-    return completed
+    """FASE 1: Download torrents com thread pool."""
+    logger.info(f"\n{'='*100}")
+    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents")
+    logger.info(f"{'='*100}\n")
+    
+    completed: Dict[str, Tuple] = {}  # ✅ INICIALIZA AQUI
+    
+    def download_single(item):
+        """Download um torrent individual."""
+        name = item["name"]
+        magnet = item["magnet"]
+        targets = item.get("targets", [])
+        
+        try:
+            logger.info(f"{E['download']} {name}")
+            
+            # Parse magnet e cria torrent
+            params = lt.parse_magnet_uri(magnet)
+            params.save_path = str(SAVE_PATH)
+            handle = session.add_torrent(params)
+            
+            # Aguarda metadata
+            metadata_wait = 0
+            max_wait = 600
+            
+            while metadata_wait < max_wait and not stop_event.is_set():
+                has_metadata = False
+                try:
+                    has_metadata = handle.has_metadata()
+                except Exception:
+                    try:
+                        _ = handle.torrent_info()
+                        has_metadata = True
+                    except Exception:
+                        has_metadata = False
+                
+                if has_metadata:
+                    break
+                
+                metadata_wait += 1
+                if metadata_wait % 30 == 0:
+                    logger.debug(f"Metadata {name}... ({metadata_wait}s)")
+                
+                time.sleep(1)
+            
+            if metadata_wait >= max_wait:
+                logger.error(f"{E['error']} Timeout metadata: {name}")
+                return None
+            
+            if stop_event.is_set():
+                raise KeyboardInterrupt()
+            
+            # Obter info do torrent
+            info = None
+            try:
+                info = handle.torrent_info()
+            except Exception:
+                try:
+                    info = handle.get_torrent_info()
+                except Exception as e:
+                    logger.error(f"{E['error']} torrent_info: {e}")
+                    return None
+            
+            # Encontrar targets
+            found, all_files = find_targets_exact(info, targets)
+            if not found:
+                logger.error(f"{E['error']} Nenhum target: {name}")
+                return None
+            
+            # Definir prioridades
+            try:
+                nfiles = getattr(info, "num_files", lambda: None)()
+                if nfiles is None:
+                    try:
+                        nfiles = len(info.files())
+                    except Exception:
+                        nfiles = max(all_files.keys()) + 1
+            except Exception:
+                nfiles = max(all_files.keys()) + 1
+            
+            for i in range(nfiles):
+                try:
+                    priority = 7 if i in found else 0
+                    handle.file_priority(i, priority)
+                except Exception:
+                    pass
+            
+            logger.info(f"{E['ok']} {name} pronto | {len(found)} arquivos")
+            return (name, (handle, info, found, all_files))
+            
+        except Exception as e:
+            logger.error(f"{E['error']} {name}: {e}")
+            return None
+    
+    # Thread pool executor
+    with ThreadPoolExecutor(max_workers=min(len(magnets), 5)) as executor:
+        futures = [executor.submit(download_single, item) for item in magnets]
+        
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    name, data = result
+                    completed[name] = data  # ✅ Adiciona ao dicionário
+            except Exception as e:
+                logger.error(f"{E['error']} Future: {e}")
+    
+    logger.info(f"\n{E['ok']} FASE 1: {len(completed)}/{len(magnets)} OK\n")
+    return completed  # ✅ Retorna aqui (variável existe!)
 
 def main():
     logger.info(f"\n{'#'*100}")
