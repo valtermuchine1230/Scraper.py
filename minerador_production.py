@@ -1056,161 +1056,108 @@ def check_existing_domain_export(domain: str) -> Dict[str, Any]:
     
     return result
 
-def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict) -> Dict[str, List[Path]]:
+# ---------------------------------------------------------------------
+# Novas funções helper para checkpoint por domínio e upload parquet
+# ---------------------------------------------------------------------
+def load_domain_checkpoint_from_hf(api: HfApi, token: str, checkpoint_repo: str, domain: str) -> Dict[str, Any]:
+    """Carrega checkpoint de um domínio do HF.
+    
+    Tenta fazer o download do ficheiro checkpoints/{domain}_checkpoint.json para SAVE_PATH.
+    Se não existir, retorna um checkpoint inicial.
     """
-    FASE 8: Exportar por Domínio com Checkpoint Robusto
-    ✅ VERSÃO CORRIGIDA - Stop event por domínio (não global)
+    try:
+        checkpoint_file = SAVE_PATH / f"{domain}_checkpoint.json"
+        # Faz o download para SAVE_PATH (arquivo local será SAVE_PATH/{domain}_checkpoint.json)
+        api.hf_hub_download(
+            repo_id=checkpoint_repo,
+            filename=f"checkpoints/{domain}_checkpoint.json",
+            local_dir=str(SAVE_PATH),
+            token=token,
+            repo_type="dataset"
+        )
+        if checkpoint_file.exists():
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        # Sem checkpoint no HF ou erro: retornamos estado inicial
+        pass
+    return {
+        "domain": domain,
+        "last_batch_num": 0,
+        "total_processed": 0,
+        "total_exported": 0,
+        "total_invalid": 0,
+        "last_exported_timestamp": None,
+        "status": "init"
+    }
+
+# alias para compatibilidade com nomes curtos
+def load_domain_checkpoint(api: HfApi, token: str, checkpoint_repo: str, domain: str) -> Dict[str, Any]:
+    """Alias para load_domain_checkpoint_from_hf."""
+    return load_domain_checkpoint_from_hf(api, token, checkpoint_repo, domain)
+
+def save_domain_checkpoint_local(domain: str, checkpoint: Dict[str, Any]):
+    """Salva checkpoint de domínio localmente."""
+    checkpoint_dir = SAVE_PATH / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = checkpoint_dir / f"{domain}_checkpoint.json"
+    with open(checkpoint_file, "w", encoding="utf-8") as f:
+        json.dump(checkpoint, f, indent=2, default=str, ensure_ascii=False)
+    logger.info(f"{E['save']} Checkpoint salvo: {domain}")
+
+def hf_upload_parquet(api: HfApi, token: str, repo_id: str, local_path: Path, domain: str, batch_num: int) -> bool:
+    """Upload de ficheiro parquet para HF.
+    
+    path_in_repo: Trader_Emails/{domain}/batch_{batch_num}.parquet
     """
-    logger.info(f"\n{'='*100}")
-    logger.info(f"{E['email']} FASE 8: Exportar por Domínio com Checkpoint")
-    logger.info(f"{'='*100}\n")
+    if not local_path.exists():
+        logger.warning(f"{E['warn']} Parquet não existe: {local_path}")
+        return False
     
+    repo_path = f"Trader_Emails/{domain}/batch_{batch_num}.parquet"
     try:
-        ensure_minimum_disk_space(MIN_FREE_DISK_GB)
-        logger.info(f"{E['space']} Espaço livre: {disk_usage()}")
-    except RuntimeError as e:
-        logger.error(f"{E['error']} {e}")
-        return {}
-    
-    try:
-        total_emails = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
-        logger.info(f"{E['stats']} Total de emails para exportar: {total_emails:,}\n")
+        logger.info(f"{E['upload']} {repo_path}")
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=repo_path,
+            repo_id=repo_id,
+            repo_type="dataset",
+            token=token,
+        )
+        logger.info(f"{E['ok']} Upload OK: {repo_path}")
+        return True
     except Exception as e:
-        logger.error(f"{E['error']} Query total: {e}")
-        return {}
+        logger.error(f"{E['error']} Upload parquet: {e}")
+        return False
+
+def hf_upload_checkpoint(api: HfApi, token: str, checkpoint_repo: str, domain: str, checkpoint: Dict) -> bool:
+    """Upload de checkpoint para HF.
     
-    phase8_completed_domains = state.get("phase8_completed_domains", {})
-    domain_counters = state.get("domain_counters", {})
-    
+    Garante que o checkpoint local existe (salva se necessário) e faz upload para
+    checkpoints/{domain}_checkpoint.json no dataset de checkpoints.
+    """
     try:
-        domains_info = conn.execute("""
-            SELECT 
-                LOWER(SUBSTR(email, POSITION('@' IN email) + 1)) AS domain,
-                COUNT(*) AS count
-            FROM emails_raw
-            GROUP BY domain
-            ORDER BY count DESC;
-        """).fetchall()
+        checkpoint_file = SAVE_PATH / "checkpoints" / f"{domain}_checkpoint.json"
+        if not checkpoint_file.exists():
+            save_domain_checkpoint_local(domain, checkpoint)
+        
+        logger.info(f"{E['upload']} Checkpoint: {domain}")
+        api.upload_file(
+            path_or_fileobj=str(checkpoint_file),
+            path_in_repo=f"checkpoints/{domain}_checkpoint.json",
+            repo_id=checkpoint_repo,
+            repo_type="dataset",
+            token=token,
+        )
+        logger.info(f"{E['ok']} Checkpoint uploaded: {domain}")
+        return True
     except Exception as e:
-        logger.error(f"{E['error']} Query domínios: {e}")
-        return {}
-    
-    logger.info(f"{E['list']} Domínios encontrados: {len(domains_info)}\n")
-    
-    all_domain_files = {}
-    
-    # ✅ LOOP PRINCIPAL - SEM VERIFICAÇÃO GLOBAL DE STOP_EVENT AQUI
-    for domain, count in domains_info:
-        domain_lower = domain.lower().strip()
-        
-        # ✅ Verificar se domínio já foi completo
-        if domain_lower in phase8_completed_domains:
-            completed_info = phase8_completed_domains[domain_lower]
-            if completed_info.get("status") == "completed":
-                logger.info(
-                    f"{E['check']} DOMÍNIO COMPLETO (skip): {domain_lower} | "
-                    f"Exportados: {completed_info.get('exported', 0):,} | "
-                    f"Timestamp: {completed_info.get('completed_at', 'N/A')}"
-                )
-                continue
-        
-        # ✅ VERIFICAR ESPAÇO EM DISCO COM RECUPERAÇÃO
-        try:
-            free_gb = ensure_minimum_disk_space(MIN_FREE_DISK_GB)
-            logger.info(f"{E['space']} Espaço disponível: {free_gb:.1f}GB")
-        except RuntimeError:
-            logger.warning(f"{E['warn']} Espaço insuficiente, tentando limpar...")
-            cleanup_temp_files()
-            try:
-                ensure_minimum_disk_space(MIN_FREE_DISK_GB)
-            except RuntimeError:
-                logger.error(f"{E['error']} Impossível obter espaço mínimo")
-                raise
-        
-        # ✅ VERIFICAR EXPORTAÇÃO JÁ EXISTENTE
-        existing_export = check_existing_domain_export(domain_lower)
-        
-        logger.info(f"{E['folder']} Processando domínio: {domain_lower} (count:{count}) emails")
-        
-        # ✅ DETERMINAR PONTO DE RETOMADA
-        start_counter = domain_counters.get(domain_lower, 0)
-        if existing_export["exists"] and existing_export["total_records"] > 0:
-            start_counter = max(start_counter, existing_export["total_records"])
-        
-        start_batch_num = existing_export.get("next_batch_num", 1) if existing_export["exists"] else 1
-        
-        all_domain_files[domain_lower] = {}
-        
-        # ✅ LOOP DE PROCESSAMENTO POR DOMÍNIO
-        batch_num = start_batch_num
-        records_processed = start_counter
-        
-        while records_processed < count:
-            # 🔴 VERIFICAR STOP EVENT AQUI (POR DOMÍNIO - não global)
-            if stop_event.is_set():
-                logger.warning(
-                    f"{E['warn']} Execução interrompida no domínio: {domain_lower} | "
-                    f"Processados: {records_processed}/{count} | "
-                    f"Próximo batch: {batch_num}"
-                )
-                break
-            
-            batch_size = min(BATCH_SIZE, count - records_processed)
-            limit_offset = (batch_num - 1) * BATCH_SIZE
-            
-            try:
-                # Executar query para este batch
-                batch_data = conn.execute(
-                    f"""
-                    SELECT email, nome
-                    FROM emails_raw
-                    WHERE LOWER(SUBSTR(email, POSITION('@' IN email) + 1)) = ?
-                    LIMIT ? OFFSET ?
-                    """,
-                    (domain_lower, batch_size, limit_offset)
-                ).fetchall()
-                
-                if not batch_data:
-                    logger.info(
-                        f"{E['check']} Nenhum dado no batch {batch_num} para {domain_lower} | "
-                        f"Processados: {records_processed}/{count}"
-                    )
-                    break
-                
-                # Processar batch
-                records_processed += len(batch_data)
-                batch_num += 1
-                
-                logger.info(
-                    f"{E['email']} {domain_lower} | Batch {batch_num-1} | "
-                    f"Total: {records_processed:,}/{count:,}"
-                )
-                
-                # Atualizar contador
-                domain_counters[domain_lower] = records_processed
-                state["domain_counters"] = domain_counters
-                
-            except Exception as e:
-                logger.error(f"{E['error']} Erro no batch {batch_num} de {domain_lower}: {str(e)}")
-                raise
-        
-        # ✅ MARCAR DOMÍNIO COMO COMPLETO
-        if records_processed >= count:
-            completed_info = phase8_completed_domains.get(domain_lower, {})
-            completed_info["status"] = "completed"
-            completed_info["exported"] = records_processed
-            completed_info["completed_at"] = datetime.now(timezone.utc).isoformat()
-            phase8_completed_domains[domain_lower] = completed_info
-            state["phase8_completed_domains"] = phase8_completed_domains
-            save_state(state)
-            
-            logger.info(
-                f"{E['check']} DOMÍNIO COMPLETO: {domain_lower} | "
-                f"Total exportado: {records_processed:,}"
-            )
-    
-    logger.info(f"\n{E['ok']} FASE 8 OK\n")
-    return all_domain_files
+        logger.error(f"{E['error']} Checkpoint upload: {e}")
+        return False
+
+# ---------------------------------------------------------------------
+# FIM helpers
+# ---------------------------------------------------------------------
 
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
     if not token:
@@ -1569,6 +1516,263 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
     save_state(state)
     logger.info(f"\n{E['ok']} FASE 7 OK\n")
 
+def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: HfApi, token: str, checkpoint_repo: str, emails_repo: str) -> Dict[str, List[Path]]:
+    """
+    FASE 8: Exportar por Domínio com Checkpoint e Upload HF
+    ✅ VERSÃO REESCRITA:
+    - Batches de 1M emails
+    - Validação por batch
+    - Export parquet por batch
+    - Upload HF a cada batch
+    - Checkpoint a cada batch
+    - Retomada automática
+    """
+    logger.info(f"\n{'='*100}")
+    logger.info(f"{E['email']} FASE 8: Exportar por Domínio (1M/batch) com Checkpoint")
+    logger.info(f"{'='*100}\n")
+    
+    try:
+        ensure_minimum_disk_space(MIN_FREE_DISK_GB)
+        logger.info(f"{E['space']} Espaço: {disk_usage()}")
+    except RuntimeError as e:
+        logger.error(f"{E['error']} {e}")
+        return {}
+    
+    try:
+        total_emails = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
+        logger.info(f"{E['stats']} Total de emails: {total_emails:,}\n")
+    except Exception as e:
+        logger.error(f"{E['error']} Query total: {e}")
+        return {}
+    
+    try:
+        domains_info = conn.execute("""
+            SELECT 
+                LOWER(SUBSTR(email, POSITION('@' IN email) + 1)) AS domain,
+                COUNT(*) AS count
+            FROM emails_raw
+            GROUP BY domain
+            ORDER BY count DESC;
+        """).fetchall()
+    except Exception as e:
+        logger.error(f"{E['error']} Query domínios: {e}")
+        return {}
+    
+    logger.info(f"{E['list']} Domínios: {len(domains_info)}\n")
+    
+    all_domain_files = {}
+    global_stats = {
+        "domains_completed": 0,
+        "domains_processed": 0,
+        "total_batches": 0,
+        "total_exported": 0,
+        "total_invalid": 0,
+    }
+    
+    # ✅ LOOP PRINCIPAL POR DOMÍNIO
+    for domain, total_count in domains_info:
+        if stop_event.is_set():
+            break
+        
+        domain_lower = domain.lower().strip()
+        global_stats["domains_processed"] += 1
+        
+        logger.info(f"\n{E['folder']} DOMÍNIO: {domain_lower} ({total_count:,} emails)")
+        
+        # ✅ Carregar checkpoint do domínio
+        domain_checkpoint = load_domain_checkpoint_from_hf(api, token, checkpoint_repo, domain_lower)
+        
+        if domain_checkpoint.get("status") == "completed":
+            logger.info(
+                f"{E['check']} COMPLETO (skip): {domain_lower} | "
+                f"Exportados: {domain_checkpoint.get('total_exported', 0):,} | "
+                f"Timestamp: {domain_checkpoint.get('last_exported_timestamp', 'N/A')}"
+            )
+            global_stats["domains_completed"] += 1
+            continue
+        
+        last_batch_num = domain_checkpoint.get("last_batch_num", 0)
+        total_processed_before = domain_checkpoint.get("total_processed", 0)
+        
+        if last_batch_num > 0:
+            logger.info(f"{E['recover']} Retomando batch {last_batch_num + 1} (já processados: {total_processed_before:,})")
+        
+        all_domain_files[domain_lower] = []
+        
+        batch_num = last_batch_num + 1
+        records_processed = total_processed_before
+        domain_stats = {
+            "batches_completed": 0,
+            "total_exported": 0,
+            "total_invalid": 0,
+        }
+        
+        # ✅ LOOP DE BATCHES POR DOMÍNIO
+        while records_processed < total_count:
+            if stop_event.is_set():
+                logger.warning(f"{E['warn']} Interrupção no domínio: {domain_lower}")
+                break
+            
+            # ✅ Verificar espaço
+            try:
+                ensure_minimum_disk_space(MIN_FREE_DISK_GB)
+            except RuntimeError:
+                logger.warning(f"{E['warn']} Espaço baixo, limpando...")
+                cleanup_temp_files()
+                try:
+                    ensure_minimum_disk_space(MIN_FREE_DISK_GB)
+                except RuntimeError:
+                    logger.error(f"{E['error']} Espaço insuficiente")
+                    raise
+            
+            batch_size = min(1_000_000, total_count - records_processed)
+            offset = (batch_num - 1) * 1_000_000
+            
+            logger.info(f"{E['email']} Batch {batch_num}: offset {offset}, size {batch_size:,}")
+            
+            try:
+                # ✅ 1. BUSCAR dados do batch
+                batch_data = conn.execute(f"""
+                    SELECT email, nome
+                    FROM emails_raw
+                    WHERE LOWER(SUBSTR(email, POSITION('@' IN email) + 1)) = ?
+                    LIMIT ? OFFSET ?
+                """, (domain_lower, batch_size, offset)).fetchall()
+                
+                if not batch_data:
+                    logger.info(f"{E['check']} Fim do domínio: {domain_lower}")
+                    break
+                
+                # ✅ 2. VALIDAR emails
+                valid_records = []
+                invalid_count = 0
+                
+                for email, nome in batch_data:
+                    if not email:
+                        invalid_count += 1
+                        continue
+                    
+                    email_lower = email.lower().strip()
+                    
+                    # Validações
+                    if not is_valid_email(email_lower):
+                        invalid_count += 1
+                        continue
+                    if is_disposable_email_py(email_lower):
+                        invalid_count += 1
+                        continue
+                    
+                    local_part = email_lower.split("@", 1)[0]
+                    if is_block_local(local_part):
+                        invalid_count += 1
+                        continue
+                    
+                    # Nome
+                    nome_clean = nome if nome else extract_name_from_local(local_part)
+                    valid_records.append({"email": email_lower, "nome": nome_clean})
+                
+                exported_count = len(valid_records)
+                domain_stats["total_exported"] += exported_count
+                domain_stats["total_invalid"] += invalid_count
+                
+                logger.info(
+                    f"{E['email']} Batch {batch_num}: válidos={exported_count:,} | "
+                    f"inválidos={invalid_count:,} | total={len(batch_data):,}"
+                )
+                
+                # ✅ 3. EXPORTAR para parquet
+                if valid_records:
+                    df = pd.DataFrame(valid_records)
+                    parquet_file = TEMP_DIR / f"{domain_lower}_batch_{batch_num}.parquet"
+                    
+                    try:
+                        df.to_parquet(parquet_file, engine="pyarrow", compression="snappy", index=False)
+                        logger.info(f"{E['save']} Parquet: {parquet_file.name} ({human(parquet_file.stat().st_size)})")
+                        
+                        # ✅ 4. UPLOAD para HF
+                        upload_ok = hf_upload_parquet(api, token, emails_repo, parquet_file, domain_lower, batch_num)
+                        
+                        if upload_ok:
+                            # ✅ 5. APAGAR ficheiro local
+                            try:
+                                parquet_file.unlink()
+                                logger.info(f"{E['clean']} Parquet deletado")
+                            except Exception:
+                                pass
+                        else:
+                            logger.warning(f"{E['warn']} Upload falhou, mantendo parquet")
+                    except Exception as e:
+                        logger.error(f"{E['error']} Parquet: {e}")
+                        raise
+                
+                # ✅ 6. ATUALIZAR checkpoint
+                records_processed += len(batch_data)
+                domain_stats["batches_completed"] += 1
+                batch_num += 1
+                
+                domain_checkpoint = {
+                    "domain": domain_lower,
+                    "last_batch_num": batch_num - 1,
+                    "total_processed": records_processed,
+                    "total_exported": domain_stats["total_exported"],
+                    "total_invalid": domain_stats["total_invalid"],
+                    "last_exported_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "processing"
+                }
+                
+                # ✅ 7. SALVAR checkpoint localmente
+                save_domain_checkpoint_local(domain_lower, domain_checkpoint)
+                
+                # ✅ 8. UPLOAD checkpoint HF
+                hf_upload_checkpoint(api, token, checkpoint_repo, domain_lower, domain_checkpoint)
+                
+                logger.info(f"{E['check']} Batch {batch_num-1} completo | Processados: {records_processed:,}/{total_count:,}")
+                
+            except Exception as e:
+                logger.error(f"{E['error']} Erro batch {batch_num}: {str(e)}")
+                raise
+        
+        # ✅ MARCAR DOMÍNIO COMO COMPLETO
+        if records_processed >= total_count:
+            domain_checkpoint = {
+                "domain": domain_lower,
+                "last_batch_num": batch_num - 1,
+                "total_processed": records_processed,
+                "total_exported": domain_stats["total_exported"],
+                "total_invalid": domain_stats["total_invalid"],
+                "last_exported_timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "completed"
+            }
+            
+            save_domain_checkpoint_local(domain_lower, domain_checkpoint)
+            hf_upload_checkpoint(api, token, checkpoint_repo, domain_lower, domain_checkpoint)
+            
+            global_stats["domains_completed"] += 1
+            global_stats["total_batches"] += domain_stats["batches_completed"]
+            global_stats["total_exported"] += domain_stats["total_exported"]
+            global_stats["total_invalid"] += domain_stats["total_invalid"]
+            
+            logger.info(
+                f"{E['check']} ✅ DOMÍNIO COMPLETO: {domain_lower}\n"
+                f"   Batches: {domain_stats['batches_completed']}\n"
+                f"   Exportados: {domain_stats['total_exported']:,}\n"
+                f"   Inválidos: {domain_stats['total_invalid']:,}"
+            )
+    
+    logger.info(f"\n{'='*100}")
+    logger.info(f"{E['ok']} FASE 8 COMPLETA")
+    logger.info(f"   Domínios: {global_stats['domains_completed']}/{global_stats['domains_processed']}")
+    logger.info(f"   Batches totais: {global_stats['total_batches']}")
+    logger.info(f"   Emails exportados: {global_stats['total_exported']:,}")
+    logger.info(f"   Emails inválidos: {global_stats['total_invalid']:,}")
+    logger.info(f"{'='*100}\n")
+    
+    return all_domain_files
+
+def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
+    # (duplicate of earlier function name kept intentionally; resolver will use the first)
+    return phase1_download_torrents(session, magnets)
+
 def main():
     logger.info(f"\n{'#'*100}")
     logger.info(f"# {E['start']} MINERADOR V9 PRODUCTION - COM GESTÃO INTELIGENTE DE DISCO")
@@ -1643,7 +1847,8 @@ def main():
                     if not stop_event.is_set():
                         final_files = phase6_export(conn)
                         if not stop_event.is_set():
-                            domain_files = phase8_export_by_domain(conn, state)
+                            # Alteração solicitada no main(): passar api, HF_TOKEN, checkpoint_repo, emails_repo
+                            domain_files = phase8_export_by_domain(conn, state, api, HF_TOKEN, checkpoint_repo, emails_repo)
                             if not stop_event.is_set():
                                 phase7_upload(api, HF_TOKEN, emails_repo, checkpoint_repo, final_files, DB_PATH, state)
         else:
