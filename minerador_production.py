@@ -11,6 +11,10 @@ Versão v9 COM CHECKPOINT ROBUSTO + GESTÃO INTELIGENTE DE DISCO:
 - Validação+Exportação+Limpeza automática
 - Gestão proativa de espaço em disco
 - Deleção de ficheiros temporários/desnecessários
+
+Esta versão inclui otimizações para evitar rate limits do HuggingFace:
+- Uploads em batch (upload de pastas) para reduzir commits
+- Retry com backoff exponencial para lidar com 429
 """
 from __future__ import annotations
 
@@ -32,7 +36,7 @@ import difflib
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict, Any, Optional, Set
+from typing import List, Tuple, Dict, Any, Optional
 from threading import Event, Lock
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
@@ -71,7 +75,8 @@ VALIDATION_BATCH_SIZE = 10000
 EXPORT_BATCH_SIZE = 100000
 MAX_VALIDATION_WORKERS = 4
 MIN_FREE_DISK_GB = 10  # Mínimo de espaço livre desejado
-BATCH_SIZE = 1000
+BATCH_SIZE = 1_000_000
+
 def increment_email_counter(count: int) -> int:
     global email_counter
     with email_counter_lock:
@@ -188,7 +193,7 @@ SUPPORTED_EXTENSIONS = {
 MAGNETS = [
     {
         "name": "Collection #2-#5",
-        "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2f%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2f%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
+        "magnet": "magnet:?xt=urn:btih:D136B1ADDE531F38311FBF43FB96FC26DF1A34CD&dn=Collection%20%232-%235%20%26%20Antipublic&tr=udp%3a%2f%2ftracker.coppersurfer.tk%3a6969%2f%2fannounce&tr=udp%3a%2f%2ftracker.leechers-paradise.org%3a6969%2f%2fannounce&tr=http%3a%2f%2ft.nyaatracker.com%3a80%2f%2fannounce&tr=http%3a%2f%2fopentracker.xyz%3a80%2f%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fopentracker.i2p.rocks%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2f%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce",
         "targets": [
             "Collection #2-#5 & Antipublic/Collection #2_New combo cloud_Trading Collection.tar.gz",
         ],
@@ -1056,9 +1061,9 @@ def check_existing_domain_export(domain: str) -> Dict[str, Any]:
     
     return result
 
-# ---------------------------------------------------------------------
-# Novas funções helper para checkpoint por domínio e upload parquet
-# ---------------------------------------------------------------------
+# ===========================
+# Helpers de checkpoint + HF
+# ===========================
 def load_domain_checkpoint_from_hf(api: HfApi, token: str, checkpoint_repo: str, domain: str) -> Dict[str, Any]:
     """Carrega checkpoint de um domínio do HF.
     
@@ -1067,7 +1072,6 @@ def load_domain_checkpoint_from_hf(api: HfApi, token: str, checkpoint_repo: str,
     """
     try:
         checkpoint_file = SAVE_PATH / f"{domain}_checkpoint.json"
-        # Faz o download para SAVE_PATH (arquivo local será SAVE_PATH/{domain}_checkpoint.json)
         api.hf_hub_download(
             repo_id=checkpoint_repo,
             filename=f"checkpoints/{domain}_checkpoint.json",
@@ -1091,7 +1095,6 @@ def load_domain_checkpoint_from_hf(api: HfApi, token: str, checkpoint_repo: str,
         "status": "init"
     }
 
-# alias para compatibilidade com nomes curtos
 def load_domain_checkpoint(api: HfApi, token: str, checkpoint_repo: str, domain: str) -> Dict[str, Any]:
     """Alias para load_domain_checkpoint_from_hf."""
     return load_domain_checkpoint_from_hf(api, token, checkpoint_repo, domain)
@@ -1155,10 +1158,83 @@ def hf_upload_checkpoint(api: HfApi, token: str, checkpoint_repo: str, domain: s
         logger.error(f"{E['error']} Checkpoint upload: {e}")
         return False
 
-# ---------------------------------------------------------------------
-# FIM helpers
-# ---------------------------------------------------------------------
+# ===========================
+# HF batch upload + retry
+# ===========================
+def hf_batch_upload_parquets(api: HfApi, token: str, repo_id: str, domain: str, batch_files: List[Path]) -> bool:
+    """
+    Upload de MÚLTIPLOS parquets de uma vez (folder upload).
+    Muito mais eficiente que ficheiro a ficheiro. Copia os ficheiros para uma pasta
+    temporária e usa upload_folder para enviar tudo de uma vez.
+    """
+    if not batch_files:
+        return True
+    
+    # Criar pasta temporária com todos os parquets
+    batch_upload_dir = TEMP_DIR / f"batch_upload_{domain}_{uuid.uuid4().hex[:8]}"
+    batch_upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Copiar parquets para pasta
+        copied = 0
+        for batch_file in batch_files:
+            if batch_file.exists():
+                shutil.copy(batch_file, batch_upload_dir / batch_file.name)
+                copied += 1
+        
+        if copied == 0:
+            logger.warning(f"{E['warn']} Nenhum parquet para upload em {domain}")
+            return True
+        
+        logger.info(f"{E['upload']} Pasta upload: {len(batch_files)} parquets -> {batch_upload_dir}")
+        
+        # Upload TODA a pasta de uma vez
+        api.upload_folder(
+            folder_path=str(batch_upload_dir),
+            path_in_repo=f"Trader_Emails/{domain}",
+            repo_id=repo_id,
+            repo_type="dataset",
+            token=token,
+            commit_message=f"Batch upload {domain}: {len(batch_files)} files"
+        )
+        
+        logger.info(f"{E['ok']} Folder upload OK: {domain}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"{E['error']} Folder upload: {e}")
+        return False
+    finally:
+        # Limpar pasta temporária
+        try:
+            shutil.rmtree(batch_upload_dir)
+        except Exception:
+            pass
 
+def hf_retry_with_backoff(func, max_retries: int = 3, initial_wait: int = 10):
+    """Retry com backoff exponencial para rate limits (429)."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            error_str = str(e)
+            # Se é rate limit (429)
+            if "429" in error_str or "Too Many Requests" in error_str or "rate limit" in error_str.lower():
+                # Extrair tempo de espera se disponível (heurística)
+                match = re.search(r"Retry after (\d+) seconds", error_str)
+                wait_time = int(match.group(1)) if match else (initial_wait * (2 ** attempt))
+                
+                if attempt < max_retries - 1:
+                    logger.warning(f"{E['warn']} Rate limit! Aguardando {wait_time}s... (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            # Se não for rate limit, relança
+            raise e
+    return None
+
+# ===========================
+# HF setup basic helpers
+# ===========================
 def hf_setup_datasets(token: str) -> Tuple[HfApi, str, str]:
     if not token:
         raise RuntimeError("HF_TOKEN não definido")
@@ -1248,6 +1324,9 @@ def hf_download_duckdb(api: HfApi, token: str, checkpoint_repo: str, local_path:
         logger.info(f"{E['info']} Sem DuckDB")
         return False
 
+# ===========================
+# FASES 1-7 (mantidas)
+# ===========================
 def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents (com verificação de reúso)")
@@ -1516,20 +1595,24 @@ def phase7_upload(api: HfApi, token: str, emails_repo: str, checkpoint_repo: str
     save_state(state)
     logger.info(f"\n{E['ok']} FASE 7 OK\n")
 
-def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: HfApi, token: str, checkpoint_repo: str, emails_repo: str) -> Dict[str, List[Path]]:
+# ===========================
+# FASE 8 OTIMIZADA (batch upload)
+# ===========================
+def phase8_export_by_domain_optimized(conn: duckdb.DuckDBPyConnection, state: Dict, api: HfApi, token: str, checkpoint_repo: str, emails_repo: str) -> Dict[str, List[Path]]:
     """
-    FASE 8: Exportar por Domínio com Checkpoint e Upload HF
-    ✅ VERSÃO REESCRITA:
-    - Batches de 1M emails
-    - Validação por batch
-    - Export parquet por batch
-    - Upload HF a cada batch
-    - Checkpoint a cada batch
-    - Retomada automática
+    FASE 8: Exportar com BATCH UPLOADS (otimizado para HF rate limits)
+    
+    Estratégia:
+    - Processar vários batches localmente (BATCHES_PER_UPLOAD)
+    - Fazer 1 upload de pasta com vários parquets (upload_folder)
+    - Fazer upload de checkpoint (1 commit)
+    - Reduz commits e risco de 429
     """
     logger.info(f"\n{'='*100}")
-    logger.info(f"{E['email']} FASE 8: Exportar por Domínio (1M/batch) com Checkpoint")
+    logger.info(f"{E['email']} FASE 8: Exportar com Batch Upload (5 batches por upload)")
     logger.info(f"{'='*100}\n")
+    
+    BATCHES_PER_UPLOAD = 5  # Juntar 5 batches antes de fazer upload (ajustável)
     
     try:
         ensure_minimum_disk_space(MIN_FREE_DISK_GB)
@@ -1540,9 +1623,9 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
     
     try:
         total_emails = conn.execute("SELECT COUNT(*) FROM emails_raw;").fetchone()[0]
-        logger.info(f"{E['stats']} Total de emails: {total_emails:,}\n")
+        logger.info(f"{E['stats']} Total: {total_emails:,}\n")
     except Exception as e:
-        logger.error(f"{E['error']} Query total: {e}")
+        logger.error(f"{E['error']} Query: {e}")
         return {}
     
     try:
@@ -1569,7 +1652,7 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
         "total_invalid": 0,
     }
     
-    # ✅ LOOP PRINCIPAL POR DOMÍNIO
+    # LOOP POR DOMÍNIO
     for domain, total_count in domains_info:
         if stop_event.is_set():
             break
@@ -1579,41 +1662,29 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
         
         logger.info(f"\n{E['folder']} DOMÍNIO: {domain_lower} ({total_count:,} emails)")
         
-        # ✅ Carregar checkpoint do domínio
+        # Carregar checkpoint
         domain_checkpoint = load_domain_checkpoint_from_hf(api, token, checkpoint_repo, domain_lower)
         
         if domain_checkpoint.get("status") == "completed":
-            logger.info(
-                f"{E['check']} COMPLETO (skip): {domain_lower} | "
-                f"Exportados: {domain_checkpoint.get('total_exported', 0):,} | "
-                f"Timestamp: {domain_checkpoint.get('last_exported_timestamp', 'N/A')}"
-            )
+            logger.info(f"{E['check']} COMPLETO (skip): {domain_lower}")
             global_stats["domains_completed"] += 1
             continue
         
         last_batch_num = domain_checkpoint.get("last_batch_num", 0)
         total_processed_before = domain_checkpoint.get("total_processed", 0)
         
-        if last_batch_num > 0:
-            logger.info(f"{E['recover']} Retomando batch {last_batch_num + 1} (já processados: {total_processed_before:,})")
-        
         all_domain_files[domain_lower] = []
-        
         batch_num = last_batch_num + 1
         records_processed = total_processed_before
-        domain_stats = {
-            "batches_completed": 0,
-            "total_exported": 0,
-            "total_invalid": 0,
-        }
+        domain_stats = {"batches_completed": 0, "total_exported": 0, "total_invalid": 0}
         
-        # ✅ LOOP DE BATCHES POR DOMÍNIO
+        pending_parquets: List[Path] = []  # Lista para acumular parquets
+        
+        # LOOP DE BATCHES
         while records_processed < total_count:
             if stop_event.is_set():
-                logger.warning(f"{E['warn']} Interrupção no domínio: {domain_lower}")
                 break
             
-            # ✅ Verificar espaço
             try:
                 ensure_minimum_disk_space(MIN_FREE_DISK_GB)
             except RuntimeError:
@@ -1631,7 +1702,7 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
             logger.info(f"{E['email']} Batch {batch_num}: offset {offset}, size {batch_size:,}")
             
             try:
-                # ✅ 1. BUSCAR dados do batch
+                # BUSCAR dados
                 batch_data = conn.execute(f"""
                     SELECT email, nome
                     FROM emails_raw
@@ -1640,10 +1711,10 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
                 """, (domain_lower, batch_size, offset)).fetchall()
                 
                 if not batch_data:
-                    logger.info(f"{E['check']} Fim do domínio: {domain_lower}")
+                    logger.info(f"{E['check']} Fim do domínio")
                     break
                 
-                # ✅ 2. VALIDAR emails
+                # VALIDAR
                 valid_records = []
                 invalid_count = 0
                 
@@ -1654,7 +1725,6 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
                     
                     email_lower = email.lower().strip()
                     
-                    # Validações
                     if not is_valid_email(email_lower):
                         invalid_count += 1
                         continue
@@ -1667,7 +1737,6 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
                         invalid_count += 1
                         continue
                     
-                    # Nome
                     nome_clean = nome if nome else extract_name_from_local(local_part)
                     valid_records.append({"email": email_lower, "nome": nome_clean})
                 
@@ -1676,11 +1745,10 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
                 domain_stats["total_invalid"] += invalid_count
                 
                 logger.info(
-                    f"{E['email']} Batch {batch_num}: válidos={exported_count:,} | "
-                    f"inválidos={invalid_count:,} | total={len(batch_data):,}"
+                    f"{E['email']} Batch {batch_num}: válidos={exported_count:,} | inválidos={invalid_count:,}"
                 )
                 
-                # ✅ 3. EXPORTAR para parquet
+                # EXPORTAR parquet
                 if valid_records:
                     df = pd.DataFrame(valid_records)
                     parquet_file = TEMP_DIR / f"{domain_lower}_batch_{batch_num}.parquet"
@@ -1689,23 +1757,14 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
                         df.to_parquet(parquet_file, engine="pyarrow", compression="snappy", index=False)
                         logger.info(f"{E['save']} Parquet: {parquet_file.name} ({human(parquet_file.stat().st_size)})")
                         
-                        # ✅ 4. UPLOAD para HF
-                        upload_ok = hf_upload_parquet(api, token, emails_repo, parquet_file, domain_lower, batch_num)
+                        # ACUMULAR para batch upload
+                        pending_parquets.append(parquet_file)
                         
-                        if upload_ok:
-                            # ✅ 5. APAGAR ficheiro local
-                            try:
-                                parquet_file.unlink()
-                                logger.info(f"{E['clean']} Parquet deletado")
-                            except Exception:
-                                pass
-                        else:
-                            logger.warning(f"{E['warn']} Upload falhou, mantendo parquet")
                     except Exception as e:
                         logger.error(f"{E['error']} Parquet: {e}")
                         raise
                 
-                # ✅ 6. ATUALIZAR checkpoint
+                # ATUALIZAR e SALVAR checkpoint localmente (mas NÃO fazer upload ainda)
                 records_processed += len(batch_data)
                 domain_stats["batches_completed"] += 1
                 batch_num += 1
@@ -1720,19 +1779,61 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
                     "status": "processing"
                 }
                 
-                # ✅ 7. SALVAR checkpoint localmente
                 save_domain_checkpoint_local(domain_lower, domain_checkpoint)
                 
-                # ✅ 8. UPLOAD checkpoint HF
-                hf_upload_checkpoint(api, token, checkpoint_repo, domain_lower, domain_checkpoint)
+                logger.info(f"{E['check']} Batch {batch_num-1} completo | {len(pending_parquets)} parquets pendentes")
                 
-                logger.info(f"{E['check']} Batch {batch_num-1} completo | Processados: {records_processed:,}/{total_count:,}")
+                # A CADA BATCHES_PER_UPLOAD: fazer upload de folder
+                if len(pending_parquets) >= BATCHES_PER_UPLOAD or records_processed >= total_count:
+                    logger.info(f"{E['upload']} Fazendo batch upload de {len(pending_parquets)} parquets...")
+                    
+                    def upload_func():
+                        return hf_batch_upload_parquets(api, token, emails_repo, domain_lower, pending_parquets)
+                    
+                    try:
+                        upload_ok = hf_retry_with_backoff(upload_func, max_retries=3, initial_wait=30)
+                        
+                        if upload_ok:
+                            # Apagar parquets locais
+                            for pq_file in pending_parquets:
+                                try:
+                                    pq_file.unlink()
+                                except Exception:
+                                    pass
+                            logger.info(f"{E['ok']} Batch upload OK, {len(pending_parquets)} parquets apagados")
+                            pending_parquets = []
+                        else:
+                            logger.warning(f"{E['warn']} Upload falhou, mantendo parquets")
+                    
+                    except Exception as e:
+                        logger.error(f"{E['error']} Batch upload: {e}")
+                        # Continuar mesmo se falhar (checkpoint está salvo)
                 
             except Exception as e:
-                logger.error(f"{E['error']} Erro batch {batch_num}: {str(e)}")
+                logger.error(f"{E['error']} Batch {batch_num}: {e}")
                 raise
         
-        # ✅ MARCAR DOMÍNIO COMO COMPLETO
+        # UPLOAD final de parquets restantes
+        if pending_parquets:
+            logger.info(f"{E['upload']} Upload final: {len(pending_parquets)} parquets")
+            
+            def upload_func():
+                return hf_batch_upload_parquets(api, token, emails_repo, domain_lower, pending_parquets)
+            
+            try:
+                upload_ok = hf_retry_with_backoff(upload_func, max_retries=3, initial_wait=30)
+                
+                if upload_ok:
+                    for pq_file in pending_parquets:
+                        try:
+                            pq_file.unlink()
+                        except Exception:
+                            pass
+                    logger.info(f"{E['ok']} Upload final OK")
+            except Exception as e:
+                logger.error(f"{E['error']} Upload final: {e}")
+        
+        # MARCAR DOMÍNIO COMO COMPLETO
         if records_processed >= total_count:
             domain_checkpoint = {
                 "domain": domain_lower,
@@ -1745,7 +1846,15 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
             }
             
             save_domain_checkpoint_local(domain_lower, domain_checkpoint)
-            hf_upload_checkpoint(api, token, checkpoint_repo, domain_lower, domain_checkpoint)
+            
+            # Retry checkpoint upload
+            def checkpoint_upload():
+                return hf_upload_checkpoint(api, token, checkpoint_repo, domain_lower, domain_checkpoint)
+            
+            try:
+                hf_retry_with_backoff(checkpoint_upload, max_retries=3, initial_wait=30)
+            except Exception as e:
+                logger.error(f"{E['error']} Checkpoint upload: {e}")
             
             global_stats["domains_completed"] += 1
             global_stats["total_batches"] += domain_stats["batches_completed"]
@@ -1762,124 +1871,16 @@ def phase8_export_by_domain(conn: duckdb.DuckDBPyConnection, state: Dict, api: H
     logger.info(f"\n{'='*100}")
     logger.info(f"{E['ok']} FASE 8 COMPLETA")
     logger.info(f"   Domínios: {global_stats['domains_completed']}/{global_stats['domains_processed']}")
-    logger.info(f"   Batches totais: {global_stats['total_batches']}")
-    logger.info(f"   Emails exportados: {global_stats['total_exported']:,}")
-    logger.info(f"   Emails inválidos: {global_stats['total_invalid']:,}")
+    logger.info(f"   Batches: {global_stats['total_batches']}")
+    logger.info(f"   Exportados: {global_stats['total_exported']:,}")
+    logger.info(f"{E['warn']} Redução: menos commits (upload por pasta)")
     logger.info(f"{'='*100}\n")
     
     return all_domain_files
 
-def phase1_download_torrents(session: lt.session, magnets: List[Dict]) -> Dict[str, Tuple]:
-    """FASE 1: Download torrents com thread pool."""
-    logger.info(f"\n{'='*100}")
-    logger.info(f"{E['download']} FASE 1: Download {len(magnets)} torrents")
-    logger.info(f"{'='*100}\n")
-    
-    completed: Dict[str, Tuple] = {}  # ✅ INICIALIZA AQUI
-    
-    def download_single(item):
-        """Download um torrent individual."""
-        name = item["name"]
-        magnet = item["magnet"]
-        targets = item.get("targets", [])
-        
-        try:
-            logger.info(f"{E['download']} {name}")
-            
-            # Parse magnet e cria torrent
-            params = lt.parse_magnet_uri(magnet)
-            params.save_path = str(SAVE_PATH)
-            handle = session.add_torrent(params)
-            
-            # Aguarda metadata
-            metadata_wait = 0
-            max_wait = 600
-            
-            while metadata_wait < max_wait and not stop_event.is_set():
-                has_metadata = False
-                try:
-                    has_metadata = handle.has_metadata()
-                except Exception:
-                    try:
-                        _ = handle.torrent_info()
-                        has_metadata = True
-                    except Exception:
-                        has_metadata = False
-                
-                if has_metadata:
-                    break
-                
-                metadata_wait += 1
-                if metadata_wait % 30 == 0:
-                    logger.debug(f"Metadata {name}... ({metadata_wait}s)")
-                
-                time.sleep(1)
-            
-            if metadata_wait >= max_wait:
-                logger.error(f"{E['error']} Timeout metadata: {name}")
-                return None
-            
-            if stop_event.is_set():
-                raise KeyboardInterrupt()
-            
-            # Obter info do torrent
-            info = None
-            try:
-                info = handle.torrent_info()
-            except Exception:
-                try:
-                    info = handle.get_torrent_info()
-                except Exception as e:
-                    logger.error(f"{E['error']} torrent_info: {e}")
-                    return None
-            
-            # Encontrar targets
-            found, all_files = find_targets_exact(info, targets)
-            if not found:
-                logger.error(f"{E['error']} Nenhum target: {name}")
-                return None
-            
-            # Definir prioridades
-            try:
-                nfiles = getattr(info, "num_files", lambda: None)()
-                if nfiles is None:
-                    try:
-                        nfiles = len(info.files())
-                    except Exception:
-                        nfiles = max(all_files.keys()) + 1
-            except Exception:
-                nfiles = max(all_files.keys()) + 1
-            
-            for i in range(nfiles):
-                try:
-                    priority = 7 if i in found else 0
-                    handle.file_priority(i, priority)
-                except Exception:
-                    pass
-            
-            logger.info(f"{E['ok']} {name} pronto | {len(found)} arquivos")
-            return (name, (handle, info, found, all_files))
-            
-        except Exception as e:
-            logger.error(f"{E['error']} {name}: {e}")
-            return None
-    
-    # Thread pool executor
-    with ThreadPoolExecutor(max_workers=min(len(magnets), 5)) as executor:
-        futures = [executor.submit(download_single, item) for item in magnets]
-        
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    name, data = result
-                    completed[name] = data  # ✅ Adiciona ao dicionário
-            except Exception as e:
-                logger.error(f"{E['error']} Future: {e}")
-    
-    logger.info(f"\n{E['ok']} FASE 1: {len(completed)}/{len(magnets)} OK\n")
-    return completed  # ✅ Retorna aqui (variável existe!)
-
+# ===========================
+# MAIN
+# ===========================
 def main():
     logger.info(f"\n{'#'*100}")
     logger.info(f"# {E['start']} MINERADOR V9 PRODUCTION - COM GESTÃO INTELIGENTE DE DISCO")
@@ -1954,8 +1955,8 @@ def main():
                     if not stop_event.is_set():
                         final_files = phase6_export(conn)
                         if not stop_event.is_set():
-                            # Alteração solicitada no main(): passar api, HF_TOKEN, checkpoint_repo, emails_repo
-                            domain_files = phase8_export_by_domain(conn, state, api, HF_TOKEN, checkpoint_repo, emails_repo)
+                            # Aqui usamos a versão otimizada para evitar rate limits HF
+                            domain_files = phase8_export_by_domain_optimized(conn, state, api, HF_TOKEN, checkpoint_repo, emails_repo)
                             if not stop_event.is_set():
                                 phase7_upload(api, HF_TOKEN, emails_repo, checkpoint_repo, final_files, DB_PATH, state)
         else:
