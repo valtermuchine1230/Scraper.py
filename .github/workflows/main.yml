@@ -30,7 +30,7 @@ env:
   LOG_LEVEL: INFO
   JOB_TIMEOUT_MINUTES: "360"
   SHUTDOWN_AT_MINUTE: "335"
-  CHECKPOINT_SYNC_INTERVAL: "300"
+  CHECKPOINT_SYNC_INTERVAL: "60"
   GRACEFUL_WAIT_AFTER_SIGTERM: "180"
   DB_UPLOAD_MAX_SIZE_MB: "1024"
   MAX_CONSECUTIVE_NO_PROGRESS: "5"
@@ -137,10 +137,12 @@ jobs:
           SHUTDOWN_TS=$((START_TS + SHUTDOWN_AT_MINUTE * 60))
 
           mkdir -p "$SAVE_PATH/checkpoints"
+          touch "$SAVE_PATH/minerador.log"
 
           echo "▶ Iniciando minerador_production.py"
           python minerador_production.py > "$SAVE_PATH/minerador.log" 2>&1 &
           PID=$!
+          echo "PID do processo: $PID"
 
           initial_metric=0
           if [ -f "$SAVE_PATH/state.json" ]; then
@@ -149,9 +151,19 @@ jobs:
           echo "Métrica inicial: $initial_metric"
 
           next_sync=$(( $(date +%s) + CHECKPOINT_SYNC_INTERVAL ))
+          last_log_size=0
 
           while kill -0 $PID 2>/dev/null; do
             now=$(date +%s)
+
+            # Mostra saída nova do script a cada ciclo (não espera o sync)
+            current_log_size=$(stat -c%s "$SAVE_PATH/minerador.log" 2>/dev/null || echo 0)
+            if [ "$current_log_size" -gt "$last_log_size" ]; then
+              echo "───── [minerador_production.py output] ─────"
+              tail -c +$((last_log_size + 1)) "$SAVE_PATH/minerador.log"
+              echo "──────────────────────────────────────────"
+              last_log_size=$current_log_size
+            fi
 
             if [ $now -ge $next_sync ]; then
               echo "🔁 Sincronizando checkpoint..."
@@ -173,8 +185,16 @@ jobs:
               break
             fi
 
-            sleep 5
+            sleep 10
           done
+
+          # Mostra qualquer saída final que tenha ficado no buffer
+          current_log_size=$(stat -c%s "$SAVE_PATH/minerador.log" 2>/dev/null || echo 0)
+          if [ "$current_log_size" -gt "$last_log_size" ]; then
+            echo "───── [minerador_production.py output - final] ─────"
+            tail -c +$((last_log_size + 1)) "$SAVE_PATH/minerador.log"
+            echo "──────────────────────────────────────────"
+          fi
 
           wait $PID 2>/dev/null || true
           echo "🛑 Processo finalizado"
@@ -189,6 +209,8 @@ jobs:
 
       - name: Dispatch next run if needed
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           STATE_FILE="$SAVE_PATH/state.json"
 
@@ -215,14 +237,12 @@ jobs:
           else
             echo "⛔ Limite de tentativas sem progresso excedido — não redisparando"
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Display logs (last 200 lines)
         if: always()
         run: |
           if [ -f "$SAVE_PATH/minerador.log" ]; then
-            echo "=== MINERADOR LOG ==="
+            echo "=== MINERADOR LOG COMPLETO (últimas 200 linhas) ==="
             tail -200 "$SAVE_PATH/minerador.log"
           fi
 
