@@ -32,23 +32,19 @@ env:
   SAVE_PATH_BASE: "${{ runner.temp }}/data-${{ github.run_id }}"
   HF_REPO_EMAILS: "Trader_Emails"
   HF_REPO_CHECKPOINT: "minerador_checkpoints"
-  LOG_LEVEL: "INFO"
 
 jobs:
   minerador:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     permissions:
       contents: read
       packages: read
       actions: write
-
     env:
       SAVE_PATH: ${{ env.SAVE_PATH_BASE }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      WORKFLOW_FILE: .github/workflows/minerador-production.yml
 
     steps:
       - name: Checkout repository
@@ -66,13 +62,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            build-essential \
-            python3-dev \
-            libffi-dev \
-            libssl-dev \
-            pkg-config \
-            jq
+          sudo apt-get install -y build-essential python3-dev libffi-dev libssl-dev pkg-config jq
 
       - name: Increase swap space
         run: |
@@ -92,6 +82,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install --no-cache-dir -r requirements.txt -q
           fi
+          pip install --no-cache-dir huggingface_hub duckdb -q
 
       - name: Prepare directories
         run: |
@@ -103,302 +94,129 @@ jobs:
 
       - name: Bootstrap remote state and database
         working-directory: repo-${{ github.run_id }}
-        run: |
-          python3 << 'BOOTSTRAP_EOF'
-import os
-import json
-import sys
-from pathlib import Path
-
-try:
-    from huggingface_hub import HfApi, hf_hub_download
-except ImportError:
-    print("❌ huggingface_hub not installed")
-    sys.exit(1)
-
-save_path = os.environ.get("SAVE_PATH", "/tmp")
-hf_token = os.environ.get("HF_TOKEN", "")
-
-if not hf_token:
-    print("⚠️ HF_TOKEN not configured")
-    sys.exit(0)
-
-api = HfApi()
-repo_owner = None
-
-try:
-    who = api.whoami(token=hf_token)
-    repo_owner = who.get("name") or who.get("user")
-except Exception as e:
-    print(f"⚠️ HF auth failed: {e}")
-
-hf_repo_checkpoint = os.environ.get("HF_REPO_CHECKPOINT", "minerador_checkpoints")
-checkpoint_repo = f"{repo_owner}/{hf_repo_checkpoint}" if repo_owner else hf_repo_checkpoint
-
-# Download state.json
-try:
-    hf_hub_download(
-        repo_id=checkpoint_repo,
-        filename="state.json",
-        local_dir=save_path,
-        token=hf_token,
-        repo_type="dataset"
-    )
-    print("✅ state.json downloaded")
-except Exception as e:
-    print(f"ℹ️ No state.json available: {e}")
-
-# Attempt DuckDB download
-try:
-    files = api.list_repo_files(repo_id=checkpoint_repo, token=hf_token, repo_type="dataset")
-    if "emails.duckdb" in files:
-        db_size_limit = int(os.environ.get("DB_UPLOAD_MAX_SIZE_MB", "1024"))
-        try:
-            path = hf_hub_download(
-                repo_id=checkpoint_repo,
-                filename="emails.duckdb",
-                local_dir=save_path,
-                token=hf_token,
-                repo_type="dataset"
-            )
-            print(f"✅ DuckDB downloaded: {path}")
-        except Exception as e:
-            print(f"⚠️ DuckDB download failed: {e}")
-    else:
-        print("ℹ️ No emails.duckdb in checkpoint repo")
-except Exception as e:
-    print(f"ℹ️ Could not list checkpoint files: {e}")
-
-BOOTSTRAP_EOF
+        run: python3 scripts/bootstrap.py
 
       - name: Check if already completed
-        shell: bash
         run: |
           STATE_FILE="${{ env.SAVE_PATH }}/state.json"
           if [ -f "$STATE_FILE" ]; then
             status=$(jq -r '.status // empty' "$STATE_FILE" 2>/dev/null || echo "")
             if [ "$status" = "completed" ]; then
-              echo "✅ Pipeline already completed — exiting"
+              echo "✅ Pipeline já concluído — encerrando"
               exit 0
             fi
           fi
-          echo "ℹ️ Continuing with pipeline execution"
+          echo "ℹ️ Continuando execução"
 
       - name: Run minerador with watchdog
         working-directory: repo-${{ github.run_id }}
         timeout-minutes: 350
         run: |
           set -euo pipefail
-          
           SAVE_PATH="${{ env.SAVE_PATH }}"
           START_TS=$(date +%s)
-          SHUTDOWN_AT_MINUTE=${{ env.SHUTDOWN_AT_MINUTE }}
-          SHUTDOWN_TS=$((START_TS + SHUTDOWN_AT_MINUTE * 60))
+          SHUTDOWN_TS=$((START_TS + ${{ env.SHUTDOWN_AT_MINUTE }} * 60))
           CHECKPOINT_SYNC_INTERVAL=${{ env.CHECKPOINT_SYNC_INTERVAL }}
           GRACEFUL_WAIT=${{ env.GRACEFUL_WAIT_AFTER_SIGTERM }}
-          MAX_NO_PROGRESS=${{ env.MAX_CONSECUTIVE_NO_PROGRESS }}
-          
+
           mkdir -p "${SAVE_PATH}/checkpoints"
-          
-          echo "▶ Starting minerador_production.py"
+
+          echo "▶ Iniciando minerador_production.py"
           python3 minerador_production.py > "${SAVE_PATH}/minerador.log" 2>&1 &
           PID=$!
-          echo "PID=$PID" >> "${SAVE_PATH}/minerador.log"
-          
-          # Get initial metric
+
           initial_metric=0
           if [ -f "${SAVE_PATH}/state.json" ]; then
-            initial_metric=$(jq -r '.total_emails_extracted // 0' "${SAVE_PATH}/state.json" 2>/dev/null || echo 0)
+            initial_metric=$(jq -r '.total_emails_extracted // .total_processed // 0' "${SAVE_PATH}/state.json" 2>/dev/null || echo 0)
           fi
-          echo "Initial metric: $initial_metric"
-          
+          echo "Métrica inicial: $initial_metric"
+
           next_sync=$(( $(date +%s) + CHECKPOINT_SYNC_INTERVAL ))
-          
-          # Watchdog loop
+
           while kill -0 $PID 2>/dev/null; do
             now=$(date +%s)
-            
-            # Periodic checkpoint sync
+
             if [ $now -ge $next_sync ]; then
-              echo "🔁 Syncing checkpoint..."
-              python3 << 'SYNC_EOF'
-import os
-import json
-from pathlib import Path
-
-try:
-    from huggingface_hub import HfApi
-except ImportError:
-    exit(1)
-
-save_path = os.environ.get("SAVE_PATH")
-hf_token = os.environ.get("HF_TOKEN")
-
-if not hf_token or not save_path:
-    exit(0)
-
-api = HfApi()
-repo_owner = None
-
-try:
-    who = api.whoami(token=hf_token)
-    repo_owner = who.get("name") or who.get("user")
-except:
-    pass
-
-checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
-
-state_file = os.path.join(save_path, "state.json")
-if os.path.exists(state_file):
-    try:
-        api.upload_file(
-            path_or_fileobj=state_file,
-            path_in_repo="state.json",
-            repo_id=checkpoint_repo,
-            repo_type="dataset",
-            token=hf_token
-        )
-        print("✅ Checkpoint synced")
-    except Exception as e:
-        print(f"⚠️ Sync failed: {e}")
-
-SYNC_EOF
+              echo "🔁 Sincronizando checkpoint..."
+              python3 scripts/sync_checkpoint.py || true
               next_sync=$(( now + CHECKPOINT_SYNC_INTERVAL ))
             fi
-            
-            # Check shutdown time
+
             if [ $now -ge $SHUTDOWN_TS ]; then
-              echo "⏰ Initiating graceful shutdown"
+              echo "⏰ Iniciando shutdown gracioso"
               kill -TERM $PID 2>/dev/null || true
-              
               end_wait=$(( now + GRACEFUL_WAIT ))
               while kill -0 $PID 2>/dev/null && [ $(date +%s) -lt $end_wait ]; do
                 sleep 1
               done
-              
               if kill -0 $PID 2>/dev/null; then
-                echo "⚠️ Force killing process"
+                echo "⚠️ Forçando encerramento"
                 kill -9 $PID 2>/dev/null || true
               fi
               break
             fi
-            
+
             sleep 5
           done
-          
+
           wait $PID 2>/dev/null || true
-          echo "🛑 Process ended"
-          
-          # Final upload
-          echo "📤 Performing final upload..."
-          python3 << 'FINAL_EOF'
-import os
-import json
-from pathlib import Path
+          echo "🛑 Processo finalizado"
 
-try:
-    from huggingface_hub import HfApi
-except ImportError:
-    exit(1)
+          echo "$initial_metric" > "${SAVE_PATH}/.initial_metric"
 
-save_path = os.environ.get("SAVE_PATH")
-hf_token = os.environ.get("HF_TOKEN")
+      - name: Finalize - upload state, checkpoints, database
+        if: always()
+        working-directory: repo-${{ github.run_id }}
+        run: |
+          initial_metric=$(cat "${{ env.SAVE_PATH }}/.initial_metric" 2>/dev/null || echo 0)
+          python3 scripts/finalize.py all
+          python3 scripts/finalize.py progress "$initial_metric"
 
-if not hf_token or not save_path:
-    exit(0)
-
-api = HfApi()
-repo_owner = None
-
-try:
-    who = api.whoami(token=hf_token)
-    repo_owner = who.get("name") or who.get("user")
-except:
-    pass
-
-checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
-
-# Upload state
-state_file = os.path.join(save_path, "state.json")
-if os.path.exists(state_file):
-    try:
-        api.upload_file(
-            path_or_fileobj=state_file,
-            path_in_repo="state.json",
-            repo_id=checkpoint_repo,
-            repo_type="dataset",
-            token=hf_token
-        )
-        print("✅ state.json uploaded")
-    except Exception as e:
-        print(f"⚠️ Upload failed: {e}")
-
-# Upload checkpoints
-cp_dir = os.path.join(save_path, "checkpoints")
-if os.path.isdir(cp_dir):
-    for fn in os.listdir(cp_dir):
-        local = os.path.join(cp_dir, fn)
-        if os.path.isfile(local):
-            try:
-                api.upload_file(
-                    path_or_fileobj=local,
-                    path_in_repo=f"checkpoints/{fn}",
-                    repo_id=checkpoint_repo,
-                    repo_type="dataset",
-                    token=hf_token
-                )
-                print(f"✅ {fn} uploaded")
-            except Exception as e:
-                print(f"⚠️ Failed to upload {fn}: {e}")
-
-FINAL_EOF
-
-      - name: Auto-dispatch next run if needed
+      - name: Dispatch next run if needed
         if: always()
         run: |
           SAVE_PATH="${{ env.SAVE_PATH }}"
           STATE_FILE="$SAVE_PATH/state.json"
-          
+
           if [ ! -f "$STATE_FILE" ]; then
-            echo "ℹ️ No state file found"
+            echo "ℹ️ Sem state.json — não redisparando"
             exit 0
           fi
-          
+
           status=$(jq -r '.status // empty' "$STATE_FILE" 2>/dev/null || echo "")
-          
           if [ "$status" = "completed" ]; then
-            echo "✅ Pipeline completed — no redispatch needed"
+            echo "✅ Concluído — não redisparando"
             exit 0
           fi
-          
+
           rwp=$(jq -r '.runs_without_progress // 0' "$STATE_FILE" 2>/dev/null || echo 0)
           max_no_progress=${{ env.MAX_CONSECUTIVE_NO_PROGRESS }}
-          
+
           if [ "$rwp" -le "$max_no_progress" ]; then
-            echo "▶ Dispatching next run..."
+            echo "▶ Disparando próxima execução..."
             curl -sS -X POST \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/minerador-production.yml/dispatches" \
-              -d '{"ref":"main","inputs":{"resume":"true"}}' || echo "⚠️ Dispatch failed"
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"resume":"true"}}' || echo "⚠️ Falha no dispatch"
           else
-            echo "⛔ Max retries exceeded — not dispatching"
+            echo "⛔ Limite de tentativas sem progresso excedido — não redisparando"
           fi
 
       - name: Show logs
         if: always()
         run: |
-          SAVE_PATH="${{ env.SAVE_PATH }}"
-          if [ -f "$SAVE_PATH/minerador.log" ]; then
-            echo "=== MINERADOR LOG (last 150 lines) ==="
-            tail -150 "$SAVE_PATH/minerador.log"
+          LOGFILE="${{ env.SAVE_PATH }}/minerador.log"
+          if [ -f "$LOGFILE" ]; then
+            echo "=== ÚLTIMAS 150 LINHAS DO LOG ==="
+            tail -150 "$LOGFILE"
           fi
 
       - name: Disk usage report
         if: always()
         run: |
-          echo "=== DISK USAGE ==="
+          echo "=== USO DE DISCO ==="
           df -h /
           echo ""
-          echo "=== DATA DIRECTORY ==="
-          du -sh "${{ env.SAVE_PATH }}"/* 2>/dev/null || echo "No data yet"
+          echo "=== DIRETÓRIO DE DADOS ==="
+          du -sh "${{ env.SAVE_PATH }}"/* 2>/dev/null || echo "Sem dados ainda"
