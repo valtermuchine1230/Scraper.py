@@ -23,34 +23,33 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  SAVE_PATH: ${{ github.workspace }}/data
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  HF_REPO_EMAILS: Trader_Emails
+  HF_REPO_CHECKPOINT: minerador_checkpoints
+  LOG_LEVEL: INFO
   JOB_TIMEOUT_MINUTES: "360"
   SHUTDOWN_AT_MINUTE: "335"
   CHECKPOINT_SYNC_INTERVAL: "300"
   GRACEFUL_WAIT_AFTER_SIGTERM: "180"
   DB_UPLOAD_MAX_SIZE_MB: "1024"
   MAX_CONSECUTIVE_NO_PROGRESS: "5"
-  HF_REPO_EMAILS: "Trader_Emails"
-  HF_REPO_CHECKPOINT: "minerador_checkpoints"
 
 jobs:
   minerador:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     permissions:
       contents: read
       packages: read
       actions: write
-    env:
-      SAVE_PATH: ${{ runner.temp }}/data-${{ github.run_id }}
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          path: repo-${{ github.run_id }}
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -60,8 +59,14 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential python3-dev libffi-dev libssl-dev pkg-config jq
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            python3-dev \
+            libffi-dev \
+            libssl-dev \
+            pkg-config \
+            jq
 
       - name: Increase swap space
         run: |
@@ -74,30 +79,45 @@ jobs:
           free -h
           set -e
 
-      - name: Install Python dependencies
-        working-directory: repo-${{ github.run_id }}
+      - name: Clean up disk space
         run: |
-          python -m pip install --upgrade pip setuptools wheel -q
-          if [ -f requirements.txt ]; then
-            pip install --no-cache-dir -r requirements.txt -q
-          fi
-          pip install --no-cache-dir huggingface_hub duckdb -q
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo apt-get clean
+          df -h
 
-      - name: Prepare directories
+      - name: Upgrade pip tooling
         run: |
-          mkdir -p "${{ env.SAVE_PATH }}/exports"
-          mkdir -p "${{ env.SAVE_PATH }}/temp"
-          mkdir -p "${{ env.SAVE_PATH }}/raw_chunks"
-          mkdir -p "${{ env.SAVE_PATH }}/checkpoints"
-          ls -la "${{ env.SAVE_PATH }}"
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install Python dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir huggingface_hub duckdb
+
+      - name: Verify critical packages
+        run: |
+          python -c "import duckdb; print('✅ duckdb OK')"
+          python -c "import pandas; print('✅ pandas OK')"
+          python -c "import pyarrow; print('✅ pyarrow OK')"
+          python -c "from huggingface_hub import hf_hub_download; print('✅ huggingface_hub OK')"
+
+      - name: Create data directories
+        run: |
+          mkdir -p "$SAVE_PATH"/exports
+          mkdir -p "$SAVE_PATH"/temp
+          mkdir -p "$SAVE_PATH"/raw_chunks
+          mkdir -p "$SAVE_PATH"/checkpoints
+          ls -la "$SAVE_PATH"
 
       - name: Bootstrap remote state and database
-        working-directory: repo-${{ github.run_id }}
         run: python3 scripts/bootstrap.py
 
       - name: Check if already completed
         run: |
-          STATE_FILE="${{ env.SAVE_PATH }}/state.json"
+          STATE_FILE="$SAVE_PATH/state.json"
           if [ -f "$STATE_FILE" ]; then
             status=$(jq -r '.status // empty' "$STATE_FILE" 2>/dev/null || echo "")
             if [ "$status" = "completed" ]; then
@@ -107,26 +127,24 @@ jobs:
           fi
           echo "ℹ️ Continuando execução"
 
-      - name: Run minerador with watchdog
-        working-directory: repo-${{ github.run_id }}
+      - name: Run Minerador Production with watchdog
         timeout-minutes: 350
+        env:
+          PYTHONUNBUFFERED: 1
         run: |
           set -euo pipefail
-          SAVE_PATH="${{ env.SAVE_PATH }}"
           START_TS=$(date +%s)
-          SHUTDOWN_TS=$((START_TS + ${{ env.SHUTDOWN_AT_MINUTE }} * 60))
-          CHECKPOINT_SYNC_INTERVAL=${{ env.CHECKPOINT_SYNC_INTERVAL }}
-          GRACEFUL_WAIT=${{ env.GRACEFUL_WAIT_AFTER_SIGTERM }}
+          SHUTDOWN_TS=$((START_TS + SHUTDOWN_AT_MINUTE * 60))
 
-          mkdir -p "${SAVE_PATH}/checkpoints"
+          mkdir -p "$SAVE_PATH/checkpoints"
 
           echo "▶ Iniciando minerador_production.py"
-          python3 minerador_production.py > "${SAVE_PATH}/minerador.log" 2>&1 &
+          python minerador_production.py > "$SAVE_PATH/minerador.log" 2>&1 &
           PID=$!
 
           initial_metric=0
-          if [ -f "${SAVE_PATH}/state.json" ]; then
-            initial_metric=$(jq -r '.total_emails_extracted // .total_processed // 0' "${SAVE_PATH}/state.json" 2>/dev/null || echo 0)
+          if [ -f "$SAVE_PATH/state.json" ]; then
+            initial_metric=$(jq -r '.total_emails_extracted // .total_processed // 0' "$SAVE_PATH/state.json" 2>/dev/null || echo 0)
           fi
           echo "Métrica inicial: $initial_metric"
 
@@ -144,7 +162,7 @@ jobs:
             if [ $now -ge $SHUTDOWN_TS ]; then
               echo "⏰ Iniciando shutdown gracioso"
               kill -TERM $PID 2>/dev/null || true
-              end_wait=$(( now + GRACEFUL_WAIT ))
+              end_wait=$(( now + GRACEFUL_WAIT_AFTER_SIGTERM ))
               while kill -0 $PID 2>/dev/null && [ $(date +%s) -lt $end_wait ]; do
                 sleep 1
               done
@@ -160,21 +178,18 @@ jobs:
 
           wait $PID 2>/dev/null || true
           echo "🛑 Processo finalizado"
-
-          echo "$initial_metric" > "${SAVE_PATH}/.initial_metric"
+          echo "$initial_metric" > "$SAVE_PATH/.initial_metric"
 
       - name: Finalize - upload state, checkpoints, database
         if: always()
-        working-directory: repo-${{ github.run_id }}
         run: |
-          initial_metric=$(cat "${{ env.SAVE_PATH }}/.initial_metric" 2>/dev/null || echo 0)
+          initial_metric=$(cat "$SAVE_PATH/.initial_metric" 2>/dev/null || echo 0)
           python3 scripts/finalize.py all
           python3 scripts/finalize.py progress "$initial_metric"
 
       - name: Dispatch next run if needed
         if: always()
         run: |
-          SAVE_PATH="${{ env.SAVE_PATH }}"
           STATE_FILE="$SAVE_PATH/state.json"
 
           if [ ! -f "$STATE_FILE" ]; then
@@ -189,9 +204,8 @@ jobs:
           fi
 
           rwp=$(jq -r '.runs_without_progress // 0' "$STATE_FILE" 2>/dev/null || echo 0)
-          max_no_progress=${{ env.MAX_CONSECUTIVE_NO_PROGRESS }}
 
-          if [ "$rwp" -le "$max_no_progress" ]; then
+          if [ "$rwp" -le "$MAX_CONSECUTIVE_NO_PROGRESS" ]; then
             echo "▶ Disparando próxima execução..."
             curl -sS -X POST \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
@@ -201,21 +215,42 @@ jobs:
           else
             echo "⛔ Limite de tentativas sem progresso excedido — não redisparando"
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Show logs
+      - name: Display logs (last 200 lines)
         if: always()
         run: |
-          LOGFILE="${{ env.SAVE_PATH }}/minerador.log"
-          if [ -f "$LOGFILE" ]; then
-            echo "=== ÚLTIMAS 150 LINHAS DO LOG ==="
-            tail -150 "$LOGFILE"
+          if [ -f "$SAVE_PATH/minerador.log" ]; then
+            echo "=== MINERADOR LOG ==="
+            tail -200 "$SAVE_PATH/minerador.log"
           fi
 
-      - name: Disk usage report
+      - name: Show disk usage
         if: always()
         run: |
-          echo "=== USO DE DISCO ==="
-          df -h /
+          echo "=== DISK USAGE ==="
+          df -h
           echo ""
-          echo "=== DIRETÓRIO DE DADOS ==="
-          du -sh "${{ env.SAVE_PATH }}"/* 2>/dev/null || echo "Sem dados ainda"
+          echo "=== DATA DIRECTORY ==="
+          if [ -d "$SAVE_PATH" ]; then
+            du -sh "$SAVE_PATH"/* 2>/dev/null || true
+          fi
+
+      - name: Clean temporary files
+        if: always()
+        run: |
+          if [ -d "$SAVE_PATH" ]; then
+            rm -rf "$SAVE_PATH"/temp
+            rm -rf "$SAVE_PATH"/raw_chunks/*.parquet
+            du -sh "$SAVE_PATH"
+          fi
+
+      - name: Status summary
+        if: always()
+        run: |
+          echo "✅ Workflow completed"
+          echo "📁 Data: $SAVE_PATH"
+          if [ -f "$SAVE_PATH/state.json" ]; then
+            echo "✅ State persisted for next run"
+          fi
