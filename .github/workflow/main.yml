@@ -1,0 +1,604 @@
+name: Minerador Production - High Performance Pipeline (Checked Rolls)
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      resume:
+        description: 'Resume from checkpoint'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+  packages: read
+  actions: write
+
+concurrency:
+  group: minerador-production
+  cancel-in-progress: false
+
+env:
+  # Default execution parameters (override per-run via workflow_dispatch inputs or env)
+  JOB_TIMEOUT_MINUTES: "360"                # total job timeout configured at job level
+  SHUTDOWN_AT_MINUTE: "335"                # minute to initiate graceful shutdown (5h35 => 335)
+  CHECKPOINT_SYNC_INTERVAL: "300"          # seconds (5 minutes)
+  GRACEFUL_WAIT_AFTER_SIGTERM: "180"       # seconds to wait after SIGTERM for Python to finish
+  DB_UPLOAD_MAX_SIZE_MB: "1024"            # max DB size to auto-upload (1 GiB default)
+  MAX_CONSECUTIVE_NO_PROGRESS: "5"         # anti-loop limit
+  SAVE_PATH_BASE: "${{ runner.temp }}/data-${{ github.run_id }}"
+  HF_REPO_EMAILS: "Trader_Emails"
+  HF_REPO_CHECKPOINT: "minerador_checkpoints"
+  LOG_LEVEL: "INFO"
+
+jobs:
+  minerador:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    permissions:
+      contents: read
+      packages: read
+      actions: write
+
+    env:
+      SAVE_PATH: ${{ env.SAVE_PATH_BASE }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WORKFLOW_FILE: .github/workflows/minerador-production.yml
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: repo-${{ github.run_id }}
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install system dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            python3-dev \
+            libffi-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Increase swap space (best-effort)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile || true
+          sudo chmod 600 /swapfile || true
+          sudo mkswap /swapfile || true
+          sudo swapon /swapfile || true
+          free -h || true
+
+      - name: Install Python dependencies (from requirements.txt)
+        working-directory: repo-${{ github.run_id }}
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then
+            pip install --no-cache-dir -r requirements.txt
+          fi
+
+      - name: Prepare SAVE_PATH and directories
+        run: |
+          mkdir -p "${{ env.SAVE_PATH }}/exports"
+          mkdir -p "${{ env.SAVE_PATH }}/temp"
+          mkdir -p "${{ env.SAVE_PATH }}/raw_chunks"
+          mkdir -p "${{ env.SAVE_PATH }}/checkpoints"
+          ls -la "${{ env.SAVE_PATH }}"
+
+      - name: Bootstrap: download remote state.json and (conditionally) emails.duckdb from HF
+        working-directory: repo-${{ github.run_id }}
+        env:
+          SAVE_PATH: ${{ env.SAVE_PATH }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_CHECKPOINT: ${{ env.HF_REPO_CHECKPOINT }}
+          HF_REPO_EMAILS: ${{ env.HF_REPO_EMAILS }}
+          DB_UPLOAD_MAX_SIZE_MB: ${{ env.DB_UPLOAD_MAX_SIZE_MB }}
+        run: |
+          python - <<'PY'
+          import os, json, sys
+          from huggingface_hub import HfApi, hf_hub_download
+          api = HfApi()
+          token = os.environ.get("HF_TOKEN")
+          repo_owner = None
+          try:
+              who = api.whoami(token=token)
+              repo_owner = who.get("name") or who.get("user")
+          except Exception as e:
+              print("⚠️ HF whoami failed:", e)
+          checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
+          save_path = os.environ.get("SAVE_PATH")
+          # Try to download state.json (safe, small)
+          try:
+              hf_hub_download(repo_id=checkpoint_repo, filename="state.json", local_dir=save_path, token=token, repo_type="dataset")
+              print("✅ state.json downloaded")
+          except Exception as e:
+              print("ℹ️ No remote state.json or download error:", e)
+          # Try to download emails.duckdb if it exists and is not too large (check via list_repo_files)
+          try:
+              files = api.list_repo_files(repo_id=checkpoint_repo, token=token, repo_type="dataset")
+              if "emails.duckdb" in files:
+                  # Try to estimate size via repo snapshot (best-effort not always available)
+                  # We will attempt download only if DB_UPLOAD_MAX_SIZE_MB allows
+                  db_size_limit_mb = int(os.environ.get("DB_UPLOAD_MAX_SIZE_MB", "1024"))
+                  # best-effort download; user accepted risk - attempt and let it fail if too big
+                  try:
+                      path = hf_hub_download(repo_id=checkpoint_repo, filename="emails.duckdb", local_dir=save_path, token=token, repo_type="dataset")
+                      print("✅ DuckDB downloaded:", path)
+                  except Exception as e:
+                      print("⚠️ DuckDB download skipped or failed:", e)
+              else:
+                  print("ℹ️ No emails.duckdb in checkpoint repo")
+          except Exception as e:
+              print("ℹ️ Could not list checkpoint repo files:", e)
+          PY
+
+      - name: Check remote state for COMPLETED (and exit early if completed)
+        shell: bash
+        working-directory: repo-${{ github.run_id }}
+        env:
+          SAVE_PATH: ${{ env.SAVE_PATH }}
+        run: |
+          set -euo pipefail
+          STATE_FILE="${SAVE_PATH}/state.json"
+          if [ -f "$STATE_FILE" ]; then
+            status=$(jq -r '.status // empty' "$STATE_FILE" || echo "")
+            if [ "$status" = "completed" ]; then
+              echo "✅ Remote state reports status=completed — stopping early."
+              exit 0
+            fi
+          fi
+          echo "ℹ️ Not completed — continuing."
+
+      - name: Run minerador with watchdog (periodic checkpoint sync + graceful shutdown + final persistence)
+        working-directory: repo-${{ github.run_id }}
+        env:
+          SAVE_PATH: ${{ env.SAVE_PATH }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_CHECKPOINT: ${{ env.HF_REPO_CHECKPOINT }}
+          HF_REPO_EMAILS: ${{ env.HF_REPO_EMAILS }}
+          CHECKPOINT_SYNC_INTERVAL: ${{ env.CHECKPOINT_SYNC_INTERVAL }}
+          SHUTDOWN_AT_MINUTE: ${{ env.SHUTDOWN_AT_MINUTE }}
+          GRACEFUL_WAIT_AFTER_SIGTERM: ${{ env.GRACEFUL_WAIT_AFTER_SIGTERM }}
+          DB_UPLOAD_MAX_SIZE_MB: ${{ env.DB_UPLOAD_MAX_SIZE_MB }}
+          MAX_CONSECUTIVE_NO_PROGRESS: ${{ env.MAX_CONSECUTIVE_NO_PROGRESS }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_FILE: ${{ env.WORKFLOW_FILE }}
+        run: |
+          set -euo pipefail
+          SAVE_PATH="${SAVE_PATH}"
+          START_TS=$(date +%s)
+          JOB_TIMEOUT_MINUTES=${{ env.JOB_TIMEOUT_MINUTES }}
+          SHUTDOWN_AT_MINUTE=${SHUTDOWN_AT_MINUTE}
+          SHUTDOWN_TS=$((START_TS + SHUTDOWN_AT_MINUTE * 60))
+          CHECKPOINT_SYNC_INTERVAL=${CHECKPOINT_SYNC_INTERVAL:-300}
+          GRACEFUL_WAIT=${GRACEFUL_WAIT_AFTER_SIGTERM:-180}
+          DB_UPLOAD_MAX_SIZE_MB=${DB_UPLOAD_MAX_SIZE_MB:-1024}
+          MAX_NO_PROGRESS=${MAX_CONSECUTIVE_NO_PROGRESS:-5}
+
+          mkdir -p "${SAVE_PATH}/checkpoints"
+
+          # helper: upload state.json and all files in checkpoints/ to HF
+          hf_upload_state_and_checkpoints() {
+            python - <<'PY'
+import os, sys, json
+from huggingface_hub import HfApi
+api = HfApi()
+token = os.environ.get("HF_TOKEN")
+repo_owner = None
+try:
+    who = api.whoami(token=token)
+    repo_owner = who.get("name") or who.get("user")
+except Exception:
+    pass
+checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
+save_path = os.environ.get("SAVE_PATH")
+uploaded = []
+# Upload state.json if exists
+statefile = os.path.join(save_path, "state.json")
+if os.path.exists(statefile):
+    try:
+        api.upload_file(path_or_fileobj=statefile, path_in_repo="state.json", repo_id=checkpoint_repo, repo_type="dataset", token=token)
+        uploaded.append("state.json")
+    except Exception as e:
+        print("⚠️ state.json upload failed:", e)
+# Upload per-domain checkpoints if present
+cp_dir = os.path.join(save_path, "checkpoints")
+if os.path.isdir(cp_dir):
+    for fn in os.listdir(cp_dir):
+        local = os.path.join(cp_dir, fn)
+        if os.path.isfile(local):
+            try:
+                api.upload_file(path_or_fileobj=local, path_in_repo=f"checkpoints/{fn}", repo_id=checkpoint_repo, repo_type="dataset", token=token)
+                uploaded.append(fn)
+            except Exception as e:
+                print("⚠️ checkpoint upload failed for", fn, e)
+print("UPLOADED:", uploaded)
+PY
+          }
+
+          # compute checksum helper for state.json
+          last_state_hash_file="${SAVE_PATH}/.last_state_hash"
+          compute_state_hash() {
+            if [ -f "${SAVE_PATH}/state.json" ]; then
+              sha256sum "${SAVE_PATH}/state.json" | awk '{print $1}'
+            else
+              echo ""
+            fi
+          }
+
+          # Start minerador in background
+          echo "▶ Starting minerador_production.py (pid saved)"
+          cd repo-${{ github.run_id }}
+          python minerador_production.py &
+          PID=$!
+          echo "PID=$PID"
+
+          # initial baseline of progress metric
+          initial_metric=0
+          if [ -f "${SAVE_PATH}/state.json" ]; then
+            initial_metric=$(jq -r '.total_emails_extracted // .total_processed // (.processed_tars | length) // 0' "${SAVE_PATH}/state.json" || echo 0)
+          fi
+          echo "Initial progress metric: $initial_metric"
+
+          # Start sync/watch loop
+          next_sync=$(( $(date +%s) + CHECKPOINT_SYNC_INTERVAL ))
+          while kill -0 $PID 2>/dev/null; do
+            now=$(date +%s)
+            # periodic sync of state.json/checkpoints
+            if [ $now -ge $next_sync ]; then
+              new_hash=$(compute_state_hash)
+              old_hash=""
+              if [ -f "$last_state_hash_file" ]; then old_hash=$(cat "$last_state_hash_file"); fi
+              if [ -n "$new_hash" ] && [ "$new_hash" != "$old_hash" ]; then
+                echo "🔁 state.json changed: uploading checkpoint..."
+                hf_upload_state_and_checkpoints
+                echo "$new_hash" > "$last_state_hash_file" || true
+              else
+                echo "ℹ️ No state.json change detected or missing."
+              fi
+              next_sync=$(( now + CHECKPOINT_SYNC_INTERVAL ))
+            fi
+
+            # time to start graceful shutdown?
+            if [ $now -ge $SHUTDOWN_TS ]; then
+              echo "⏰ Shutdown threshold reached (5h35) — initiating graceful shutdown"
+              # ask process to stop starting new work
+              kill -TERM "$PID" 2>/dev/null || true
+              # allow GRACEFUL_WAIT seconds for python to flush and exit
+              end_wait=$(( now + GRACEFUL_WAIT ))
+              while kill -0 $PID 2>/dev/null && [ $(date +%s) -lt $end_wait ]; do
+                sleep 1
+              done
+              if kill -0 $PID 2>/dev/null; then
+                echo "⚠️ Process did not exit within graceful window — force kill"
+                kill -KILL "$PID" 2>/dev/null || true
+              fi
+              break
+            fi
+            sleep 5
+          done
+
+          # Wait for process termination and capture exit code
+          wait $PID || true
+          echo "🛑 Minerador process ended. Performing final uploads & verification..."
+
+          # Final: always upload state.json and checkpoints
+          hf_upload_state_and_checkpoints
+
+          # Optionally upload DuckDB (safe conservative strategy)
+          DB_PATH="${SAVE_PATH}/emails.duckdb"
+          if [ -f "$DB_PATH" ]; then
+            size_bytes=$(stat -c%s "$DB_PATH" || echo 0)
+            size_mb=$(( size_bytes / 1024 / 1024 ))
+            echo "ℹ️ DuckDB found: ${size_mb} MB"
+            # conservative rule: upload only if <= DB_UPLOAD_MAX_SIZE_MB
+            if [ $size_mb -le $DB_UPLOAD_MAX_SIZE_MB ]; then
+              echo "📤 Attempting DuckDB upload (size ${size_mb}MB <= ${DB_UPLOAD_MAX_SIZE_MB}MB)"
+              python - <<'PY'
+import os, sys
+from huggingface_hub import HfApi
+api = HfApi()
+token = os.environ.get("HF_TOKEN")
+repo_owner = None
+try:
+    who = api.whoami(token=token)
+    repo_owner = who.get("name") or who.get("user")
+except Exception:
+    pass
+emails_repo = f"{repo_owner}/{os.environ.get('HF_REPO_EMAILS')}" if repo_owner else os.environ.get('HF_REPO_EMAILS')
+db_path = os.path.join(os.environ.get("SAVE_PATH"), "emails.duckdb")
+if os.path.exists(db_path):
+    try:
+        api.upload_file(path_or_fileobj=db_path, path_in_repo="emails.duckdb", repo_id=emails_repo, repo_type="dataset", token=token)
+        print("✅ DuckDB uploaded")
+    except Exception as e:
+        print("⚠️ DuckDB upload failed:", e)
+PY
+            else
+              echo "⚠️ DuckDB too large to auto-upload; skipping (size ${size_mb}MB > ${DB_UPLOAD_MAX_SIZE_MB}MB)"
+            fi
+          else
+            echo "ℹ️ No local DuckDB to upload"
+          fi
+
+          # Verification: re-download state.json and confirm hash (simple verification)
+          python - <<'PY'
+import os, json, sys, hashlib
+from huggingface_hub import HfApi, hf_hub_download
+api = HfApi()
+token = os.environ.get("HF_TOKEN")
+repo_owner = None
+try:
+    who = api.whoami(token=token)
+    repo_owner = who.get("name") or who.get("user")
+except Exception:
+    pass
+checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
+save_path = os.environ.get("SAVE_PATH")
+statefile = os.path.join(save_path, "state.json")
+ok = False
+try:
+    hf_hub_download(repo_id=checkpoint_repo, filename="state.json", local_dir=save_path, token=token, repo_type="dataset")
+    # quick sanity read
+    with open(statefile, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    print("✅ Remote state.json present (verified). keys:", list(data.keys()))
+    ok = True
+except Exception as e:
+    print("⚠️ Could not verify remote state:", e)
+    ok = False
+# exit code doesn't fail the job; we trust logs and subsequent logic
+sys.exit(0 if ok else 0)
+PY
+
+          # Decide whether mission is COMPLETED
+          # Rule:
+          # - If local state.json contains status == "completed" OR
+          # - If DuckDB exists locally AND count(distinct domains) == number of domain checkpoint files with status completed
+          COMPLETED=0
+          statefile="${SAVE_PATH}/state.json"
+          if [ -f "$statefile" ]; then
+            st=$(jq -r '.status // empty' "$statefile" || echo "")
+            if [ "$st" = "completed" ]; then
+              echo "✅ State explicit completed"
+              COMPLETED=1
+            fi
+          fi
+
+          if [ $COMPLETED -eq 0 ] && [ -f "${SAVE_PATH}/emails.duckdb" ]; then
+            echo "ℹ️ Attempting inference of completion using DuckDB and per-domain checkpoints..."
+            python - <<'PY'
+import os, json
+import duckdb
+save_path = os.environ.get("SAVE_PATH")
+db = duckdb.connect(os.path.join(save_path, "emails.duckdb"))
+try:
+    rows = db.execute("""
+        SELECT LOWER(SUBSTR(email, POSITION('@' IN email) + 1)) AS domain,
+               COUNT(*) AS cnt
+        FROM emails_raw
+        GROUP BY domain
+    """).fetchall()
+    domains = [r[0] for r in rows]
+    # count completed checkpoint files
+    cp_dir = os.path.join(save_path, "checkpoints")
+    completed = 0
+    if os.path.isdir(cp_dir):
+        import json
+        for fn in os.listdir(cp_dir):
+            try:
+                with open(os.path.join(cp_dir, fn), 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                    if d.get("status") == "completed":
+                        completed += 1
+            except Exception:
+                continue
+    print("DOMAINS_TOTAL:", len(domains), "CHECKPOINTS_COMPLETED:", completed)
+    # export to file for YAML step
+    with open(os.path.join(save_path, ".__completion_eval__.json"), "w") as f:
+        json.dump({"domains_total": len(domains), "checkpoints_completed": completed}, f)
+except Exception as e:
+    print("ℹ️ DuckDB inference failed:", e)
+    with open(os.path.join(save_path, ".__completion_eval__.json"), "w") as f:
+        json.dump({"domains_total": 0, "checkpoints_completed": 0}, f)
+finally:
+    db.close()
+PY
+            if [ -f "${SAVE_PATH}/.__completion_eval__.json" ]; then
+              dt=$(jq -r '.domains_total' "${SAVE_PATH}/.__completion_eval__.json")
+              dc=$(jq -r '.checkpoints_completed' "${SAVE_PATH}/.__completion_eval__.json")
+              echo "Domains total: $dt  Completed checkpoints: $dc"
+              if [ "$dt" -gt 0 ] && [ "$dt" -eq "$dc" ]; then
+                echo "✅ Inferred COMPLETED via DuckDB and per-domain checkpoints"
+                COMPLETED=1
+              else
+                echo "ℹ️ Not all domains completed (or no domains found)"
+              fi
+            fi
+          fi
+
+          # If completed set, write and upload an explicit completed state.json (safe: will not modify Python)
+          if [ $COMPLETED -eq 1 ]; then
+            echo "✅ Declaring global status=completed (workflow writes final state.json for clarity)."
+            python - <<'PY'
+import os, json
+p = os.path.join(os.environ.get("SAVE_PATH"), "state.json")
+state = {}
+if os.path.exists(p):
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+state["status"] = "completed"
+import datetime
+state["completed_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+with open(p + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(state, f, indent=2, ensure_ascii=False)
+os.replace(p + ".tmp", p)
+# upload
+from huggingface_hub import HfApi
+api = HfApi()
+token = os.environ.get("HF_TOKEN")
+repo_owner = None
+try:
+    who = api.whoami(token=token)
+    repo_owner = who.get("name") or who.get("user")
+except Exception:
+    pass
+checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
+try:
+    api.upload_file(path_or_fileobj=p, path_in_repo="state.json", repo_id=checkpoint_repo, repo_type="dataset", token=token)
+    print("✅ uploaded final completed state.json")
+except Exception as e:
+    print("⚠️ failed to upload completed state:", e)
+PY
+          fi
+
+          # Anti-loop: compare progress metric before and after. Decide whether to dispatch new run.
+          # initial_metric retrieved earlier
+          final_metric=0
+          if [ -f "${SAVE_PATH}/state.json" ]; then
+            final_metric=$(jq -r '.total_emails_extracted // .total_processed // (.processed_tars | length) // 0' "${SAVE_PATH}/state.json" || echo 0)
+          fi
+          echo "Progress: initial=$initial_metric final=$final_metric"
+
+          # If no progress, increment a counter in the remote state (runs_without_progress) to avoid infinite re-dispatch
+          runs_without_progress=0
+          statefile_local="${SAVE_PATH}/state.json"
+          if [ -f "$statefile_local" ]; then
+            runs_without_progress=$(jq -r '.runs_without_progress // 0' "$statefile_local")
+          fi
+
+          if [ "$final_metric" -le "$initial_metric" ]; then
+            runs_without_progress=$((runs_without_progress + 1))
+            echo "⚠️ No progress detected in this run -- incrementing runs_without_progress -> $runs_without_progress"
+            # update and upload state.json with counter
+            python - <<'PY'
+import os, json
+p = os.path.join(os.environ.get("SAVE_PATH"), "state.json")
+if os.path.exists(p):
+    with open(p, "r", encoding="utf-8") as f:
+        s = json.load(f)
+else:
+    s = {}
+s["runs_without_progress"] = int(s.get("runs_without_progress", 0))
+s["runs_without_progress"] += 1
+with open(p + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(s, f, indent=2, ensure_ascii=False)
+os.replace(p + ".tmp", p)
+# upload updated state
+from huggingface_hub import HfApi
+api = HfApi()
+token = os.environ.get("HF_TOKEN")
+repo_owner = None
+try:
+    who = api.whoami(token=token)
+    repo_owner = who.get("name") or who.get("user")
+except Exception:
+    pass
+checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
+try:
+    api.upload_file(path_or_fileobj=p, path_in_repo="state.json", repo_id=checkpoint_repo, repo_type="dataset", token=token)
+    print("Uploaded updated state.json with runs_without_progress")
+except Exception as e:
+    print("Failed uploading updated state:", e)
+PY
+          else
+            # reset counter to 0 if progress occurred
+            python - <<'PY'
+import os, json
+p = os.path.join(os.environ.get("SAVE_PATH"), "state.json")
+if os.path.exists(p):
+    with open(p, "r", encoding="utf-8") as f:
+        s = json.load(f)
+else:
+    s = {}
+s["runs_without_progress"] = 0
+with open(p + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(s, f, indent=2, ensure_ascii=False)
+os.replace(p + ".tmp", p)
+from huggingface_hub import HfApi
+api = HfApi()
+token = os.environ.get("HF_TOKEN")
+repo_owner = None
+try:
+    who = api.whoami(token=token)
+    repo_owner = who.get("name") or who.get("user")
+except Exception:
+    pass
+checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
+try:
+    api.upload_file(path_or_fileobj=p, path_in_repo="state.json", repo_id=checkpoint_repo, repo_type="dataset", token=token)
+    print("Uploaded reset runs_without_progress=0")
+except Exception as e:
+    print("Failed uploading reset state:", e)
+PY
+          fi
+
+          # Final decision: should we dispatch a new workflow run?
+          # Conditions to dispatch:
+          #  - Not marked completed
+          #  - runs_without_progress <= MAX_NO_PROGRESS
+          should_dispatch=0
+          if [ $COMPLETED -eq 0 ]; then
+            # read runs_without_progress
+            rwp=$(jq -r '.runs_without_progress // 0' "${SAVE_PATH}/state.json" || echo 0)
+            if [ "$rwp" -le "$MAX_NO_PROGRESS" ]; then
+              should_dispatch=1
+            else
+              echo "⛔ Anti-loop: runs_without_progress ($rwp) > MAX_NO_PROGRESS ($MAX_NO_PROGRESS); NOT dispatching."
+            fi
+          else
+            echo "✅ Completed detected; NOT dispatching new run."
+          fi
+
+          if [ $should_dispatch -eq 1 ]; then
+            echo "▶ Dispatching new workflow run (automatic resume)."
+            # Use GitHub Actions API to dispatch same workflow file
+            REPO="${GITHUB_REPOSITORY}"
+            WF_FILE="${WORKFLOW_FILE}"
+            curl -sS -X POST -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${REPO}/actions/workflows/$(basename ${WF_FILE})/dispatches" \
+              -d "{\"ref\":\"${GITHUB_REF:-main}\", \"inputs\": {\"resume\": \"true\"}}"
+            echo "ℹ️ Dispatch request sent."
+          fi
+
+          echo "✅ Run finished. SAVE_PATH contents:"
+          du -sh "${SAVE_PATH}"/* 2>/dev/null || true
+
+      - name: Display logs (last 200 lines)
+        if: always()
+        run: |
+          if [ -f "${{ env.SAVE_PATH }}/minerador_v9.log" ]; then
+            echo "=== MINERADOR LOG ==="
+            tail -200 "${{ env.SAVE_PATH }}/minerador_v9.log"
+          fi
+
+      - name: Show disk usage & final summary
+        if: always()
+        run: |
+          echo "=== DISK USAGE ==="
+          df -h
+          echo ""
+          echo "=== DATA DIRECTORY ==="
+          if [ -d "${{ env.SAVE_PATH }}" ]; then
+            du -sh "${{ env.SAVE_PATH }}"/* 2>/dev/null || true
+          fi
+          echo ""
+          echo "✅ Workflow step completed."
