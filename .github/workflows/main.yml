@@ -1,4 +1,4 @@
-name: Minerador Production - High Performance Pipeline (Checked Rolls)
+name: Minerador Production - High Performance Pipeline
 
 on:
   push:
@@ -23,12 +23,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  JOB_TIMEOUT_MINUTES: "360"                # total job timeout configured at job level
-  SHUTDOWN_AT_MINUTE: "335"                # minute to initiate graceful shutdown (5h35 => 335)
-  CHECKPOINT_SYNC_INTERVAL: "300"          # seconds (5 minutes)
-  GRACEFUL_WAIT_AFTER_SIGTERM: "180"       # seconds to wait after SIGTERM for Python to finish
-  DB_UPLOAD_MAX_SIZE_MB: "1024"            # max DB size to auto-upload (1 GiB default)
-  MAX_CONSECUTIVE_NO_PROGRESS: "5"         # anti-loop limit
+  JOB_TIMEOUT_MINUTES: "360"
+  SHUTDOWN_AT_MINUTE: "335"
+  CHECKPOINT_SYNC_INTERVAL: "300"
+  GRACEFUL_WAIT_AFTER_SIGTERM: "180"
+  DB_UPLOAD_MAX_SIZE_MB: "1024"
+  MAX_CONSECUTIVE_NO_PROGRESS: "5"
   HF_REPO_EMAILS: "Trader_Emails"
   HF_REPO_CHECKPOINT: "minerador_checkpoints"
   LOG_LEVEL: "INFO"
@@ -44,7 +44,6 @@ jobs:
       actions: write
 
     env:
-      # Directly compute SAVE_PATH here to avoid cross-level env reference issues
       SAVE_PATH: ${{ runner.temp }}/data-${{ github.run_id }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,12 +65,7 @@ jobs:
       - name: Install system dependencies (apt)
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            python3-dev \
-            libffi-dev \
-            libssl-dev \
-            pkg-config
+          sudo apt-get install -y build-essential python3-dev libffi-dev libssl-dev pkg-config
 
       - name: Increase swap space (best-effort)
         run: |
@@ -120,13 +114,11 @@ except Exception as e:
     print("⚠️ HF whoami failed:", e)
 checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
 save_path = os.environ.get("SAVE_PATH")
-# Try to download state.json (safe, small)
 try:
     hf_hub_download(repo_id=checkpoint_repo, filename="state.json", local_dir=save_path, token=token, repo_type="dataset")
     print("✅ state.json downloaded")
 except Exception as e:
     print("ℹ️ No remote state.json or download error:", e)
-# Try to download emails.duckdb if present (best-effort)
 try:
     files = api.list_repo_files(repo_id=checkpoint_repo, token=token, repo_type="dataset")
     if "emails.duckdb" in files:
@@ -196,7 +188,6 @@ except Exception:
     pass
 checkpoint_repo = f"{repo_owner}/{os.environ.get('HF_REPO_CHECKPOINT')}" if repo_owner else os.environ.get('HF_REPO_CHECKPOINT')
 save_path = os.environ.get("SAVE_PATH")
-# Upload state.json if exists
 statefile = os.path.join(save_path, "state.json")
 if os.path.exists(statefile):
     try:
@@ -204,7 +195,6 @@ if os.path.exists(statefile):
         print("✅ state.json uploaded")
     except Exception as e:
         print("⚠️ state.json upload failed:", e)
-# Upload per-domain checkpoints if present
 cp_dir = os.path.join(save_path, "checkpoints")
 if os.path.isdir(cp_dir):
     for fn in os.listdir(cp_dir):
