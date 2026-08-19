@@ -29,7 +29,6 @@ env:
   GRACEFUL_WAIT_AFTER_SIGTERM: "180"
   DB_UPLOAD_MAX_SIZE_MB: "1024"
   MAX_CONSECUTIVE_NO_PROGRESS: "5"
-  SAVE_PATH_BASE: "${{ runner.temp }}/data-${{ github.run_id }}"
   HF_REPO_EMAILS: "Trader_Emails"
   HF_REPO_CHECKPOINT: "minerador_checkpoints"
 
@@ -42,7 +41,7 @@ jobs:
       packages: read
       actions: write
     env:
-      SAVE_PATH: ${{ env.SAVE_PATH_BASE }}
+      SAVE_PATH: ${{ runner.temp }}/data-${{ github.run_id }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
